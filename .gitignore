@@ -1,0 +1,26 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Azure Functions local settings (contains secrets - never commit)
+local.settings.json
+
+# Azure Functions build artifacts
+bin/
+obj/
+.python_packages/
+__azurite_db*__.json
+__blobstorage__/
+__queuestorage__/
+
+# VS Code
+
+# OS files
+.DS_Store
+Thumbs.db
