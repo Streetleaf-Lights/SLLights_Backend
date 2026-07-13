@@ -10,7 +10,6 @@ CREATE TABLE SP_Execution (
     TotalSuccessfulRecords  INT                 NOT NULL DEFAULT 0,
     TotalErrorRecords       INT                 NOT NULL DEFAULT 0,
     Source                  NVARCHAR(255)       NULL,
-    BatchIds                NVARCHAR(MAX)       NULL,
     BatchCount              INT                 NOT NULL DEFAULT 0,
     IsFinalBatch            BIT                 NOT NULL DEFAULT 0,
     ErrorMessage            NVARCHAR(MAX)       NULL,
@@ -29,3 +28,5 @@ CREATE NONCLUSTERED INDEX IX_SP_Execution_Environment_StartDateTime
 
 -- DROP INDEX IX_SP_Execution_Environment ON SP_Execution;
 -- DROP INDEX IX_SP_Execution_Environment_StartDateTime ON SP_Execution;
+
+-- ALTER TABLE SP_Execution DROP COLUMN BatchIds;

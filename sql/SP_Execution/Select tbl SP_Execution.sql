@@ -6,8 +6,9 @@ SELECT TOP (1000) [Id]
       ,[TotalSuccessfulRecords]
       ,[TotalErrorRecords]
       ,[Source]
-      ,[BatchIds]
       ,[BatchCount]
       ,[IsFinalBatch]
       ,[ErrorMessage]
   FROM [dbo].[SP_Execution]
+  ORDER BY [StartDateTime] DESC
+  

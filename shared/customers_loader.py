@@ -49,13 +49,13 @@ def _airtable_created_time_to_eastern(created_time: str | None) -> str | None:
 
 # Merge logic only fires the UPDATE branch when at least one of these fields
 # actually differs from what's already stored, so unchanged customers are
-# left untouched. BatchId is intentionally excluded from the diff check
+# left untouched. SP_ExecId is intentionally excluded from the diff check
 # (it's always refreshed to the latest run) but IS included in the SET list.
 _UPSERT_SQL = """
 MERGE Customers AS target
 USING (
     SELECT
-        ? AS Id, ? AS Name, ? AS ProjectNames, ? AS ProjectIds, ? AS BatchId,
+        ? AS Id, ? AS Name, ? AS ProjectNames, ? AS ProjectIds, ? AS SP_ExecId,
         ? AS Address, ? AS City, ? AS State, ? AS Zip, ? AS Phone,
         ? AS AirTableCreatedDateTime
 ) AS source
@@ -74,15 +74,15 @@ THEN UPDATE SET
     Name         = source.Name,
     ProjectNames = source.ProjectNames,
     ProjectIds   = source.ProjectIds,
-    BatchId      = source.BatchId,
+    SP_ExecId      = source.SP_ExecId,
     Address      = source.Address,
     City         = source.City,
     State        = source.State,
     Zip          = source.Zip,
     Phone        = source.Phone
 WHEN NOT MATCHED THEN
-    INSERT (Id, Name, ProjectNames, ProjectIds, BatchId, Address, City, State, Zip, Phone, AirTableCreatedDateTime)
-    VALUES (source.Id, source.Name, source.ProjectNames, source.ProjectIds, source.BatchId,
+    INSERT (Id, Name, ProjectNames, ProjectIds, SP_ExecId, Address, City, State, Zip, Phone, AirTableCreatedDateTime)
+    VALUES (source.Id, source.Name, source.ProjectNames, source.ProjectIds, source.SP_ExecId,
             source.Address, source.City, source.State, source.Zip, source.Phone,
             source.AirTableCreatedDateTime);
 """
@@ -121,7 +121,7 @@ def load_customers() -> None:
     conn = get_connection()
     cursor = conn.cursor()
 
-    batch_id = None
+    sp_exec_id = None
     total_success = 0
     total_errors = 0
 
@@ -138,7 +138,7 @@ def load_customers() -> None:
             start_time,
             "AirTable",
         )
-        batch_id = cursor.fetchone()[0]
+        sp_exec_id = cursor.fetchone()[0]
         conn.commit()
 
         # 2. Pull every page from Airtable before doing any DB writes
@@ -159,7 +159,7 @@ def load_customers() -> None:
                     customer["Name"],
                     customer["ProjectNames"],
                     customer["ProjectIds"],
-                    batch_id,
+                    sp_exec_id,
                     customer["Address"],
                     customer["City"],
                     customer["State"],
@@ -185,7 +185,6 @@ def load_customers() -> None:
             SET EndDateTime = ?,
                 TotalSuccessfulRecords = ?,
                 TotalErrorRecords = ?,
-                BatchIds = ?,
                 BatchCount = ?,
                 IsFinalBatch = 1
             WHERE Id = ?
@@ -193,15 +192,14 @@ def load_customers() -> None:
             _to_dto_string(_now_eastern()),
             total_success,
             total_errors,
-            json.dumps(offsets_seen),
             len(offsets_seen) + 1,
-            batch_id,
+            sp_exec_id,
         )
         conn.commit()
 
     except Exception as ex:
         logging.error("loadCustomers: run failed: %s", ex)
-        if batch_id:
+        if sp_exec_id:
             cursor.execute(
                 """
                 UPDATE SP_Execution
@@ -212,7 +210,7 @@ def load_customers() -> None:
                 str(ex),
                 total_success,
                 total_errors,
-                batch_id,
+                sp_exec_id,
             )
             conn.commit()
         raise

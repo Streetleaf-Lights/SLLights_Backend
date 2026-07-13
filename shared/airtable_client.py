@@ -6,7 +6,7 @@ AIRTABLE_API_KEY = os.environ["AIRTABLE_API_KEY"]
 AIRTABLE_BASE_ID = os.environ["AIRTABLE_BASE_ID"]
 AIRTABLE_API_URL = "https://api.airtable.com/v0"
 
-PAGE_SIZE = 100              # Airtable's max records per page
+PAGE_SIZE = 100  # Airtable's max records per page
 REQUEST_DELAY_SECONDS = 0.2  # keeps us comfortably under Airtable's 5 req/sec limit
 
 
@@ -18,7 +18,7 @@ def fetch_all_records(table_name: str) -> tuple[list[dict], list[str]]:
     Returns:
         records: list of raw Airtable record dicts ({"id", "createdTime", "fields"})
         offsets_seen: list of offset tokens consumed along the way (for logging
-                      into SP_Execution.BatchIds / BatchCount)
+                      into SP_Execution.BatchCount)
     """
     records: list[dict] = []
     offsets_seen: list[str] = []
