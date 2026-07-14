@@ -7,6 +7,7 @@ import azure.functions as func
 
 from shared.customers_loader import load_customers
 from shared.projects_loader import load_projects
+from shared.poles_loader import load_poles
 
 app = func.FunctionApp()
 
@@ -43,14 +44,15 @@ def loadAirTableData(myTimer: func.TimerRequest) -> None:
         now_eastern.strftime("%Y-%m-%d %H:%M %Z"),
     )
 
-    # Projects loads first: Customers doesn't have a FK back from Projects
-    # (CustomerId is a plain unconstrained column), so this order can't hit
-    # a referential-integrity error even though the Customer row a given
-    # Project points at might not exist yet until load_customers() runs
-    # later in this same invocation.
+    # Load order is Poles -> Projects -> Customers. None of the three has a
+    # FK pointing "forward" at a table that hasn't loaded yet in this same
+    # invocation (Poles.ProjectId/CustomerId and Projects.CustomerId are all
+    # plain unconstrained columns), so this order can't hit a
+    # referential-integrity error even though a Pole's Project/Customer, or
+    # a Project's Customer, might not exist in the target table yet.
+    load_poles()
     load_projects()
     load_customers()
-    # load_poles()
     # load_pole_statuses()
 
     logging.info("loadAirTableData: run complete.")
@@ -69,8 +71,9 @@ def loadAirTableDataManual(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse("Manual trigger is disabled in Prod.", status_code=403)
 
     logging.info("loadAirTableDataManual: manual run triggered.")
+    load_poles()
     load_projects()
     load_customers()
     logging.info("loadAirTableDataManual: run complete.")
 
-    return func.HttpResponse("loadProjects + loadCustomers run complete.", status_code=200)
+    return func.HttpResponse("loadPoles + loadProjects + loadCustomers run complete.", status_code=200)

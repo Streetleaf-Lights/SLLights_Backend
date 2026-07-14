@@ -25,19 +25,22 @@ def make_http_request():
     )
 
 
-def patch_both_loaders(mocker):
+def patch_all_loaders(mocker):
     """
-    Patches both load_projects and load_customers, tracking call order via
-    a shared list so tests can assert Projects runs before Customers.
+    Patches load_poles, load_projects, and load_customers, tracking call
+    order via a shared list so tests can assert Poles -> Projects -> Customers.
     """
     call_order = []
+    mock_poles = mocker.patch(
+        "function_app.load_poles", side_effect=lambda: call_order.append("poles")
+    )
     mock_projects = mocker.patch(
         "function_app.load_projects", side_effect=lambda: call_order.append("projects")
     )
     mock_customers = mocker.patch(
         "function_app.load_customers", side_effect=lambda: call_order.append("customers")
     )
-    return mock_projects, mock_customers, call_order
+    return mock_poles, mock_projects, mock_customers, call_order
 
 
 # --------------------------------------------------------------------------
@@ -48,76 +51,97 @@ def patch_both_loaders(mocker):
 class TestLoadAirTableDataTimer:
     @freeze_time("2026-07-13 10:00:00")  # 6:00 AM EDT
     def test_runs_at_6am_eastern_summer(self, mocker):
-        mock_projects, mock_customers, _ = patch_both_loaders(mocker)
+        mock_poles, mock_projects, mock_customers, _ = patch_all_loaders(mocker)
         function_app.loadAirTableData(make_timer_request())
+        mock_poles.assert_called_once()
         mock_projects.assert_called_once()
         mock_customers.assert_called_once()
 
     @freeze_time("2026-07-13 22:00:00")  # 6:00 PM EDT
     def test_runs_at_6pm_eastern_summer(self, mocker):
-        mock_projects, mock_customers, _ = patch_both_loaders(mocker)
+        mock_poles, mock_projects, mock_customers, _ = patch_all_loaders(mocker)
         function_app.loadAirTableData(make_timer_request())
+        mock_poles.assert_called_once()
         mock_projects.assert_called_once()
         mock_customers.assert_called_once()
 
     @freeze_time("2026-01-13 11:00:00")  # 6:00 AM EST (winter, DST-proof check)
     def test_runs_at_6am_eastern_winter(self, mocker):
-        mock_projects, mock_customers, _ = patch_both_loaders(mocker)
+        mock_poles, mock_projects, mock_customers, _ = patch_all_loaders(mocker)
         function_app.loadAirTableData(make_timer_request())
+        mock_poles.assert_called_once()
         mock_projects.assert_called_once()
         mock_customers.assert_called_once()
 
     @freeze_time("2026-07-13 23:00:00")  # 7:00 PM EDT -- not a target hour
     def test_skips_outside_target_hours(self, mocker):
-        mock_projects, mock_customers, _ = patch_both_loaders(mocker)
+        mock_poles, mock_projects, mock_customers, _ = patch_all_loaders(mocker)
         function_app.loadAirTableData(make_timer_request())
+        mock_poles.assert_not_called()
         mock_projects.assert_not_called()
         mock_customers.assert_not_called()
 
     @freeze_time("2026-07-13 14:00:00")  # 10:00 AM EDT -- not a target hour
     def test_skips_midday(self, mocker):
-        mock_projects, mock_customers, _ = patch_both_loaders(mocker)
+        mock_poles, mock_projects, mock_customers, _ = patch_all_loaders(mocker)
         function_app.loadAirTableData(make_timer_request())
+        mock_poles.assert_not_called()
         mock_projects.assert_not_called()
         mock_customers.assert_not_called()
 
     @freeze_time("2026-07-13 10:00:00")  # 6:00 AM EDT, target hour
     def test_past_due_still_runs_and_logs_warning(self, mocker, caplog):
-        mock_projects, mock_customers, _ = patch_both_loaders(mocker)
+        mock_poles, mock_projects, mock_customers, _ = patch_all_loaders(mocker)
         with caplog.at_level("WARNING"):
             function_app.loadAirTableData(make_timer_request(past_due=True))
+        mock_poles.assert_called_once()
         mock_projects.assert_called_once()
         mock_customers.assert_called_once()
         assert any("past due" in rec.message for rec in caplog.records)
 
     @freeze_time("2026-07-13 23:00:00")  # not a target hour
     def test_past_due_outside_target_hour_still_skips_load(self, mocker):
-        mock_projects, mock_customers, _ = patch_both_loaders(mocker)
+        mock_poles, mock_projects, mock_customers, _ = patch_all_loaders(mocker)
         function_app.loadAirTableData(make_timer_request(past_due=True))
+        mock_poles.assert_not_called()
         mock_projects.assert_not_called()
         mock_customers.assert_not_called()
 
     @freeze_time("2026-07-13 10:00:00")
-    def test_projects_runs_before_customers(self, mocker):
-        _, _, call_order = patch_both_loaders(mocker)
+    def test_poles_runs_before_projects_before_customers(self, mocker):
+        _, _, _, call_order = patch_all_loaders(mocker)
         function_app.loadAirTableData(make_timer_request())
-        assert call_order == ["projects", "customers"]
+        assert call_order == ["poles", "projects", "customers"]
 
     @freeze_time("2026-07-13 10:00:00")
     def test_propagates_exception_from_load_customers(self, mocker):
+        mocker.patch("function_app.load_poles")
         mocker.patch("function_app.load_projects")
         mocker.patch("function_app.load_customers", side_effect=RuntimeError("db down"))
         with pytest.raises(RuntimeError, match="db down"):
             function_app.loadAirTableData(make_timer_request())
 
     @freeze_time("2026-07-13 10:00:00")
+    def test_later_loaders_not_called_if_load_poles_fails(self, mocker):
+        """
+        Poles runs first with no exception handling around it in
+        loadAirTableData, so a failure there prevents Projects and
+        Customers from running at all in this invocation (they'll get
+        another shot at the next scheduled hour).
+        """
+        mocker.patch("function_app.load_poles", side_effect=RuntimeError("poles failed"))
+        mock_projects = mocker.patch("function_app.load_projects")
+        mock_customers = mocker.patch("function_app.load_customers")
+
+        with pytest.raises(RuntimeError, match="poles failed"):
+            function_app.loadAirTableData(make_timer_request())
+
+        mock_projects.assert_not_called()
+        mock_customers.assert_not_called()
+
+    @freeze_time("2026-07-13 10:00:00")
     def test_load_customers_not_called_if_load_projects_fails(self, mocker):
-        """
-        Projects runs first with no exception handling around it in
-        loadAirTableData, so a failure there prevents Customers from
-        running at all in this invocation (it'll get another shot at the
-        next scheduled hour).
-        """
+        mocker.patch("function_app.load_poles")
         mocker.patch("function_app.load_projects", side_effect=RuntimeError("projects failed"))
         mock_customers = mocker.patch("function_app.load_customers")
 
@@ -135,61 +159,78 @@ class TestLoadAirTableDataTimer:
 class TestLoadAirTableDataManual:
     def test_blocked_in_prod(self, mocker, monkeypatch):
         monkeypatch.setattr(function_app, "ENVIRONMENT", "Prod")
-        mock_projects, mock_customers, _ = patch_both_loaders(mocker)
+        mock_poles, mock_projects, mock_customers, _ = patch_all_loaders(mocker)
 
         response = function_app.loadAirTableDataManual(make_http_request())
 
         assert response.status_code == 403
+        mock_poles.assert_not_called()
         mock_projects.assert_not_called()
         mock_customers.assert_not_called()
 
     def test_runs_when_not_prod(self, mocker, monkeypatch):
         monkeypatch.setattr(function_app, "ENVIRONMENT", "Dev")
-        mock_projects, mock_customers, _ = patch_both_loaders(mocker)
+        mock_poles, mock_projects, mock_customers, _ = patch_all_loaders(mocker)
 
         response = function_app.loadAirTableDataManual(make_http_request())
 
         assert response.status_code == 200
-        assert response.get_body() == b"loadProjects + loadCustomers run complete."
+        assert response.get_body() == b"loadPoles + loadProjects + loadCustomers run complete."
+        mock_poles.assert_called_once()
         mock_projects.assert_called_once()
         mock_customers.assert_called_once()
 
-    def test_projects_runs_before_customers(self, mocker, monkeypatch):
+    def test_poles_runs_before_projects_before_customers(self, mocker, monkeypatch):
         monkeypatch.setattr(function_app, "ENVIRONMENT", "Dev")
-        _, _, call_order = patch_both_loaders(mocker)
+        _, _, _, call_order = patch_all_loaders(mocker)
 
         function_app.loadAirTableDataManual(make_http_request())
 
-        assert call_order == ["projects", "customers"]
+        assert call_order == ["poles", "projects", "customers"]
 
     def test_runs_when_environment_unset_defaults_to_dev_behavior(self, mocker, monkeypatch):
         # ENVIRONMENT defaults to "Dev" for any value other than "Prod"
         monkeypatch.setattr(function_app, "ENVIRONMENT", "Staging")
-        mock_projects, mock_customers, _ = patch_both_loaders(mocker)
+        mock_poles, mock_projects, mock_customers, _ = patch_all_loaders(mocker)
 
         response = function_app.loadAirTableDataManual(make_http_request())
 
         assert response.status_code == 200
+        mock_poles.assert_called_once()
         mock_projects.assert_called_once()
         mock_customers.assert_called_once()
 
     def test_is_synchronous_exception_propagates_to_caller(self, mocker, monkeypatch):
         """
-        Locks in current behavior: both loaders are called directly in the
-        request-handling path (no background thread), so a failure
+        Locks in current behavior: all three loaders are called directly in
+        the request-handling path (no background thread), so a failure
         propagates out of the handler rather than being swallowed. If
         fire-and-forget threading is reintroduced later, this test will
         start failing and should be updated deliberately.
         """
         monkeypatch.setattr(function_app, "ENVIRONMENT", "Dev")
+        mocker.patch("function_app.load_poles")
         mocker.patch("function_app.load_projects")
         mocker.patch("function_app.load_customers", side_effect=RuntimeError("db down"))
 
         with pytest.raises(RuntimeError, match="db down"):
             function_app.loadAirTableDataManual(make_http_request())
 
+    def test_later_loaders_not_called_if_load_poles_fails(self, mocker, monkeypatch):
+        monkeypatch.setattr(function_app, "ENVIRONMENT", "Dev")
+        mocker.patch("function_app.load_poles", side_effect=RuntimeError("poles failed"))
+        mock_projects = mocker.patch("function_app.load_projects")
+        mock_customers = mocker.patch("function_app.load_customers")
+
+        with pytest.raises(RuntimeError, match="poles failed"):
+            function_app.loadAirTableDataManual(make_http_request())
+
+        mock_projects.assert_not_called()
+        mock_customers.assert_not_called()
+
     def test_load_customers_not_called_if_load_projects_fails(self, mocker, monkeypatch):
         monkeypatch.setattr(function_app, "ENVIRONMENT", "Dev")
+        mocker.patch("function_app.load_poles")
         mocker.patch("function_app.load_projects", side_effect=RuntimeError("projects failed"))
         mock_customers = mocker.patch("function_app.load_customers")
 

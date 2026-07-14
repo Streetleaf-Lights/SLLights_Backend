@@ -149,6 +149,58 @@ def patch_fetch_all_records_projects(mocker):
 
 
 @pytest.fixture
+def patch_get_connection_poles(mocker, mock_conn):
+    """Patches shared.poles_loader.get_connection to return mock_conn."""
+    return mocker.patch(
+        "shared.poles_loader.get_connection", return_value=mock_conn
+    )
+
+
+@pytest.fixture
+def patch_fetch_all_records_poles(mocker):
+    """Patches shared.poles_loader.fetch_all_records (already imported by name)."""
+    return mocker.patch("shared.poles_loader.fetch_all_records")
+
+
+@pytest.fixture
+def make_pole_record():
+    """Factory for building a raw Airtable 'Streetleaf Poles' record dict
+    with sane defaults, using the real Airtable field names."""
+
+    def _make(
+        record_id="rec_pole_0000001",
+        created_time="2026-07-02T18:00:00.000Z",
+        pole_number="P-1001",
+        location_id="LOC-42",
+        project_ids=None,
+        customer_ids=None,
+        install_date="2026-03-01",
+        lat=27.9506,
+        long=-82.4572,
+        extra_fields=None,
+    ):
+        fields = {
+            "Pole Number": pole_number,
+            "Location ID": location_id,
+            "Contracting Entity": project_ids if project_ids is not None else ["recProject123"],
+            "Customer ID": customer_ids if customer_ids is not None else ["recCustomer456"],
+            "Field Installed": install_date,
+            "LAT": lat,
+            "LONG": long,
+        }
+        if extra_fields:
+            fields.update(extra_fields)
+
+        return {
+            "id": record_id,
+            "createdTime": created_time,
+            "fields": fields,
+        }
+
+    return _make
+
+
+@pytest.fixture
 def make_project_record():
     """Factory for building a raw Airtable 'Project Tracking' record dict
     with sane defaults, using the real Airtable field names."""

@@ -9,5 +9,6 @@ SELECT TOP (1000) [Id]
       ,[InstallDates]
       ,[AirTableCreatedDateTime]
   FROM [dbo].[Projects]
+  WHERE [CustomerId] = 'recwx649JfiRmWqxF'
   ORDER BY [AirTableCreatedDateTime] DESC
   

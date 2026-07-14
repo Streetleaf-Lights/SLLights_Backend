@@ -1,30 +1,46 @@
 # LightsApp — Airtable → Azure SQL Sync (Python Azure Functions)
 
-A Python Azure Functions project (v2 programming model) that syncs project
-and customer data from Airtable into Azure SQL Database on a schedule,
-running on a Flex Consumption (Linux) plan.
+A Python Azure Functions project (v2 programming model) that syncs pole,
+project, and customer data from Airtable into Azure SQL Database on a
+schedule, running on a Flex Consumption (Linux) plan.
 
 ## Project structure
 
 ```
-LightsApp/
+Backend/
 ├── function_app.py         # Function definitions (v2 model, all triggers live here)
 │                            #   - loadAirTableData: timer trigger, fires 6 AM/6 PM Eastern
-│                            #     runs load_projects() then load_customers(), in that order
+│                            #     runs load_poles() -> load_projects() -> load_customers()
 │                            #   - loadAirTableDataManual: manual HTTP trigger, blocked in Prod
 ├── shared/
 │   ├── airtable_client.py   # Paginated Airtable fetch (fetch_all_records)
 │   ├── sql_client.py        # Azure SQL connection helper (get_connection)
 │   ├── datetime_utils.py    # Shared Eastern-time / DATETIMEOFFSET helpers
 │   ├── customers_loader.py  # Airtable → Customers upsert logic (load_customers)
-│   └── projects_loader.py   # Airtable → Projects upsert logic (load_projects)
-├── sql/
-│   └── create_projects_table.sql  # Guarded CREATE TABLE for Projects
+│   ├── projects_loader.py   # Airtable → Projects upsert logic (load_projects)
+│   └── poles_loader.py      # Airtable → Poles upsert logic (load_poles)
+├── sql/                     # One folder per table; each has a guarded CREATE
+│   │                        # and a scratch SELECT for querying/debugging in SSMS/ADS
+│   ├── Customers/
+│   │   ├── Create tbl Customers.sql
+│   │   └── Select tbl Customers.sql
+│   ├── Poles/
+│   │   ├── Create tbl Poles.sql
+│   │   └── Select tbl Poles.sql
+│   ├── Projects/
+│   │   ├── Create tbl Projects.sql
+│   │   └── Select tbl Projects.sql
+│   └── SP_Execution/
+│       ├── Create tbl SP_Execution.sql
+│       └── Select tbl SP_Execution.sql
 ├── tests/                   # pytest suite — see "Running the tests" below
+├── .vscode/                  # Editor settings, launch/task configs
+├── .funcignore               # Files excluded from the deployment zip
 ├── host.json                 # Runtime configuration
 ├── local.settings.json       # Local dev settings (not committed to git)
 ├── requirements.txt          # Runtime dependencies
 ├── requirements-dev.txt      # Test-only dependencies
+├── Backend.code-workspace    # VS Code workspace file
 └── .gitignore
 ```
 
@@ -79,15 +95,12 @@ LightsApp/
    ```bash
    curl -X POST http://localhost:7071/api/loadAirTableDataManual
    ```
-   > If you've since set `routePrefix: ""` in `host.json` (as discussed
-   > when trimming the `/api/` prefix off the deployed URL), drop `/api`
-   > from the path above — the comment in `function_app.py` still shows
-   > the old `/api/`-prefixed path, so double check against your actual
-   > `host.json`.
+   (Confirmed against `host.json` — no custom `routePrefix` is set, so the
+   `/api/` prefix is correct as shown.)
 
 ## Running the tests
 
-83 tests, fully mocked — no real Airtable or Azure SQL calls, no
+125 tests, fully mocked — no real Airtable or Azure SQL calls, no
 credentials needed for the default run.
 
 | File | Focus |
@@ -95,10 +108,11 @@ credentials needed for the default run.
 | `tests/test_airtable_client.py` | Pagination (single/multi-page), offset handling, rate-limit sleep, auth header, HTTP error propagation |
 | `tests/test_sql_client.py` | Connection string from env, missing env var, pyodbc error passthrough |
 | `tests/test_datetime_utils.py` | `to_dto_string` offset formatting, `airtable_created_time_to_eastern` (winter/summer DST) |
-| `tests/test_customers_loader.py` | `_map_record_to_customer` field mapping, full `load_customers()` flow (success, partial row failure, top-level failure + `ErrorMessage` update, cleanup-on-error), MERGE SQL structural checks |
-| `tests/test_projects_loader.py` | Same shape as `test_customers_loader.py`, for `load_projects()` — including the linked-Customer-id mapping and the NULL-safe `INTERSECT` diff check (needed since `EffectiveDate`/`InstallDate` are `DATE` columns) |
-| `tests/test_function_app.py` | Timer trigger fires only at 6 AM/6 PM Eastern (verified across the DST boundary with freezegun), `past_due` handling, manual HTTP trigger's `Prod` block, synchronous (non-threaded) execution, **Projects runs before Customers** in both triggers |
-| `tests/test_schema_integration.py` | Column-name consistency between the code's SQL and a documented expected schema (both tables); opt-in **real** end-to-end test |
+| `tests/test_customers_loader.py` | `_map_record_to_customer` field mapping, full `load_customers()` flow (success, partial row failure, top-level failure + `ErrorMessage` update, cleanup-on-error), MERGE SQL structural checks, `ntext`-cast regression check |
+| `tests/test_projects_loader.py` | Same shape as `test_customers_loader.py`, for `load_projects()` — including the linked-Customer-id mapping, the NULL-safe `INTERSECT` diff check, and the `ntext`-cast fix regression check |
+| `tests/test_poles_loader.py` | Same shape again, for `load_poles()` — including the linked-Project-id mapping and the `'#NA'` → `0` Lat/Long cleanup |
+| `tests/test_function_app.py` | Timer trigger fires only at 6 AM/6 PM Eastern (verified across the DST boundary with freezegun), `past_due` handling, manual HTTP trigger's `Prod` block, synchronous (non-threaded) execution, **Poles runs before Projects runs before Customers** in both triggers, and a failure in an earlier loader blocks the later ones |
+| `tests/test_schema_integration.py` | Column-name consistency between the code's SQL and a documented expected schema (all three tables); opt-in **real** end-to-end test |
 
 ```bash
 pytest -v
@@ -202,11 +216,12 @@ reference for a from-scratch project, not as the LightsApp deploy runbook.
   function key is required when calling the deployed endpoint. It's also
   hard-blocked (403) when `ENVIRONMENT == "Prod"`, regardless of auth level.
 - **Manual trigger runs synchronously** — `loadAirTableDataManual` calls
-  `load_customers()` directly in the request path, no
-  `threading.Thread` fire-and-forget. If a long Airtable sync risks
-  hitting Azure's 230-second HTTP gateway timeout on Flex Consumption
-  again, that's the pattern to reach for — `tests/test_function_app.py`
-  has a tripwire test that'll fail the moment threading is reintroduced.
+  `load_poles()`, `load_projects()`, and `load_customers()` directly in the
+  request path, no `threading.Thread` fire-and-forget. If a long Airtable
+  sync risks hitting Azure's 230-second HTTP gateway timeout on Flex
+  Consumption again, that's the pattern to reach for —
+  `tests/test_function_app.py` has a tripwire test that'll fail the moment
+  threading is reintroduced.
 - **Schema discrepancy to verify**: `customers_loader.py`'s MERGE statement
   reads/writes a `Customers` column called `SP_ExecId`. Earlier schema
   design work in this project created that column as `BatchId` instead.
@@ -240,3 +255,28 @@ reference for a from-scratch project, not as the LightsApp deploy runbook.
   the Customer a Project points at may not exist in the table yet at
   insert time. An FK constraint would make that insert fail. If you add
   one later, either flip the load order or make it deferred/not-enforced.
+- **Poles table field mappings — all confirmed**: Airtable table is
+  `Streetleaf Poles`. `Pole Number`→`PoleNumber`, `Location ID`→`LocationId`
+  (plain scalar), `Field Installed`→`InstallDate`, `LAT`/`LONG`→`Lat`/`Long`.
+  `ProjectId` and `CustomerId` are both linked-record fields (`Contracting
+  Entity` and `Customer ID` respectively) — both stored as a list of ids in
+  Airtable, first one taken. Note: `Contracting Entity` is the same-looking
+  label used in `Project Tracking` (where it maps to `CustomerId` there) —
+  confirmed as a coincidental naming reuse, not a shared meaning, so no
+  action needed there.
+- **Poles.ProjectId/CustomerId have no FK either, same reasoning** —
+  `load_poles()` now runs before both `load_projects()` and
+  `load_customers()`, so neither referenced row exists yet at insert time.
+- **Fixed: `LAT`/`LONG` error strings failing to load** — Airtable returns
+  literal error strings for these fields when the underlying formula/lookup
+  can't resolve (e.g. an ungeocoded address, or a divide-by-zero in the
+  formula), which don't fit `Poles.Lat`/`Poles.Long` (`FLOAT`).
+  `_map_record_to_pole()` normalizes any of `'#NA'`, `'#ERROR!'`, or
+  `'#DIV/0!'` (whitespace-trimmed) to `0` before the value reaches the
+  MERGE. The set lives in `poles_loader._COORDINATE_ERROR_STRINGS` — add to
+  it if other error strings turn up in the wild.
+- **Fixed: `LAT`/`LONG` with leading/trailing whitespace failing to load**
+  — `_clean_coordinate()` now `.strip()`s any string value for these two
+  fields before anything else happens to it (including the error-string
+  check above), so a value like `' 27.9506 '` loads as `'27.9506'` instead
+  of failing.
