@@ -132,3 +132,55 @@ def patch_get_connection(mocker, mock_conn):
 def patch_fetch_all_records(mocker):
     """Patches shared.customers_loader.fetch_all_records (already imported by name)."""
     return mocker.patch("shared.customers_loader.fetch_all_records")
+
+
+@pytest.fixture
+def patch_get_connection_projects(mocker, mock_conn):
+    """Patches shared.projects_loader.get_connection to return mock_conn."""
+    return mocker.patch(
+        "shared.projects_loader.get_connection", return_value=mock_conn
+    )
+
+
+@pytest.fixture
+def patch_fetch_all_records_projects(mocker):
+    """Patches shared.projects_loader.fetch_all_records (already imported by name)."""
+    return mocker.patch("shared.projects_loader.fetch_all_records")
+
+
+@pytest.fixture
+def make_project_record():
+    """Factory for building a raw Airtable 'Project Tracking' record dict
+    with sane defaults, using the real Airtable field names."""
+
+    def _make(
+        record_id="rec_proj_0000001",
+        created_time="2026-07-02T18:00:00.000Z",
+        name="Downtown Fiber Rollout",
+        pole_numbers=None,
+        pole_ids=None,
+        customer_ids=None,
+        poles_under_contract=25,
+        effective_date="2026-01-15",
+        install_dates=None,
+        extra_fields=None,
+    ):
+        fields = {
+            "Executed Project": name,
+            "PoleNumbers": pole_numbers if pole_numbers is not None else ["P-100", "P-101"],
+            "Streetleaf Poles": pole_ids if pole_ids is not None else ["pole1", "pole2"],
+            "Contracting Entity": customer_ids if customer_ids is not None else ["recCustomer123"],
+            "Lights Under Contract": poles_under_contract,
+            "Effective Date": effective_date,
+            "Install Date(S)": install_dates if install_dates is not None else ["2026-03-01"],
+        }
+        if extra_fields:
+            fields.update(extra_fields)
+
+        return {
+            "id": record_id,
+            "createdTime": created_time,
+            "fields": fields,
+        }
+
+    return _make

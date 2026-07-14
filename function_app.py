@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 import azure.functions as func
 
 from shared.customers_loader import load_customers
+from shared.projects_loader import load_projects
 
 app = func.FunctionApp()
 
@@ -42,9 +43,13 @@ def loadAirTableData(myTimer: func.TimerRequest) -> None:
         now_eastern.strftime("%Y-%m-%d %H:%M %Z"),
     )
 
-    # Only Customers for now. Add these back in as they're built out:
+    # Projects loads first: Customers doesn't have a FK back from Projects
+    # (CustomerId is a plain unconstrained column), so this order can't hit
+    # a referential-integrity error even though the Customer row a given
+    # Project points at might not exist yet until load_customers() runs
+    # later in this same invocation.
+    load_projects()
     load_customers()
-    # load_projects()
     # load_poles()
     # load_pole_statuses()
 
@@ -64,7 +69,8 @@ def loadAirTableDataManual(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse("Manual trigger is disabled in Prod.", status_code=403)
 
     logging.info("loadAirTableDataManual: manual run triggered.")
+    load_projects()
     load_customers()
     logging.info("loadAirTableDataManual: run complete.")
 
-    return func.HttpResponse("loadCustomers run complete.", status_code=200)
+    return func.HttpResponse("loadProjects + loadCustomers run complete.", status_code=200)

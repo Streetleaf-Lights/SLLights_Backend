@@ -8,68 +8,30 @@ import pytest
 
 from shared import customers_loader
 
-
-# --------------------------------------------------------------------------
-# _to_dto_string
-# --------------------------------------------------------------------------
-
 DTO_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} [+-]\d{2}:\d{2}$")
 
 
-class TestToDtoString:
-    def test_formats_negative_offset(self):
+# --------------------------------------------------------------------------
+# The DTO-formatting and Eastern-time-conversion helpers now live in
+# shared/datetime_utils.py (see tests/test_datetime_utils.py for full
+# coverage) and are re-exported into this module by name for backwards
+# compatibility. This is just a sanity check that the re-export still works.
+# --------------------------------------------------------------------------
+
+
+class TestSharedHelpersReexport:
+    def test_to_dto_string_is_reexported(self):
         dt = datetime(2026, 7, 2, 14, 14, 39, 901000, tzinfo=timezone(timedelta(hours=-4)))
         assert customers_loader._to_dto_string(dt) == "2026-07-02 14:14:39.901 -04:00"
 
-    def test_formats_positive_offset(self):
-        dt = datetime(2026, 1, 15, 9, 0, 0, 500000, tzinfo=timezone(timedelta(hours=5, minutes=30)))
-        assert customers_loader._to_dto_string(dt) == "2026-01-15 09:00:00.500 +05:30"
-
-    def test_formats_utc_zero_offset(self):
-        dt = datetime(2025, 11, 17, 19, 56, 44, 0, tzinfo=timezone.utc)
-        assert customers_loader._to_dto_string(dt) == "2025-11-17 19:56:44.000 +00:00"
-
-    def test_truncates_microseconds_to_milliseconds(self):
-        dt = datetime(2026, 3, 1, 0, 0, 0, 123456, tzinfo=timezone(timedelta(hours=-5)))
-        result = customers_loader._to_dto_string(dt)
-        assert result.endswith(".123 -05:00")
-
-    def test_output_matches_dto_shape(self):
-        dt = datetime.now(customers_loader.EASTERN)
-        assert DTO_PATTERN.match(customers_loader._to_dto_string(dt))
-
-
-# --------------------------------------------------------------------------
-# _airtable_created_time_to_eastern
-# --------------------------------------------------------------------------
-
-
-class TestAirtableCreatedTimeToEastern:
-    def test_none_returns_none(self):
-        assert customers_loader._airtable_created_time_to_eastern(None) is None
-
-    def test_empty_string_returns_none(self):
-        assert customers_loader._airtable_created_time_to_eastern("") is None
-
-    def test_winter_utc_converts_to_est_minus_5(self):
-        # Nov 17 is outside US DST -> EST, UTC-5
-        result = customers_loader._airtable_created_time_to_eastern(
-            "2025-11-17T19:56:44.000Z"
-        )
-        assert result == "2025-11-17 14:56:44.000 -05:00"
-
-    def test_summer_utc_converts_to_edt_minus_4(self):
-        # July 2 is inside US DST -> EDT, UTC-4
-        result = customers_loader._airtable_created_time_to_eastern(
-            "2026-07-02T18:00:00.000Z"
-        )
+    def test_airtable_created_time_to_eastern_is_reexported(self):
+        result = customers_loader._airtable_created_time_to_eastern("2026-07-02T18:00:00.000Z")
         assert result == "2026-07-02 14:00:00.000 -04:00"
 
-    def test_result_matches_dto_shape(self):
-        result = customers_loader._airtable_created_time_to_eastern(
-            "2026-01-01T00:00:00.000Z"
-        )
-        assert DTO_PATTERN.match(result)
+    def test_eastern_constant_is_reexported(self):
+        assert customers_loader.EASTERN is not None
+        now = datetime.now(customers_loader.EASTERN)
+        assert DTO_PATTERN.match(customers_loader._to_dto_string(now))
 
 
 # --------------------------------------------------------------------------
@@ -186,6 +148,18 @@ class TestUpsertSqlStructure:
         fail at runtime with an invalid column name error.
         """
         assert "SP_ExecId" in customers_loader._UPSERT_SQL
+
+    def test_long_text_columns_are_cast_to_nvarchar_max(self):
+        """
+        Regression test for the same 'ntext is not comparable' bug that hit
+        Projects (see test_projects_loader.py): pyodbc binds long string
+        parameters as ntext once they cross a length threshold. ProjectNames/
+        ProjectIds are JSON-encoded lists that could grow long enough to
+        trigger it, so they're explicitly cast to NVARCHAR(MAX).
+        """
+        sql = customers_loader._UPSERT_SQL
+        assert "CAST(? AS NVARCHAR(MAX)) AS ProjectNames" in sql
+        assert "CAST(? AS NVARCHAR(MAX)) AS ProjectIds" in sql
 
 
 # --------------------------------------------------------------------------

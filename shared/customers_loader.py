@@ -1,61 +1,39 @@
 import os
 import json
 import logging
-from datetime import datetime
-from zoneinfo import ZoneInfo
 
 from shared.airtable_client import fetch_all_records
 from shared.sql_client import get_connection
+from shared.datetime_utils import (
+    EASTERN,
+    now_eastern as _now_eastern,
+    to_dto_string as _to_dto_string,
+    airtable_created_time_to_eastern as _airtable_created_time_to_eastern,
+)
 
 # Adjust this to match the exact table name in your Airtable base.
 AIRTABLE_CUSTOMERS_TABLE = "Companies_New"
 
 ENVIRONMENT = os.environ.get("ENVIRONMENT", "Dev")
-EASTERN = ZoneInfo("America/New_York")
-
-
-def _now_eastern() -> datetime:
-    """Current time as an aware datetime in America/New_York (handles EST/EDT automatically)."""
-    return datetime.now(EASTERN)
-
-
-def _to_dto_string(dt: datetime) -> str:
-    """
-    Formats an aware datetime as an explicit DATETIMEOFFSET literal string,
-    e.g. '2026-07-02 14:14:39.901 -04:00'.
-
-    pyodbc silently converts timezone-aware datetime objects to UTC (offset
-    +00:00) when binding them as parameters -- the wall-clock hour ends up
-    right, but the offset gets discarded. Passing a pre-formatted string
-    instead lets SQL Server parse the offset directly, so it's preserved.
-    """
-    offset = dt.strftime("%z")  # e.g. '-0400'
-    offset_fmt = f"{offset[:3]}:{offset[3:]}"  # '-04:00'
-    return dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] + " " + offset_fmt
-
-
-def _airtable_created_time_to_eastern(created_time: str | None) -> str | None:
-    """
-    Converts Airtable's createdTime (always UTC, e.g. '2025-11-17T19:56:44.000Z')
-    into an Eastern-time DATETIMEOFFSET string, e.g. '2025-11-17 14:56:44.000 -05:00'.
-    """
-    if not created_time:
-        return None
-
-    utc_dt = datetime.fromisoformat(created_time.replace("Z", "+00:00"))
-    eastern_dt = utc_dt.astimezone(EASTERN)
-    return _to_dto_string(eastern_dt)
 
 
 # Merge logic only fires the UPDATE branch when at least one of these fields
 # actually differs from what's already stored, so unchanged customers are
 # left untouched. SP_ExecId is intentionally excluded from the diff check
 # (it's always refreshed to the latest run) but IS included in the SET list.
+#
+# CAST(...AS NVARCHAR(MAX)) on ProjectNames/ProjectIds: pyodbc binds string
+# parameters as the legacy `ntext` type once they cross a length threshold
+# (long JSON-encoded lists), and ntext doesn't support comparison operators
+# like <> -- this is the same bug that broke Projects' INTERSECT diff-check
+# for records with many poles. Customers hasn't hit it yet (needs a customer
+# with enough linked projects to push the JSON string past the threshold),
+# but the mechanism is identical, so casting here preempts it.
 _UPSERT_SQL = """
 MERGE Customers AS target
 USING (
     SELECT
-        ? AS Id, ? AS Name, ? AS ProjectNames, ? AS ProjectIds, ? AS SP_ExecId,
+        ? AS Id, ? AS Name, CAST(? AS NVARCHAR(MAX)) AS ProjectNames, CAST(? AS NVARCHAR(MAX)) AS ProjectIds, ? AS SP_ExecId,
         ? AS Address, ? AS City, ? AS State, ? AS Zip, ? AS Phone,
         ? AS AirTableCreatedDateTime
 ) AS source

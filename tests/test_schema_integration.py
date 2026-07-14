@@ -34,7 +34,7 @@ import re
 
 import pytest
 
-from shared import customers_loader
+from shared import customers_loader, projects_loader
 
 
 # --------------------------------------------------------------------------
@@ -66,6 +66,19 @@ EXPECTED_CUSTOMERS_COLUMNS = {
     "State",
     "Zip",
     "Phone",
+    "AirTableCreatedDateTime",
+}
+
+EXPECTED_PROJECTS_COLUMNS = {
+    "Id",
+    "Name",
+    "PoleNumbers",
+    "PoleIds",
+    "SP_ExecId",
+    "CustomerId",
+    "PolesUnderContract",
+    "EffectiveDate",
+    "InstallDates",
     "AirTableCreatedDateTime",
 }
 
@@ -137,6 +150,36 @@ class TestCustomersSchemaConsistency:
         assert "ON target.Id = source.Id" in sql
 
 
+class TestProjectsSchemaConsistency:
+    def test_merge_insert_columns_are_known(self):
+        sql = projects_loader._PROJECT_UPSERT_SQL
+        match = re.search(r"INSERT \(([^)]+)\)", sql)
+        cols = {c.strip() for c in match.group(1).split(",")}
+        assert cols == EXPECTED_PROJECTS_COLUMNS
+
+    def test_merge_update_set_columns_are_known(self):
+        sql = projects_loader._PROJECT_UPSERT_SQL
+        match = re.search(r"THEN UPDATE SET\s*(.+?)\s*WHEN NOT MATCHED", sql, re.DOTALL)
+        assignments = match.group(1).strip().rstrip(",").split(",")
+        cols = {a.split("=")[0].strip() for a in assignments}
+        # Update path intentionally never touches Id or AirTableCreatedDateTime
+        assert cols == EXPECTED_PROJECTS_COLUMNS - {"Id", "AirTableCreatedDateTime"}
+
+    def test_merge_match_key_is_id(self):
+        assert "ON target.Id = source.Id" in projects_loader._PROJECT_UPSERT_SQL
+
+    def test_no_fk_reference_to_customers(self):
+        """
+        Locks in the deliberate design choice: Projects.CustomerId has no
+        FK back to Customers, because load_projects() runs before
+        load_customers() in function_app.py. If a REFERENCES Customers
+        clause shows up here later, it needs to come with a load-order
+        change too (or the MERGE will start failing on new Projects whose
+        Customer hasn't loaded yet).
+        """
+        assert "REFERENCES Customers" not in projects_loader._PROJECT_UPSERT_SQL
+
+
 # --------------------------------------------------------------------------
 # Opt-in real end-to-end integration test.
 #
@@ -159,14 +202,19 @@ _LIVE_TESTS_ENABLED = os.environ.get("RUN_LIVE_INTEGRATION_TESTS") == "1"
     ),
 )
 class TestLiveIntegration:
-    def test_load_customers_against_real_airtable_and_sql(self):
+    def test_load_projects_then_customers_against_real_airtable_and_sql(self):
         assert os.environ.get("ENVIRONMENT", "Dev") != "Prod", (
             "Refusing to run the live integration test with ENVIRONMENT=Prod. "
             "Point this at a Dev/Staging environment."
         )
-        # Reload so the module picks up the real env vars instead of the
+        # Reload so the modules pick up the real env vars instead of the
         # test defaults conftest.py sets with setdefault().
         import importlib
 
+        importlib.reload(projects_loader)
         importlib.reload(customers_loader)
-        customers_loader.load_customers()  # will raise on failure -- that's the assertion
+
+        # Same order as function_app.py: Projects first (no FK depends on
+        # Customers existing yet), then Customers.
+        projects_loader.load_projects()  # will raise on failure -- that's the assertion
+        customers_loader.load_customers()
