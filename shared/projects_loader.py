@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import time
 
 from shared.airtable_client import fetch_all_records
 from shared.sql_client import get_connection
@@ -128,14 +129,18 @@ def load_projects() -> None:
         conn.commit()
 
         # 2. Pull every page from Airtable before doing any DB writes
+        fetch_start = time.perf_counter()
         records, offsets_seen = fetch_all_records(AIRTABLE_PROJECTS_TABLE)
+        fetch_seconds = time.perf_counter() - fetch_start
         logging.info(
-            "loadProjects: fetched %d record(s) across %d page(s).",
+            "loadProjects: fetched %d record(s) across %d page(s) in %.1fs.",
             len(records),
             len(offsets_seen) + 1,
+            fetch_seconds,
         )
 
         # 3. Upsert each project -- insert if new, update only if something changed
+        upsert_start = time.perf_counter()
         for record in records:
             project = _map_record_to_project(record)
             try:
@@ -162,6 +167,11 @@ def load_projects() -> None:
                 )
 
         conn.commit()
+        logging.info(
+            "loadProjects: upsert phase took %.1fs for %d record(s).",
+            time.perf_counter() - upsert_start,
+            len(records),
+        )
 
         # 4. Close out the SP_Execution row with final counts
         cursor.execute(

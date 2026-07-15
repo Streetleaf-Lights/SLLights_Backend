@@ -169,6 +169,28 @@ class TestUpsertSqlStructure:
 
 
 class TestLoadCustomersSuccessFlow:
+    def test_logs_fetch_and_upsert_phase_timings(
+        self,
+        patch_get_connection,
+        patch_fetch_all_records,
+        mock_cursor,
+        make_airtable_record,
+        caplog,
+    ):
+        patch_fetch_all_records.return_value = ([make_airtable_record()], [])
+
+        with caplog.at_level("INFO"):
+            customers_loader.load_customers()
+
+        messages = [rec.message for rec in caplog.records]
+        assert any(
+            "loadCustomers: fetched" in m and "page(s) in" in m and m.rstrip().endswith("s.")
+            for m in messages
+        )
+        assert any(
+            "loadCustomers: upsert phase took" in m and "record(s)" in m for m in messages
+        )
+
     def test_full_success_flow_two_records(
         self, patch_get_connection, patch_fetch_all_records, mock_conn, mock_cursor, make_airtable_record
     ):

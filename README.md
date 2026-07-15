@@ -100,17 +100,17 @@ Backend/
 
 ## Running the tests
 
-125 tests, fully mocked — no real Airtable or Azure SQL calls, no
+149 tests, fully mocked — no real Airtable or Azure SQL calls, no
 credentials needed for the default run.
 
 | File | Focus |
 |---|---|
-| `tests/test_airtable_client.py` | Pagination (single/multi-page), offset handling, rate-limit sleep, auth header, HTTP error propagation |
+| `tests/test_airtable_client.py` | Pagination (single/multi-page), offset handling, adaptive rate-limit pacing (sleeps only the remaining gap, skips it entirely when a request was already slow), optional `fields[]` payload restriction, auth header, HTTP error propagation |
 | `tests/test_sql_client.py` | Connection string from env, missing env var, pyodbc error passthrough |
 | `tests/test_datetime_utils.py` | `to_dto_string` offset formatting, `airtable_created_time_to_eastern` (winter/summer DST) |
-| `tests/test_customers_loader.py` | `_map_record_to_customer` field mapping, full `load_customers()` flow (success, partial row failure, top-level failure + `ErrorMessage` update, cleanup-on-error), MERGE SQL structural checks, `ntext`-cast regression check |
-| `tests/test_projects_loader.py` | Same shape as `test_customers_loader.py`, for `load_projects()` — including the linked-Customer-id mapping, the NULL-safe `INTERSECT` diff check, and the `ntext`-cast fix regression check |
-| `tests/test_poles_loader.py` | Same shape again, for `load_poles()` — including the linked-Project-id mapping and the `'#NA'` → `0` Lat/Long cleanup |
+| `tests/test_customers_loader.py` | `_map_record_to_customer` field mapping, full `load_customers()` flow (success, partial row failure, top-level failure + `ErrorMessage` update, cleanup-on-error), MERGE SQL structural checks, `ntext`-cast regression check, fetch/upsert phase-timing logs |
+| `tests/test_projects_loader.py` | Same shape as `test_customers_loader.py`, for `load_projects()` — including the linked-Customer-id mapping, the NULL-safe `INTERSECT` diff check, the `ntext`-cast fix regression check, and fetch/upsert phase-timing logs |
+| `tests/test_poles_loader.py` | Same shape again, for `load_poles()` — including the linked-Project-id mapping, the LAT/LONG error-string/whitespace cleanup, the staging-table bulk MERGE (with chunk-level fallback to row-by-row on a failed chunk), and the Airtable `fields[]` restriction |
 | `tests/test_function_app.py` | Timer trigger fires only at 6 AM/6 PM Eastern (verified across the DST boundary with freezegun), `past_due` handling, manual HTTP trigger's `Prod` block, synchronous (non-threaded) execution, **Poles runs before Projects runs before Customers** in both triggers, and a failure in an earlier loader blocks the later ones |
 | `tests/test_schema_integration.py` | Column-name consistency between the code's SQL and a documented expected schema (all three tables); opt-in **real** end-to-end test |
 
@@ -280,3 +280,73 @@ reference for a from-scratch project, not as the LightsApp deploy runbook.
   fields before anything else happens to it (including the error-string
   check above), so a value like `' 27.9506 '` loads as `'27.9506'` instead
   of failing.
+- **`load_poles()` performance — three rounds of optimization, in order:**
+  1. *Round-trip batching* (14k+ poles was taking ~12 minutes). Poles were
+     switched from one `cursor.execute()` per row to `cursor.executemany()`
+     with `cursor.fast_executemany = True`, cutting ~14,000 round trips to
+     Azure SQL down to ~28. That alone got it to ~2 minutes.
+  2. *Set-based bulk MERGE* — `fast_executemany` only cuts network round
+     trips; the server still runs each MERGE statement in a batch
+     individually, and that per-statement execution cost was assumed to be
+     the remaining bottleneck. `load_poles()` stages each chunk into a
+     local temp table (`#PolesStaging`, see `poles_loader._STAGING_TABLE_SQL`)
+     via `executemany()`, then runs **one** set-based `MERGE ... USING
+     #PolesStaging` per chunk (`poles_loader._MERGE_FROM_STAGING_SQL`)
+     instead of one MERGE execution per row. Chunk size is
+     `poles_loader._UPSERT_BATCH_SIZE` (2000).
+
+     **Tradeoff**: a single bad row can now fail an entire chunk's
+     set-based MERGE, not just that row. `load_poles()` handles this by
+     falling back to the original row-by-row `_POLE_UPSERT_SQL` for any
+     chunk that fails this way — so the "blast radius" of one bad pole is
+     at most one chunk (2000 rows), not the whole run, and not a single
+     row either. Re-running already-applied rows during that fallback is
+     safe since MERGE is idempotent.
+
+  3. *Measured data corrected the diagnosis, then fixed the real
+     bottleneck.* `load_poles()` logs how long the Airtable fetch and the
+     upsert phase each took (`loadPoles: fetched N record(s) ... in X.Xs`
+     / `loadPoles: upsert phase took X.Xs`). A real run showed **fetch:
+     86.5s, upsert: 51.7s** — the fetch, not the SQL writes, turned out to
+     be the bigger piece (the earlier "~30-60s" estimate for it was wrong).
+     Two fixes followed from that:
+     - **`shared/airtable_client.py`'s pacing is now adaptive** instead of
+       a flat `time.sleep(0.2)` after every page. It tracks elapsed time
+       since the last request *started* and only sleeps whatever's left of
+       `MIN_REQUEST_INTERVAL_SECONDS` (0.2s) — measured production
+       latency was ~0.39s/request, already over that floor, so the fixed
+       sleep was pure waste (~29s of the 86.5s was literally just
+       `sleep()`). This is a pure win with no real downside: it still
+       guarantees the same minimum spacing between requests, just doesn't
+       double up on top of naturally-slow ones.
+     - **`fetch_all_records()` now accepts an optional `fields` list** to
+       restrict the Airtable API response to just the columns a loader
+       actually reads (`poles_loader.AIRTABLE_POLES_FIELDS`), shrinking
+       each page's payload. This one's payoff is less certain than the
+       pacing fix — it depends on how many other fields the live
+       `Streetleaf Poles` table has that `_map_record_to_pole()` doesn't
+       use.
+
+     **Measured result**: fetch dropped from 86.5s to **39.2s** — more
+     than the ~29s expected from the pacing fix alone, so the `fields[]`
+     restriction pulled real weight too (smaller per-page JSON payloads,
+     not just less wasted sleep). Upsert held steady at ~50-52s (expected —
+     nothing in this round touched the SQL side). Total run time: ~138s →
+     **~90s (~1:30)**.
+
+     Further gains from here would need the fetch and upsert phases to
+     overlap instead of running sequentially — Airtable's cursor-based
+     pagination means page N+1's request can't be sent until page N's
+     response reveals the next offset, so the fetch itself can't be
+     parallelized, but a genuinely concurrent (threaded/async) rewrite
+     could let SQL writes for earlier pages happen while later pages are
+     still being fetched. That's a bigger, riskier change for a smaller
+     remaining gain, so it hasn't been done here.
+
+  The batching/staging-table optimizations above aren't applied to
+  `load_projects()`/`load_customers()`, since neither has anywhere near
+  enough rows for them to matter yet — both can be lifted over if that
+  changes. The **fetch/upsert phase-timing logs**, however, are: all three
+  loaders now log `"load<X>: fetched N record(s) ... in X.Xs"` and
+  `"load<X>: upsert phase took X.Xs for N record(s)"`, so the same
+  before/after visibility is available everywhere, not just for Poles.

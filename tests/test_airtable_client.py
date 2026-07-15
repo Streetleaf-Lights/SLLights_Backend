@@ -96,10 +96,49 @@ def test_fetch_all_records_first_request_has_no_offset_param(mock_requests_get):
     assert first_call_params["pageSize"] == airtable_client.PAGE_SIZE
 
 
-def test_fetch_all_records_sleeps_between_pages_but_not_after_last(
+def test_fetch_all_records_without_fields_arg_omits_fields_param(mock_requests_get):
+    mock_requests_get.return_value = make_http_response(make_airtable_response([]))
+
+    airtable_client.fetch_all_records("Companies_New")
+
+    call_params = mock_requests_get.call_args_list[0].kwargs["params"]
+    assert "fields[]" not in call_params
+
+
+def test_fetch_all_records_with_fields_arg_restricts_response_fields(mock_requests_get):
+    mock_requests_get.return_value = make_http_response(make_airtable_response([]))
+
+    airtable_client.fetch_all_records("Streetleaf Poles", fields=["LAT", "LONG"])
+
+    call_params = mock_requests_get.call_args_list[0].kwargs["params"]
+    assert call_params["fields[]"] == ["LAT", "LONG"]
+
+
+def test_fetch_all_records_fields_arg_applies_to_every_page(mock_requests_get):
+    r1 = {"id": "rec1", "createdTime": "t", "fields": {}}
+    r2 = {"id": "rec2", "createdTime": "t", "fields": {}}
+    mock_requests_get.side_effect = [
+        make_http_response(make_airtable_response([r1], offset="off1")),
+        make_http_response(make_airtable_response([r2])),
+    ]
+
+    airtable_client.fetch_all_records("Streetleaf Poles", fields=["LAT", "LONG"])
+
+    for call in mock_requests_get.call_args_list:
+        assert call.kwargs["params"]["fields[]"] == ["LAT", "LONG"]
+
+
+def test_fetch_all_records_sleeps_the_remaining_gap_when_request_was_fast(
     mock_requests_get, mocker
 ):
     mock_sleep = mocker.patch("shared.airtable_client.time.sleep")
+    # monotonic() is called 3 times for a 2-page fetch: request-1 start,
+    # elapsed-check before request-2, request-2 start. Simulate only 0.05s
+    # having elapsed since request-1 started -- under the 0.2s floor.
+    mocker.patch(
+        "shared.airtable_client.time.monotonic",
+        side_effect=[0.0, 0.05, 0.05],
+    )
 
     r1 = {"id": "rec1", "createdTime": "t", "fields": {}}
     r2 = {"id": "rec2", "createdTime": "t", "fields": {}}
@@ -110,9 +149,36 @@ def test_fetch_all_records_sleeps_between_pages_but_not_after_last(
 
     airtable_client.fetch_all_records("Companies_New")
 
-    # one sleep for the one offset consumed; none after the final page
-    assert mock_sleep.call_count == 1
-    mock_sleep.assert_called_with(airtable_client.REQUEST_DELAY_SECONDS)
+    # should sleep the remaining ~0.15s, not a flat 0.2s
+    mock_sleep.assert_called_once()
+    slept_for = mock_sleep.call_args.args[0]
+    assert slept_for == pytest.approx(0.15, abs=1e-9)
+
+
+def test_fetch_all_records_skips_sleep_when_request_was_already_slow(
+    mock_requests_get, mocker
+):
+    """
+    This is the production case: real Airtable round-trips (~0.39s
+    measured) already exceed MIN_REQUEST_INTERVAL_SECONDS (0.2s), so no
+    additional sleep should be added on top of naturally-slow requests.
+    """
+    mock_sleep = mocker.patch("shared.airtable_client.time.sleep")
+    mocker.patch(
+        "shared.airtable_client.time.monotonic",
+        side_effect=[0.0, 0.5, 0.5],
+    )
+
+    r1 = {"id": "rec1", "createdTime": "t", "fields": {}}
+    r2 = {"id": "rec2", "createdTime": "t", "fields": {}}
+    mock_requests_get.side_effect = [
+        make_http_response(make_airtable_response([r1], offset="off1")),
+        make_http_response(make_airtable_response([r2])),
+    ]
+
+    airtable_client.fetch_all_records("Companies_New")
+
+    mock_sleep.assert_not_called()
 
 
 def test_fetch_all_records_no_sleep_for_single_page(mock_requests_get, mocker):

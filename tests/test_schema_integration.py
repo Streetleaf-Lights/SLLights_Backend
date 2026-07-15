@@ -221,6 +221,25 @@ class TestPolesSchemaConsistency:
         assert "REFERENCES Projects" not in sql
         assert "REFERENCES Customers" not in sql
 
+    def test_staging_table_columns_match_expected_schema(self):
+        sql = poles_loader._STAGING_TABLE_SQL
+        match = re.search(r"CREATE TABLE #PolesStaging \((.+)\);", sql, re.DOTALL)
+        cols = {line.strip().split()[0] for line in match.group(1).strip().split(",")}
+        assert cols == EXPECTED_POLES_COLUMNS
+
+    def test_merge_from_staging_insert_columns_match_expected_schema(self):
+        sql = poles_loader._MERGE_FROM_STAGING_SQL
+        match = re.search(r"INSERT \(([^)]+)\)", sql)
+        cols = {c.strip() for c in match.group(1).split(",")}
+        assert cols == EXPECTED_POLES_COLUMNS
+
+    def test_merge_from_staging_update_columns_match_expected_schema(self):
+        sql = poles_loader._MERGE_FROM_STAGING_SQL
+        match = re.search(r"THEN UPDATE SET\s*(.+?)\s*WHEN NOT MATCHED", sql, re.DOTALL)
+        assignments = match.group(1).strip().rstrip(",").split(",")
+        cols = {a.split("=")[0].strip() for a in assignments}
+        assert cols == EXPECTED_POLES_COLUMNS - {"Id", "AirTableCreatedDateTime"}
+
 
 # --------------------------------------------------------------------------
 # Opt-in real end-to-end integration test.

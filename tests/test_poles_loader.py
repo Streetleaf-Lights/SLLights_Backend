@@ -164,14 +164,23 @@ class TestPoleUpsertSqlStructure:
         patch_fetch_all_records_poles.return_value = ([make_pole_record()], [])
         poles_loader.load_poles()
 
-        upsert_calls = [
-            call
-            for call in mock_cursor.execute.call_args_list
-            if "MERGE Poles" in call.args[0]
+        assert mock_cursor.executemany.call_count == 1
+        sql_text, batch = mock_cursor.executemany.call_args.args
+        assert "INSERT INTO #PolesStaging" in sql_text
+        assert len(batch) == 1
+        assert sql_text.count("?") == len(batch[0]) == 10
+
+    def test_merge_from_staging_is_executed_after_staging_insert(
+        self, patch_get_connection_poles, patch_fetch_all_records_poles, mock_cursor, make_pole_record
+    ):
+        patch_fetch_all_records_poles.return_value = ([make_pole_record()], [])
+        poles_loader.load_poles()
+
+        merge_calls = [
+            call for call in mock_cursor.execute.call_args_list if "MERGE Poles" in call.args[0]
         ]
-        assert len(upsert_calls) == 1
-        sql_text, *params = upsert_calls[0].args
-        assert sql_text.count("?") == len(params) == 10
+        assert len(merge_calls) == 1
+        assert "#PolesStaging" in merge_calls[0].args[0]
 
     def test_insert_column_list_matches_values_list_length(self):
         sql = poles_loader._POLE_UPSERT_SQL
@@ -196,12 +205,107 @@ class TestPoleUpsertSqlStructure:
         assert "REFERENCES Customers" not in sql
 
 
+class TestStagingMergeSqlStructure:
+    """Structural checks for the bulk staging-table path's SQL constants."""
+
+    def test_staging_table_ddl_has_defensive_guard_and_creates_table(self):
+        sql = poles_loader._STAGING_TABLE_SQL
+        assert "IF OBJECT_ID('tempdb..#PolesStaging')" in sql
+        assert "DROP TABLE #PolesStaging" in sql
+        assert "CREATE TABLE #PolesStaging" in sql
+
+    def test_staging_insert_placeholder_count_matches_column_count(self):
+        sql = poles_loader._STAGING_INSERT_SQL
+        insert_cols = re.search(r"INSERT INTO #PolesStaging \(([^)]+)\)", sql).group(1)
+        assert len(insert_cols.split(",")) == sql.count("?") == 10
+
+    def test_merge_from_staging_sources_the_staging_table(self):
+        assert "USING #PolesStaging AS source" in poles_loader._MERGE_FROM_STAGING_SQL
+
+    def test_merge_from_staging_match_key_is_id(self):
+        assert "ON target.Id = source.Id" in poles_loader._MERGE_FROM_STAGING_SQL
+
+    def test_merge_from_staging_uses_intersect(self):
+        assert "INTERSECT" in poles_loader._MERGE_FROM_STAGING_SQL
+
+    def test_merge_from_staging_has_no_placeholders(self):
+        """It reads from the already-staged table, not from bound params."""
+        assert poles_loader._MERGE_FROM_STAGING_SQL.count("?") == 0
+
+    def test_merge_from_staging_insert_column_list_matches_values(self):
+        sql = poles_loader._MERGE_FROM_STAGING_SQL
+        insert_cols = re.search(r"INSERT \(([^)]+)\)", sql).group(1)
+        values_cols = re.search(r"VALUES \(([^)]+)\)", sql, re.DOTALL).group(1)
+        assert len(insert_cols.split(",")) == len(values_cols.split(",")) == 10
+
+    def test_truncate_staging_sql_targets_staging_table(self):
+        assert poles_loader._TRUNCATE_STAGING_SQL == "TRUNCATE TABLE #PolesStaging"
+
+
+class TestPolesBatchingPerformance:
+    """
+    Covers the fast_executemany batching added to fix the ~12-minute load
+    time for 14k+ poles (one cursor.execute() round trip per row was the
+    dominant cost, not the Airtable fetch).
+    """
+
+    def test_fast_executemany_is_enabled(
+        self, patch_get_connection_poles, patch_fetch_all_records_poles, mock_cursor, make_pole_record
+    ):
+        patch_fetch_all_records_poles.return_value = ([make_pole_record()], [])
+        poles_loader.load_poles()
+        assert mock_cursor.fast_executemany is True
+
+    def test_batches_are_chunked_by_upsert_batch_size(
+        self, patch_get_connection_poles, patch_fetch_all_records_poles, mock_cursor, make_pole_record
+    ):
+        batch_size = poles_loader._UPSERT_BATCH_SIZE
+        records = [make_pole_record(record_id=f"recPole{i}") for i in range(batch_size + 1)]
+        patch_fetch_all_records_poles.return_value = (records, [])
+
+        poles_loader.load_poles()
+
+        assert mock_cursor.executemany.call_count == 2
+        first_batch = mock_cursor.executemany.call_args_list[0].args[1]
+        second_batch = mock_cursor.executemany.call_args_list[1].args[1]
+        assert len(first_batch) == batch_size
+        assert len(second_batch) == 1
+
+    def test_single_batch_for_small_record_counts(
+        self, patch_get_connection_poles, patch_fetch_all_records_poles, mock_cursor, make_pole_record
+    ):
+        records = [make_pole_record(record_id=f"recPole{i}") for i in range(5)]
+        patch_fetch_all_records_poles.return_value = (records, [])
+
+        poles_loader.load_poles()
+
+        assert mock_cursor.executemany.call_count == 1
+        batch = mock_cursor.executemany.call_args.args[1]
+        assert len(batch) == 5
+
+
 # --------------------------------------------------------------------------
 # load_poles() -- full flow
 # --------------------------------------------------------------------------
 
 
 class TestLoadPolesSuccessFlow:
+    def test_requests_only_the_fields_it_needs(
+        self, patch_get_connection_poles, patch_fetch_all_records_poles, mock_cursor, make_pole_record
+    ):
+        """
+        Shrinking the Airtable response payload to just the fields
+        _map_record_to_pole() reads can meaningfully cut fetch latency on
+        a table with many unused columns.
+        """
+        patch_fetch_all_records_poles.return_value = ([make_pole_record()], [])
+
+        poles_loader.load_poles()
+
+        patch_fetch_all_records_poles.assert_called_once_with(
+            poles_loader.AIRTABLE_POLES_TABLE, fields=poles_loader.AIRTABLE_POLES_FIELDS
+        )
+
     def test_full_success_flow_two_records(
         self,
         patch_get_connection_poles,
@@ -218,21 +322,36 @@ class TestLoadPolesSuccessFlow:
         poles_loader.load_poles()
 
         calls = mock_cursor.execute.call_args_list
-        assert len(calls) == 4  # insert SP_Execution + 2 upserts + final update
+        # insert SP_Execution, staging table create, merge-from-staging,
+        # truncate staging, final update (upserts themselves go via
+        # executemany into the staging table)
+        assert len(calls) == 5
 
         insert_sql, name, env, start_time, source = calls[0].args
         assert "INSERT INTO SP_Execution" in insert_sql
         assert (name, env, source) == ("loadPoles", "Dev", "AirTable")
         assert DTO_PATTERN.match(start_time)
 
-        upsert1_args = calls[1].args
-        upsert2_args = calls[2].args
-        assert upsert1_args[1] == "recPole1"
-        assert upsert1_args[9] == 7  # SP_ExecId position
-        assert upsert2_args[1] == "recPole2"
-        assert upsert2_args[9] == 7
+        staging_create_sql = calls[1].args[0]
+        assert "CREATE TABLE #PolesStaging" in staging_create_sql
 
-        update_sql, end_time, success, errors, batch_count, sp_exec_id = calls[3].args
+        merge_sql = calls[2].args[0]
+        assert "MERGE Poles" in merge_sql
+        assert "#PolesStaging" in merge_sql
+
+        truncate_sql = calls[3].args[0]
+        assert "TRUNCATE TABLE #PolesStaging" in truncate_sql
+
+        assert mock_cursor.executemany.call_count == 1
+        staging_insert_sql, batch = mock_cursor.executemany.call_args.args
+        assert "INSERT INTO #PolesStaging" in staging_insert_sql
+        assert len(batch) == 2
+        assert batch[0][0] == "recPole1"
+        assert batch[0][8] == 7  # SP_ExecId position
+        assert batch[1][0] == "recPole2"
+        assert batch[1][8] == 7
+
+        update_sql, end_time, success, errors, batch_count, sp_exec_id = calls[4].args
         assert "UPDATE SP_Execution" in update_sql
         assert (success, errors, batch_count, sp_exec_id) == (2, 0, 1, 7)
         assert DTO_PATTERN.match(end_time)
@@ -249,9 +368,10 @@ class TestLoadPolesSuccessFlow:
         poles_loader.load_poles()
 
         calls = mock_cursor.execute.call_args_list
-        assert len(calls) == 2
+        assert len(calls) == 2  # insert + final update -- no staging table needed for zero rows
         _, _end_time, success, errors, batch_count, _sp_exec_id = calls[1].args
         assert (success, errors, batch_count) == (0, 0, 1)
+        mock_cursor.executemany.assert_not_called()
 
 
 class TestLoadPolesPartialFailure:
@@ -266,13 +386,72 @@ class TestLoadPolesPartialFailure:
             [make_pole_record(record_id="recPole1"), make_pole_record(record_id="recPole2")],
             [],
         )
-        mock_cursor.execute.side_effect = [None, None, RuntimeError("bad row"), None]
+        # The chunk's bulk staging+merge fails, so load_poles() falls back
+        # to executing each row individually; the second one fails there.
+        mock_cursor.executemany.side_effect = RuntimeError("chunk failed")
+        mock_cursor.execute.side_effect = [
+            None,  # insert SP_Execution
+            None,  # staging table create
+            None,  # truncate after chunk failure
+            None,  # row1 fallback succeeds
+            RuntimeError("bad row"),  # row2 fallback fails
+            None,  # final update
+        ]
 
         poles_loader.load_poles()  # must not raise
 
         final_update_args = mock_cursor.execute.call_args_list[-1].args
         success, errors = final_update_args[2], final_update_args[3]
         assert (success, errors) == (1, 1)
+
+    def test_chunk_failure_falls_back_to_row_by_row_execute(
+        self,
+        patch_get_connection_poles,
+        patch_fetch_all_records_poles,
+        mock_cursor,
+        make_pole_record,
+    ):
+        patch_fetch_all_records_poles.return_value = (
+            [make_pole_record(record_id="recPole1"), make_pole_record(record_id="recPole2")],
+            [],
+        )
+        mock_cursor.executemany.side_effect = RuntimeError("chunk failed")
+        mock_cursor.execute.side_effect = [None] * 6  # insert, staging create, truncate, row1, row2, final update
+
+        poles_loader.load_poles()
+
+        # insert, staging create, truncate-after-failure, 2 fallback row
+        # upserts, final update
+        assert mock_cursor.execute.call_count == 6
+        row1_args = mock_cursor.execute.call_args_list[3].args
+        row2_args = mock_cursor.execute.call_args_list[4].args
+        assert row1_args[1][0] == "recPole1"
+        assert row2_args[1][0] == "recPole2"
+
+    def test_staging_table_is_truncated_before_row_by_row_fallback(
+        self,
+        patch_get_connection_poles,
+        patch_fetch_all_records_poles,
+        mock_cursor,
+        make_pole_record,
+    ):
+        """
+        A partially-staged chunk (some rows may have inserted into
+        #PolesStaging before the failure) must be cleared before falling
+        back to row-by-row, so a retried run doesn't re-merge stale rows.
+        """
+        patch_fetch_all_records_poles.return_value = ([make_pole_record(record_id="recPole1")], [])
+        mock_cursor.executemany.side_effect = RuntimeError("chunk failed")
+        mock_cursor.execute.side_effect = [None] * 5  # insert, staging create, truncate, row1, final update
+
+        poles_loader.load_poles()
+
+        truncate_calls = [
+            call
+            for call in mock_cursor.execute.call_args_list
+            if call.args[0] == "TRUNCATE TABLE #PolesStaging"
+        ]
+        assert len(truncate_calls) == 1
 
 
 class TestLoadPolesTopLevelFailure:
