@@ -1,8 +1,9 @@
-# LightsApp — Airtable → Azure SQL Sync (Python Azure Functions)
+# LightsApp — Airtable + Leadsun → Azure SQL Sync (Python Azure Functions)
 
 A Python Azure Functions project (v2 programming model) that syncs pole,
-project, and customer data from Airtable into Azure SQL Database on a
-schedule, running on a Flex Consumption (Linux) plan.
+project, and customer data from Airtable, plus raw lamp telemetry from the
+Leadsun API, into Azure SQL Database on a schedule, running on a Flex
+Consumption (Linux) plan.
 
 ## Project structure
 
@@ -12,13 +13,18 @@ Backend/
 │                            #   - loadAirTableData: timer trigger, fires 6 AM/6 PM Eastern
 │                            #     runs load_poles() -> load_projects() -> load_customers()
 │                            #   - loadAirTableDataManual: manual HTTP trigger, blocked in Prod
+│                            #   - loadPoleRawData: SEPARATE timer trigger, fires every 10 minutes,
+│                            #     runs load_pole_raw_data() (Leadsun) -- unrelated to the above
+│                            #   - loadPoleRawDataManual: manual HTTP trigger, blocked in Prod
 ├── shared/
-│   ├── airtable_client.py   # Paginated Airtable fetch (fetch_all_records)
-│   ├── sql_client.py        # Azure SQL connection helper (get_connection)
-│   ├── datetime_utils.py    # Shared Eastern-time / DATETIMEOFFSET helpers
-│   ├── customers_loader.py  # Airtable → Customers upsert logic (load_customers)
-│   ├── projects_loader.py   # Airtable → Projects upsert logic (load_projects)
-│   └── poles_loader.py      # Airtable → Poles upsert logic (load_poles)
+│   ├── airtable_client.py       # Paginated Airtable fetch (fetch_all_records)
+│   ├── leadsun_client.py        # Mutual-TLS fetch from the Leadsun API (fetch_lamps)
+│   ├── sql_client.py            # Azure SQL connection helper (get_connection)
+│   ├── datetime_utils.py        # Shared Eastern-time / DATETIMEOFFSET helpers
+│   ├── customers_loader.py      # Airtable → Customers upsert logic (load_customers)
+│   ├── projects_loader.py       # Airtable → Projects upsert logic (load_projects)
+│   ├── poles_loader.py          # Airtable → Poles upsert logic (load_poles)
+│   └── pole_raw_data_loader.py  # Leadsun → PoleRawData upsert + retention (load_pole_raw_data)
 ├── sql/                     # One folder per table; each has a guarded CREATE
 │   │                        # and a scratch SELECT for querying/debugging in SSMS/ADS
 │   ├── Customers/
@@ -30,6 +36,9 @@ Backend/
 │   ├── Projects/
 │   │   ├── Create tbl Projects.sql
 │   │   └── Select tbl Projects.sql
+│   ├── PoleRawData/
+│   │   ├── Create tbl PoleRawData.sql
+│   │   └── Select tbl PoleRawData.sql
 │   └── SP_Execution/
 │       ├── Create tbl SP_Execution.sql
 │       └── Select tbl SP_Execution.sql
@@ -81,49 +90,58 @@ Backend/
        "AIRTABLE_API_KEY": "...",
        "AIRTABLE_BASE_ID": "...",
        "SQL_CONNECTION_STRING": "...",
-       "ENVIRONMENT": "Dev"
+       "ENVIRONMENT": "Dev",
+       "LEADSUN_CLIENT_CERT_PEM": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
      }
    }
    ```
+   `LEADSUN_CLIENT_CERT_PEM` is the **entire contents** of the combined
+   cert+key `.pem` file, as a single JSON string with real newlines escaped
+   to `\n`. **Do not commit the actual `.pem` file to the repo** — it's a
+   private key. See the Leadsun section under Notes below for why this is
+   stored as a setting instead of a file, and how to get it into Azure.
 
 4. Start the Functions host locally:
    ```bash
    func start
    ```
 
-5. Test the manual HTTP trigger:
+5. Test the manual HTTP triggers:
    ```bash
    curl -X POST http://localhost:7071/api/loadAirTableDataManual
+   curl -X POST http://localhost:7071/api/loadPoleRawDataManual
    ```
    (Confirmed against `host.json` — no custom `routePrefix` is set, so the
    `/api/` prefix is correct as shown.)
 
 ## Running the tests
 
-149 tests, fully mocked — no real Airtable or Azure SQL calls, no
-credentials needed for the default run.
+230 tests, fully mocked — no real Airtable, Leadsun, or Azure SQL calls,
+no credentials needed for the default run.
 
 | File | Focus |
 |---|---|
 | `tests/test_airtable_client.py` | Pagination (single/multi-page), offset handling, adaptive rate-limit pacing (sleeps only the remaining gap, skips it entirely when a request was already slow), optional `fields[]` payload restriction, auth header, HTTP error propagation |
+| `tests/test_leadsun_client.py` | Cert materialized to a temp file with the right content, temp file cleaned up on both success and failure, correct URL/timeout, HTTP error propagation, `verify=` resolution (default/pinned CA/skip-verify precedence), and the hostname-check-bypass adapter — including a real (non-mocked) check that `assert_hostname=False` actually reaches urllib3's pool config, not just the `SSLContext` |
 | `tests/test_sql_client.py` | Connection string from env, missing env var, pyodbc error passthrough |
 | `tests/test_datetime_utils.py` | `to_dto_string` offset formatting, `airtable_created_time_to_eastern` (winter/summer DST) |
 | `tests/test_customers_loader.py` | `_map_record_to_customer` field mapping, full `load_customers()` flow (success, partial row failure, top-level failure + `ErrorMessage` update, cleanup-on-error), MERGE SQL structural checks, `ntext`-cast regression check, fetch/upsert phase-timing logs |
 | `tests/test_projects_loader.py` | Same shape as `test_customers_loader.py`, for `load_projects()` — including the linked-Customer-id mapping, the NULL-safe `INTERSECT` diff check, the `ntext`-cast fix regression check, and fetch/upsert phase-timing logs |
 | `tests/test_poles_loader.py` | Same shape again, for `load_poles()` — including the linked-Project-id mapping, the LAT/LONG error-string/whitespace cleanup, the staging-table bulk MERGE (with chunk-level fallback to row-by-row on a failed chunk), and the Airtable `fields[]` restriction |
-| `tests/test_function_app.py` | Timer trigger fires only at 6 AM/6 PM Eastern (verified across the DST boundary with freezegun), `past_due` handling, manual HTTP trigger's `Prod` block, synchronous (non-threaded) execution, **Poles runs before Projects runs before Customers** in both triggers, and a failure in an earlier loader blocks the later ones |
-| `tests/test_schema_integration.py` | Column-name consistency between the code's SQL and a documented expected schema (all three tables); opt-in **real** end-to-end test |
+| `tests/test_pole_raw_data_loader.py` | `_capitalize_key` (PascalCase, not `str.capitalize()`'s behavior), `_parse_iso_datetime`, `_map_lamp_record` against the real confirmed sample (productName→LocationId, id→LeadsunId, projectId/projectName→LeadsunProjectId/Name renames, string trimming, `ExtraFieldsJson` capture for unexpected fields), the missing-`LastUpload` sentinel (stable across calls, never eligible for retention purge, distinct from a genuine parse failure), staging-table bulk MERGE + fallback, retention purge logging |
+| `tests/test_function_app.py` | Timer trigger fires only at 6 AM/6 PM Eastern (verified across the DST boundary with freezegun), `past_due` handling, manual HTTP trigger's `Prod` block, synchronous (non-threaded) execution, **Poles runs before Projects runs before Customers** in both triggers, a failure in an earlier loader blocks the later ones, and **`loadPoleRawData` runs unconditionally** (no hour-gating) and never touches the Airtable loaders |
+| `tests/test_schema_integration.py` | Column-name consistency between the code's SQL and a documented expected schema (all four tables); two opt-in **real** end-to-end tests (Airtable+SQL, and separately Leadsun+SQL) |
 
 ```bash
 pytest -v
 ```
 
-### Running the real integration test (optional)
+### Running the real integration tests (optional)
 
-To actually exercise `load_customers()` against real Airtable + Azure SQL
-(useful before/after a deploy), from an environment with real network
-access and credentials:
+Two separate opt-in flags, since Airtable/SQL and Leadsun/SQL are
+independent pipelines with different credentials.
 
+**Airtable → SQL** (`load_poles()` → `load_projects()` → `load_customers()`):
 ```bash
 export RUN_LIVE_INTEGRATION_TESTS=1
 export AIRTABLE_API_KEY=...
@@ -133,8 +151,18 @@ export ENVIRONMENT=Dev   # test refuses to run if this is "Prod"
 pytest -v -m integration
 ```
 
-This **writes real rows** to your `SP_Execution` and `Customers` tables.
-Point it at Dev, never Prod.
+**Leadsun → SQL** (`load_pole_raw_data()`):
+```bash
+export RUN_LIVE_LEADSUN_INTEGRATION_TEST=1
+export LEADSUN_CLIENT_CERT_PEM=...
+export SQL_CONNECTION_STRING=...
+export ENVIRONMENT=Dev   # test refuses to run if this is "Prod"
+pytest -v -m integration
+```
+
+The Airtable test **writes real rows** to `SP_Execution`, `Poles`,
+`Projects`, and `Customers`. The Leadsun test writes to `SP_Execution` and
+`PoleRawData`. Point either at Dev, never Prod.
 
 ## Adding more functions
 
@@ -350,3 +378,161 @@ reference for a from-scratch project, not as the LightsApp deploy runbook.
   loaders now log `"load<X>: fetched N record(s) ... in X.Xs"` and
   `"load<X>: upsert phase took X.Xs for N record(s)"`, so the same
   before/after visibility is available everywhere, not just for Poles.
+
+- **`loadPoleRawData` — new, separate pipeline (Leadsun → `PoleRawData`)**:
+  runs on its own timer trigger every 10 minutes
+  (`schedule="0 */10 * * * *"`), completely independent of
+  `loadAirTableData` — different source, different cadence, no dependency
+  between the two. Has its own manual HTTP trigger
+  (`loadPoleRawDataManual`), same `Prod`-blocking convention as the others.
+
+  **Schema is confirmed against a real Leadsun `/lamps` response** (46
+  columns) — every field is promoted to its own typed column, matching
+  "consistent with our tables" directly rather than the JSON-blob fallback
+  this started as. All field names are capitalized via `_capitalize_key()`
+  (PascalCase — not Python's `str.capitalize()`, which would wrongly
+  lowercase the rest of each name), with three deliberate exceptions:
+  - `productName` → `LocationId` (the one rename explicitly requested)
+  - Leadsun's own `id` → **`LeadsunId`**, not `Id` — a bare `Id` column
+    would look like this table's primary key, but it isn't
+    (`LocationId`+`LastUpload` is)
+  - Leadsun's own `projectId`/`projectName` → **`LeadsunProjectId`**/
+    **`LeadsunProjectName`**, not `ProjectId`/`ProjectName` — those would
+    otherwise look like a reference to *our* Airtable-sourced `Projects`
+    table; they're Leadsun's own internal project grouping, unrelated to
+    ours. (`ProductId`, a *different* field from `productName`, has no
+    such collision and keeps its plain capitalized name.)
+
+  A small `ExtraFieldsJson` column remains as a safety net — any field
+  Leadsun sends that *isn't* one of the 46 known columns (e.g. added in a
+  future firmware/API update) lands there (capitalized, JSON-encoded)
+  instead of being silently dropped. It's empty/`NULL` for every record in
+  the confirmed sample, since all of its fields are now accounted for.
+
+  **String fields are trimmed on the way in** — the confirmed sample had
+  `lightingState` come back as `"lighting-off "` with a trailing space;
+  every string value gets `.strip()`'d now, the same lesson already
+  applied to Poles' `Lat`/`Long`.
+
+  The single source of truth for the column list (order included) is
+  `pole_raw_data_loader._ALL_COLUMNS` — the staging table DDL, the
+  `MERGE`'s `INSERT`/`UPDATE` column lists, and the Python param-tuple
+  order are all built from it (or cross-checked against it in tests), so
+  there's one place to change if a column ever needs to move.
+
+  **Confirmed, not assumed, from the real response**: single GET with no
+  pagination; plain JSON array (not wrapped in an envelope); `lastUpload`
+  as ISO-8601 with an explicit offset (e.g.
+  `"2026-07-15T12:35:30.000+00:00"`) — matches what `_parse_iso_datetime()`
+  already expected. `createTime` uses the same parser and was `null` in
+  the sample; records with an unparseable/missing `LastUpload` (or
+  `LocationId`) are still counted as row-level errors and skipped, since
+  both are part of the primary key.
+
+  **Upsert key = `(LocationId, LastUpload)`**, directly as the table's
+  composite `PRIMARY KEY` — matches "upsert is based on the productName
+  and lastUpload" literally. Uses the same staging-table bulk MERGE pattern
+  as Poles (batches of `pole_raw_data_loader._UPSERT_BATCH_SIZE`, 2000,
+  with row-by-row fallback on a failed chunk) rather than starting naive,
+  since that pattern's already proven out.
+
+  **Retention (6 months, based on `LastUpload`)** runs as a plain
+  `DELETE ... WHERE LastUpload < DATEADD(MONTH, -6, SYSDATETIMEOFFSET())`
+  at the end of every invocation (every 10 minutes) — not a separate
+  scheduled job or partitioning scheme, since the loader already runs
+  frequently enough that a simple indexed delete is plenty. Change
+  `RETENTION_MONTHS` in `pole_raw_data_loader.py` to adjust the window.
+
+  **Records with a genuinely missing `lastUpload`** (a handful of real
+  devices report this — presumably ones that haven't uploaded yet) get a
+  stable placeholder, `pole_raw_data_loader._MISSING_LAST_UPLOAD_SENTINEL`
+  (`9999-12-31 23:59:59.999 +00:00`), instead of being dropped —
+  `LastUpload` is half of the composite primary key, so it can never
+  actually be `NULL`. The sentinel is deliberately: (1) the *same* value
+  every run, so a device that keeps reporting `lastUpload: null` gets its
+  one row updated in place each cycle rather than a new row inserted every
+  10 minutes; and (2) far enough in the future that it's never
+  `< 6 months ago`, so the retention purge above naturally never deletes
+  it — no special-case exclusion needed. A `lastUpload` that's *present*
+  but fails to parse (a real format surprise, not a legitimately-missing
+  value) is left as a genuine row-level error rather than silently
+  sentineled over, so an actual bug doesn't get masked. One accepted
+  tradeoff: if a device later starts reporting a real `lastUpload`, that
+  lands in a new row (real timestamp ≠ sentinel), and the old sentinel row
+  is orphaned harmlessly — it just sits there indefinitely since it never
+  ages past the retention cutoff. Not handled automatically; worth a
+  manual cleanup pass if it ever becomes clutter.
+
+  **Credential handling — `LEADSUN_CLIENT_CERT_PEM`**: the API uses mutual
+  TLS (client certificate + private key), not a bearer token like
+  Airtable. The combined cert+key `.pem` file is **not committed to the
+  repo** — same reasoning as `local.settings.json` already being
+  git-ignored for `AIRTABLE_API_KEY`/`SQL_CONNECTION_STRING`. Instead, the
+  entire PEM content is stored as a single app setting
+  (`LEADSUN_CLIENT_CERT_PEM`), and `leadsun_client._write_client_cert_to_temp_file()`
+  materializes it to a temp file fresh on every call (cheap — a few KB),
+  since `requests`' `cert=` parameter needs an actual filesystem path, not
+  raw PEM text. The temp file is deleted immediately after the request,
+  success or failure. To set this up in Azure: open the Function App's
+  Configuration blade, add `LEADSUN_CLIENT_CERT_PEM` as a new application
+  setting, and paste the full `.pem` file contents as the value (Azure
+  Portal's setting-value field accepts multi-line text directly — no
+  base64 encoding needed). For local dev, put it in `local.settings.json`
+  with real newlines escaped to `\n` (see the local setup section above) —
+  `python3 -c "import json; print(json.dumps(open('leadsun.pem').read()))"`
+  will do that escaping correctly rather than editing it by hand.
+
+  **Separate issue — verifying the *server's* certificate**: distinct from
+  the client cert above, `leadsunedge-us.com` presents a **self-signed**
+  server certificate, which fails against the public CA bundle
+  `requests`/`certifi` trusts by default
+  (`SSLCertVerificationError: self-signed certificate`). Two ways to
+  handle it, both optional app settings:
+  - **`LEADSUN_SERVER_CA_CERT`** (preferred) — PEM text of the server's
+    cert (or its issuing CA) to trust specifically, same storage pattern
+    as `LEADSUN_CLIENT_CERT_PEM`. To grab the cert the server is actually
+    presenting:
+    ```bash
+    openssl s_client -connect leadsunedge-us.com:8550 -showcerts </dev/null 2>/dev/null \
+      | openssl x509 -outform PEM > leadsun_server.pem
+    ```
+    then JSON-escape it the same way as the client cert and set it as
+    `LEADSUN_SERVER_CA_CERT`.
+  - **`LEADSUN_SKIP_TLS_VERIFY=true`** (escape hatch, insecure) — disables
+    server certificate verification entirely, leaving the connection open
+    to tampering. `leadsun_client._resolve_verify_option()` logs a warning
+    every time this is active. Only reach for this if the real
+    cert/CA genuinely isn't obtainable and the risk is accepted; if both
+    settings are present, this one wins (deterministic, not silently
+    picked).
+  Leave both unset to keep the default `verify=True` behavior (fails
+  against Leadsun's self-signed cert until one of the above is set).
+
+  **A third issue can surface even after `LEADSUN_SERVER_CA_CERT` is set**:
+  the pinned cert's Common Name/SAN may not actually match
+  `leadsunedge-us.com` (`SSLCertVerificationError: Hostname mismatch...`)
+  — common for lightweight self-signed certs on IoT gateways that get
+  reused across deployments without customizing that field. Rather than
+  jumping straight to `LEADSUN_SKIP_TLS_VERIFY` (which drops chain
+  validation too), there's a middle ground:
+  - **`LEADSUN_SKIP_HOSTNAME_CHECK=true`** — keeps validating that the
+    server presents the *exact* certificate pinned via
+    `LEADSUN_SERVER_CA_CERT` (chain validation stays on,
+    `verify_mode=CERT_REQUIRED`), but stops requiring its name to match
+    the connection hostname. Since `requests`' plain `verify=` kwarg can't
+    express "validate the chain, skip just the hostname," this routes
+    through a `requests.Session` with a custom `HTTPAdapter`
+    (`leadsun_client._NoHostnameCheckAdapter`). That adapter has to
+    disable hostname checking in **two separate places**, not one: the
+    `ssl.SSLContext`'s own `check_hostname` flag, *and* urllib3's
+    independent `assert_hostname` pool-level setting, which runs its own
+    hostname check underneath `requests`' `verify=` handling regardless of
+    what the SSLContext says. Setting only the SSLContext flag looks right
+    but still fails with a hostname-mismatch error from urllib3 itself —
+    both have to be off. Meant to be used **together with**
+    `LEADSUN_SERVER_CA_CERT` — set alone, it falls back to the system's
+    default trust store for chain validation, which still rejects a
+    self-signed cert (a warning is logged if this happens).
+  - If both `LEADSUN_SKIP_TLS_VERIFY` and `LEADSUN_SKIP_HOSTNAME_CHECK`
+    are set, `LEADSUN_SKIP_TLS_VERIFY` wins — the fully-open path already
+    covers it, no need for the custom adapter too.

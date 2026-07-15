@@ -17,7 +17,10 @@
 
 -- DROP TABLE IF EXISTS Projects;
 
-CREATE TABLE Projects (
+IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'Projects')
+BEGIN
+
+    CREATE TABLE Projects (
         Id                      VARCHAR(50)         NOT NULL PRIMARY KEY,
         Name                    NVARCHAR(255)       NOT NULL,
         PoleNumbers             NVARCHAR(MAX)       NULL,
@@ -30,11 +33,12 @@ CREATE TABLE Projects (
         AirTableCreatedDateTime DATETIMEOFFSET(3)    NULL
     );
 
-CREATE NONCLUSTERED INDEX IX_Projects_SP_ExecId
-    ON Projects (SP_ExecId);
+    CREATE NONCLUSTERED INDEX IX_Projects_SP_ExecId
+        ON Projects (SP_ExecId);
 
-CREATE NONCLUSTERED INDEX IX_Projects_CustomerId
-    ON Projects (CustomerId);
+    CREATE NONCLUSTERED INDEX IX_Projects_CustomerId
+        ON Projects (CustomerId);
 
-CREATE NONCLUSTERED INDEX IX_Projects_Name
-    ON Projects (Name);
+    CREATE NONCLUSTERED INDEX IX_Projects_Name
+        ON Projects (Name);
+END

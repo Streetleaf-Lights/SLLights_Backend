@@ -238,3 +238,86 @@ class TestLoadAirTableDataManual:
             function_app.loadAirTableDataManual(make_http_request())
 
         mock_customers.assert_not_called()
+
+
+# --------------------------------------------------------------------------
+# loadPoleRawData / loadPoleRawDataManual (Leadsun, separate from
+# loadAirTableData -- different source, different cadence, no dependency
+# between the two pipelines)
+# --------------------------------------------------------------------------
+
+
+def make_pole_raw_data_http_request():
+    return func.HttpRequest(
+        method="POST",
+        url="/api/loadPoleRawDataManual",
+        headers={},
+        params={},
+        body=b"",
+    )
+
+
+class TestLoadPoleRawDataTimer:
+    def test_runs_unconditionally(self, mocker):
+        """Unlike loadAirTableData, there's no hour-gating -- every timer
+        fire (every 10 minutes) should call the loader."""
+        mock_load = mocker.patch("function_app.load_pole_raw_data")
+        function_app.loadPoleRawData(make_timer_request())
+        mock_load.assert_called_once()
+
+    def test_past_due_still_runs_and_logs_warning(self, mocker, caplog):
+        mock_load = mocker.patch("function_app.load_pole_raw_data")
+        with caplog.at_level("WARNING"):
+            function_app.loadPoleRawData(make_timer_request(past_due=True))
+        mock_load.assert_called_once()
+        assert any("past due" in rec.message for rec in caplog.records)
+
+    def test_propagates_exception(self, mocker):
+        mocker.patch(
+            "function_app.load_pole_raw_data", side_effect=RuntimeError("leadsun down")
+        )
+        with pytest.raises(RuntimeError, match="leadsun down"):
+            function_app.loadPoleRawData(make_timer_request())
+
+    def test_does_not_touch_airtable_loaders(self, mocker):
+        """loadPoleRawData is a separate function -- it must not call any
+        of the Airtable-sourced loaders."""
+        mock_pole_raw = mocker.patch("function_app.load_pole_raw_data")
+        mock_poles, mock_projects, mock_customers, _ = patch_all_loaders(mocker)
+
+        function_app.loadPoleRawData(make_timer_request())
+
+        mock_pole_raw.assert_called_once()
+        mock_poles.assert_not_called()
+        mock_projects.assert_not_called()
+        mock_customers.assert_not_called()
+
+
+class TestLoadPoleRawDataManual:
+    def test_blocked_in_prod(self, mocker, monkeypatch):
+        monkeypatch.setattr(function_app, "ENVIRONMENT", "Prod")
+        mock_load = mocker.patch("function_app.load_pole_raw_data")
+
+        response = function_app.loadPoleRawDataManual(make_pole_raw_data_http_request())
+
+        assert response.status_code == 403
+        mock_load.assert_not_called()
+
+    def test_runs_when_not_prod(self, mocker, monkeypatch):
+        monkeypatch.setattr(function_app, "ENVIRONMENT", "Dev")
+        mock_load = mocker.patch("function_app.load_pole_raw_data")
+
+        response = function_app.loadPoleRawDataManual(make_pole_raw_data_http_request())
+
+        assert response.status_code == 200
+        assert response.get_body() == b"loadPoleRawData run complete."
+        mock_load.assert_called_once()
+
+    def test_is_synchronous_exception_propagates_to_caller(self, mocker, monkeypatch):
+        monkeypatch.setattr(function_app, "ENVIRONMENT", "Dev")
+        mocker.patch(
+            "function_app.load_pole_raw_data", side_effect=RuntimeError("leadsun down")
+        )
+
+        with pytest.raises(RuntimeError, match="leadsun down"):
+            function_app.loadPoleRawDataManual(make_pole_raw_data_http_request())

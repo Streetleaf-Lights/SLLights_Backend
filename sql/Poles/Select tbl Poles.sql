@@ -9,6 +9,3 @@ SELECT TOP (1000) [Id]
       ,[SP_ExecId]
       ,[AirTableCreatedDateTime]
   FROM [dbo].[Poles]
-  WHERE 1=1
---   AND [LocationId] = '12101-8409'
-  ORDER BY [AirTableCreatedDateTime] DESC

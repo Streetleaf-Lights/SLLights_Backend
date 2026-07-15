@@ -34,7 +34,7 @@ import re
 
 import pytest
 
-from shared import customers_loader, projects_loader, poles_loader
+from shared import customers_loader, projects_loader, poles_loader, pole_raw_data_loader
 
 
 # --------------------------------------------------------------------------
@@ -94,6 +94,14 @@ EXPECTED_POLES_COLUMNS = {
     "SP_ExecId",
     "AirTableCreatedDateTime",
 }
+
+# Confirmed against a real Leadsun API response. Sourced directly from
+# pole_raw_data_loader._ALL_COLUMNS rather than duplicated here by hand --
+# with 46 columns, a hand-copied list is itself a drift risk. What these
+# tests actually verify is that the SQL strings stay in sync with that
+# single source of truth, not that the list itself is "correct" (that's
+# covered by the DDL cross-check in test_pole_raw_data_loader.py).
+EXPECTED_POLE_RAW_DATA_COLUMNS = set(pole_raw_data_loader._ALL_COLUMNS)
 
 
 def _columns_in_insert_into(sql: str, table: str) -> set:
@@ -241,6 +249,34 @@ class TestPolesSchemaConsistency:
         assert cols == EXPECTED_POLES_COLUMNS - {"Id", "AirTableCreatedDateTime"}
 
 
+class TestPoleRawDataSchemaConsistency:
+    def test_staging_table_columns_match_expected_schema(self):
+        sql = pole_raw_data_loader._STAGING_TABLE_SQL
+        match = re.search(r"CREATE TABLE #PoleRawDataStaging \((.+)\);", sql, re.DOTALL)
+        cols = {line.strip().split()[0] for line in match.group(1).strip().split(",")}
+        assert cols == EXPECTED_POLE_RAW_DATA_COLUMNS
+
+    def test_merge_from_staging_insert_columns_match_expected_schema(self):
+        sql = pole_raw_data_loader._MERGE_FROM_STAGING_SQL
+        match = re.search(r"INSERT \(([^)]+)\)", sql)
+        cols = {c.strip() for c in match.group(1).split(",")}
+        assert cols == EXPECTED_POLE_RAW_DATA_COLUMNS
+
+    def test_merge_from_staging_update_columns_match_expected_schema(self):
+        sql = pole_raw_data_loader._MERGE_FROM_STAGING_SQL
+        match = re.search(r"THEN UPDATE SET\s*(.+?)\s*WHEN NOT MATCHED", sql, re.DOTALL)
+        assignments = match.group(1).strip().rstrip(",").split(",")
+        cols = {a.split("=")[0].strip() for a in assignments}
+        # Update path never touches the match key (LocationId/LastUpload)
+        assert cols == EXPECTED_POLE_RAW_DATA_COLUMNS - {"LocationId", "LastUpload"}
+
+    def test_no_fk_references(self):
+        """PoleRawData is a separate ingestion pipeline from the
+        Airtable-sourced tables and isn't meant to reference them."""
+        sql = pole_raw_data_loader._MERGE_FROM_STAGING_SQL
+        assert "REFERENCES" not in sql
+
+
 # --------------------------------------------------------------------------
 # Opt-in real end-to-end integration test.
 #
@@ -280,3 +316,32 @@ class TestLiveIntegration:
         poles_loader.load_poles()  # will raise on failure -- that's the assertion
         projects_loader.load_projects()
         customers_loader.load_customers()
+
+
+# Separate opt-in gate from the Airtable one above: PoleRawData is an
+# independent pipeline (different source, different credentials --
+# LEADSUN_CLIENT_CERT_PEM, not Airtable/SQL), so it gets its own flag
+# rather than piggybacking on RUN_LIVE_INTEGRATION_TESTS.
+_LEADSUN_LIVE_TESTS_ENABLED = os.environ.get("RUN_LIVE_LEADSUN_INTEGRATION_TEST") == "1"
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    not _LEADSUN_LIVE_TESTS_ENABLED,
+    reason=(
+        "Live Leadsun integration test skipped. Set "
+        "RUN_LIVE_LEADSUN_INTEGRATION_TEST=1 plus a real LEADSUN_CLIENT_CERT_PEM "
+        "and SQL_CONNECTION_STRING (pointed at a non-Prod environment) to run "
+        "this for real."
+    ),
+)
+class TestLeadsunLiveIntegration:
+    def test_load_pole_raw_data_against_real_leadsun_api_and_sql(self):
+        assert os.environ.get("ENVIRONMENT", "Dev") != "Prod", (
+            "Refusing to run the live integration test with ENVIRONMENT=Prod. "
+            "Point this at a Dev/Staging environment."
+        )
+        import importlib
+
+        importlib.reload(pole_raw_data_loader)
+        pole_raw_data_loader.load_pole_raw_data()  # will raise on failure -- that's the assertion

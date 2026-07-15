@@ -20,7 +20,10 @@
 
 -- DROP TABLE IF EXISTS Poles;
 
-CREATE TABLE Poles (
+IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'Poles')
+BEGIN
+
+    CREATE TABLE Poles (
         Id                      VARCHAR(50)         NOT NULL PRIMARY KEY,
         PoleNumber              NVARCHAR(100)       NULL,
         LocationId              VARCHAR(50)          NULL,
@@ -44,3 +47,4 @@ CREATE TABLE Poles (
 
     CREATE NONCLUSTERED INDEX IX_Poles_LocationId
         ON Poles (LocationId);
+END
