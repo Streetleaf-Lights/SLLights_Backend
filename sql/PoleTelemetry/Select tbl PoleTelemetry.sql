@@ -1,7 +1,7 @@
--- Column list matches pole_raw_data_loader._ALL_COLUMNS exactly (order
+-- Column list matches pole_telemetry_loader._ALL_COLUMNS exactly (order
 -- included) -- if that list ever changes, regenerate this from it rather
 -- than hand-editing, to avoid drift.
-SELECT TOP 1000
+SELECT TOP 100
     LocationId,
     LastUpload,
     Source,
@@ -48,5 +48,7 @@ SELECT TOP 1000
     ControlModelCode,
     ControlModelName,
     ExtraFieldsJson
-FROM PoleRawData
+FROM PoleTelemetry
+WHERE 1 = 1
+AND LocationId = '12101-5540'
 ORDER BY LastUpload DESC;

@@ -8,7 +8,8 @@ import azure.functions as func
 from shared.customers_loader import load_customers
 from shared.projects_loader import load_projects
 from shared.poles_loader import load_poles
-from shared.pole_raw_data_loader import load_pole_raw_data
+from shared.pole_models_loader import load_pole_models
+from shared.pole_telemetry_loader import load_pole_telemetry
 
 app = func.FunctionApp()
 
@@ -82,35 +83,45 @@ def loadAirTableDataManual(req: func.HttpRequest) -> func.HttpResponse:
 
 # Separate from loadAirTableData on purpose -- different source (Leadsun,
 # not Airtable), different cadence (every 10 minutes, not twice a day), and
-# no dependency between the two: PoleRawData doesn't join against
+# no dependency between the two: this pipeline doesn't join against
 # Poles/Projects/Customers, so there's no load-order concern with the
 # Airtable pipeline either way.
+#
+# Renamed from loadPoleRawData now that it orchestrates two loaders, not
+# one -- mirrors loadAirTableData's naming (source name + "Data" as the
+# umbrella, individual load_<x>() functions underneath). Load order is
+# Models -> Telemetry: PoleModels is a device-model reference table, and
+# PoleTelemetry's ExtraFieldsJson/readings don't actually join against it
+# at the DB level, but conceptually the catalog should exist before the
+# telemetry that references those models.
 @app.timer_trigger(
     schedule="0 */10 * * * *",
     arg_name="myTimer",
     run_on_startup=False,
     use_monitor=True,
 )
-def loadPoleRawData(myTimer: func.TimerRequest) -> None:
+def loadLeadsunData(myTimer: func.TimerRequest) -> None:
     if myTimer.past_due:
-        logging.warning("loadPoleRawData: timer is past due!")
+        logging.warning("loadLeadsunData: timer is past due!")
 
-    logging.info("loadPoleRawData: starting run.")
-    load_pole_raw_data()
-    logging.info("loadPoleRawData: run complete.")
+    logging.info("loadLeadsunData: starting run.")
+    load_pole_models()
+    load_pole_telemetry()
+    logging.info("loadLeadsunData: run complete.")
 
 
 # Manual trigger for testing outside the 10-minute schedule -- same
 # Prod-blocking convention as loadAirTableDataManual.
 @app.route(
-    route="loadPoleRawDataManual", methods=["POST"], auth_level=func.AuthLevel.FUNCTION
+    route="loadLeadsunDataManual", methods=["POST"], auth_level=func.AuthLevel.FUNCTION
 )
-def loadPoleRawDataManual(req: func.HttpRequest) -> func.HttpResponse:
+def loadLeadsunDataManual(req: func.HttpRequest) -> func.HttpResponse:
     if ENVIRONMENT == "Prod":
         return func.HttpResponse("Manual trigger is disabled in Prod.", status_code=403)
 
-    logging.info("loadPoleRawDataManual: manual run triggered.")
-    load_pole_raw_data()
-    logging.info("loadPoleRawDataManual: run complete.")
+    logging.info("loadLeadsunDataManual: manual run triggered.")
+    load_pole_models()
+    load_pole_telemetry()
+    logging.info("loadLeadsunDataManual: run complete.")
 
-    return func.HttpResponse("loadPoleRawData run complete.", status_code=200)
+    return func.HttpResponse("loadPoleModels + loadPoleTelemetry run complete.", status_code=200)

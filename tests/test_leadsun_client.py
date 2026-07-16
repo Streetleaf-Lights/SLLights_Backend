@@ -84,6 +84,48 @@ def test_default_api_url_is_the_lamps_endpoint():
     assert leadsun_client.LEADSUN_API_URL == "https://leadsunedge-us.com:8550/lamps"
 
 
+def test_default_models_url_is_the_models_endpoint():
+    assert leadsun_client.LEADSUN_MODELS_URL == "https://leadsunedge-us.com:8550/models"
+
+
+class TestFetchModels:
+    """
+    fetch_models() shares _get() with fetch_lamps() -- all the cert/verify/
+    hostname-bypass behavior is already covered via fetch_lamps()'s tests
+    above (same underlying code path). These just confirm fetch_models()
+    hits the right URL and returns the right data.
+    """
+
+    def test_calls_models_url_not_lamps_url(self, mock_requests_get_leadsun):
+        mock_requests_get_leadsun.return_value.json.return_value = [{"modelId": 82}]
+        mock_requests_get_leadsun.return_value.raise_for_status.return_value = None
+
+        result = leadsun_client.fetch_models()
+
+        assert result == [{"modelId": 82}]
+        called_url = mock_requests_get_leadsun.call_args.args[0]
+        assert called_url == leadsun_client.LEADSUN_MODELS_URL
+        assert called_url != leadsun_client.LEADSUN_API_URL
+
+    def test_cleans_up_cert_temp_file(self, mocker):
+        mock_get = mocker.patch("shared.leadsun_client.requests.get")
+        mock_get.return_value.json.return_value = []
+        mock_get.return_value.raise_for_status.return_value = None
+        mock_unlink = mocker.patch("shared.leadsun_client.os.unlink")
+
+        leadsun_client.fetch_models()
+
+        mock_unlink.assert_called_once()
+
+    def test_propagates_http_errors(self, mock_requests_get_leadsun):
+        mock_requests_get_leadsun.return_value.raise_for_status.side_effect = RuntimeError(
+            "HTTP 500"
+        )
+
+        with pytest.raises(RuntimeError, match="HTTP 500"):
+            leadsun_client.fetch_models()
+
+
 # --------------------------------------------------------------------------
 # Server certificate verification (_resolve_verify_option / fetch_lamps)
 # --------------------------------------------------------------------------

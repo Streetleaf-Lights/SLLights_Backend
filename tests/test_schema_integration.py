@@ -34,7 +34,7 @@ import re
 
 import pytest
 
-from shared import customers_loader, projects_loader, poles_loader, pole_raw_data_loader
+from shared import customers_loader, projects_loader, poles_loader, pole_telemetry_loader, pole_models_loader
 
 
 # --------------------------------------------------------------------------
@@ -96,12 +96,17 @@ EXPECTED_POLES_COLUMNS = {
 }
 
 # Confirmed against a real Leadsun API response. Sourced directly from
-# pole_raw_data_loader._ALL_COLUMNS rather than duplicated here by hand --
+# pole_telemetry_loader._ALL_COLUMNS rather than duplicated here by hand --
 # with 46 columns, a hand-copied list is itself a drift risk. What these
 # tests actually verify is that the SQL strings stay in sync with that
 # single source of truth, not that the list itself is "correct" (that's
-# covered by the DDL cross-check in test_pole_raw_data_loader.py).
-EXPECTED_POLE_RAW_DATA_COLUMNS = set(pole_raw_data_loader._ALL_COLUMNS)
+# covered by the DDL cross-check in test_pole_telemetry_loader.py).
+EXPECTED_POLE_TELEMETRY_COLUMNS = set(pole_telemetry_loader._ALL_COLUMNS)
+
+# Same reasoning as EXPECTED_POLE_TELEMETRY_COLUMNS above -- sourced
+# directly from pole_models_loader._ALL_COLUMNS rather than duplicated by
+# hand.
+EXPECTED_POLE_MODELS_COLUMNS = set(pole_models_loader._ALL_COLUMNS)
 
 
 def _columns_in_insert_into(sql: str, table: str) -> set:
@@ -249,31 +254,59 @@ class TestPolesSchemaConsistency:
         assert cols == EXPECTED_POLES_COLUMNS - {"Id", "AirTableCreatedDateTime"}
 
 
-class TestPoleRawDataSchemaConsistency:
+class TestPoleTelemetrySchemaConsistency:
     def test_staging_table_columns_match_expected_schema(self):
-        sql = pole_raw_data_loader._STAGING_TABLE_SQL
-        match = re.search(r"CREATE TABLE #PoleRawDataStaging \((.+)\);", sql, re.DOTALL)
+        sql = pole_telemetry_loader._STAGING_TABLE_SQL
+        match = re.search(r"CREATE TABLE #PoleTelemetryStaging \((.+)\);", sql, re.DOTALL)
         cols = {line.strip().split()[0] for line in match.group(1).strip().split(",")}
-        assert cols == EXPECTED_POLE_RAW_DATA_COLUMNS
+        assert cols == EXPECTED_POLE_TELEMETRY_COLUMNS
 
     def test_merge_from_staging_insert_columns_match_expected_schema(self):
-        sql = pole_raw_data_loader._MERGE_FROM_STAGING_SQL
+        sql = pole_telemetry_loader._MERGE_FROM_STAGING_SQL
         match = re.search(r"INSERT \(([^)]+)\)", sql)
         cols = {c.strip() for c in match.group(1).split(",")}
-        assert cols == EXPECTED_POLE_RAW_DATA_COLUMNS
+        assert cols == EXPECTED_POLE_TELEMETRY_COLUMNS
 
     def test_merge_from_staging_update_columns_match_expected_schema(self):
-        sql = pole_raw_data_loader._MERGE_FROM_STAGING_SQL
+        sql = pole_telemetry_loader._MERGE_FROM_STAGING_SQL
         match = re.search(r"THEN UPDATE SET\s*(.+?)\s*WHEN NOT MATCHED", sql, re.DOTALL)
         assignments = match.group(1).strip().rstrip(",").split(",")
         cols = {a.split("=")[0].strip() for a in assignments}
         # Update path never touches the match key (LocationId/LastUpload)
-        assert cols == EXPECTED_POLE_RAW_DATA_COLUMNS - {"LocationId", "LastUpload"}
+        assert cols == EXPECTED_POLE_TELEMETRY_COLUMNS - {"LocationId", "LastUpload"}
 
     def test_no_fk_references(self):
-        """PoleRawData is a separate ingestion pipeline from the
+        """PoleTelemetry is a separate ingestion pipeline from the
         Airtable-sourced tables and isn't meant to reference them."""
-        sql = pole_raw_data_loader._MERGE_FROM_STAGING_SQL
+        sql = pole_telemetry_loader._MERGE_FROM_STAGING_SQL
+        assert "REFERENCES" not in sql
+
+
+class TestPoleModelsSchemaConsistency:
+    def test_staging_table_columns_match_expected_schema(self):
+        sql = pole_models_loader._STAGING_TABLE_SQL
+        match = re.search(r"CREATE TABLE #PoleModelsStaging \((.+)\);", sql, re.DOTALL)
+        cols = {line.strip().split()[0] for line in match.group(1).strip().split(",")}
+        assert cols == EXPECTED_POLE_MODELS_COLUMNS
+
+    def test_merge_from_staging_insert_columns_match_expected_schema(self):
+        sql = pole_models_loader._MERGE_FROM_STAGING_SQL
+        match = re.search(r"INSERT \(([^)]+)\)", sql)
+        cols = {c.strip() for c in match.group(1).split(",")}
+        assert cols == EXPECTED_POLE_MODELS_COLUMNS
+
+    def test_merge_from_staging_update_columns_match_expected_schema(self):
+        sql = pole_models_loader._MERGE_FROM_STAGING_SQL
+        match = re.search(r"THEN UPDATE SET\s*(.+?)\s*WHEN NOT MATCHED", sql, re.DOTALL)
+        assignments = match.group(1).strip().rstrip(",").split(",")
+        cols = {a.split("=")[0].strip() for a in assignments}
+        # Update path never touches the match key (ModelId)
+        assert cols == EXPECTED_POLE_MODELS_COLUMNS - {"ModelId"}
+
+    def test_no_fk_references(self):
+        """PoleModels is part of the Leadsun pipeline but isn't referenced
+        by / doesn't reference any other table here."""
+        sql = pole_models_loader._MERGE_FROM_STAGING_SQL
         assert "REFERENCES" not in sql
 
 
@@ -318,7 +351,7 @@ class TestLiveIntegration:
         customers_loader.load_customers()
 
 
-# Separate opt-in gate from the Airtable one above: PoleRawData is an
+# Separate opt-in gate from the Airtable one above: PoleTelemetry is an
 # independent pipeline (different source, different credentials --
 # LEADSUN_CLIENT_CERT_PEM, not Airtable/SQL), so it gets its own flag
 # rather than piggybacking on RUN_LIVE_INTEGRATION_TESTS.
@@ -336,12 +369,16 @@ _LEADSUN_LIVE_TESTS_ENABLED = os.environ.get("RUN_LIVE_LEADSUN_INTEGRATION_TEST"
     ),
 )
 class TestLeadsunLiveIntegration:
-    def test_load_pole_raw_data_against_real_leadsun_api_and_sql(self):
+    def test_load_pole_models_then_pole_telemetry_against_real_leadsun_api_and_sql(self):
         assert os.environ.get("ENVIRONMENT", "Dev") != "Prod", (
             "Refusing to run the live integration test with ENVIRONMENT=Prod. "
             "Point this at a Dev/Staging environment."
         )
         import importlib
 
-        importlib.reload(pole_raw_data_loader)
-        pole_raw_data_loader.load_pole_raw_data()  # will raise on failure -- that's the assertion
+        importlib.reload(pole_models_loader)
+        importlib.reload(pole_telemetry_loader)
+
+        # Same order as function_app.py's loadLeadsunData: Model -> RawData.
+        pole_models_loader.load_pole_models()  # will raise on failure -- that's the assertion
+        pole_telemetry_loader.load_pole_telemetry()

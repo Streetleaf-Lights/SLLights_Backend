@@ -1,4 +1,4 @@
--- PoleRawData: raw lamp/pole telemetry from the Leadsun API (/lamps).
+-- PoleTelemetry: raw lamp/pole telemetry from the Leadsun API (/lamps).
 --
 -- Notes / assumptions (confirm before running against a real environment):
 --   * Column list is confirmed against a real Leadsun API response (not a
@@ -19,22 +19,22 @@
 --     requested, not a judgment call.
 --   * PRIMARY KEY is the composite (LocationId, LastUpload), matching
 --     "upsert is based on the productName and lastUpload" directly.
---   * No FK anywhere -- PoleRawData is a separate ingestion pipeline from
+--   * No FK anywhere -- PoleTelemetry is a separate ingestion pipeline from
 --     the Airtable-sourced tables (Poles/Projects/Customers) and isn't
 --     meant to reference them.
 --   * Retention (6 months, based on LastUpload) is enforced in code
---     (pole_raw_data_loader.load_pole_raw_data(), runs every invocation),
+--     (pole_telemetry_loader.load_pole_telemetry(), runs every invocation),
 --     not via a SQL Agent job or partition scheme -- simplest option given
 --     the loader already runs every 10 minutes anyway.
 --   * String columns are trimmed on the way in (Leadsun's real response
 --     had at least one field -- lightingState -- with stray trailing
 --     whitespace: "lighting-off ").
 
--- DROP TABLE IF EXISTS PoleRawData;
+-- DROP TABLE IF EXISTS PoleTelemetry;
 
-IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'PoleRawData')
+IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'PoleTelemetry')
 BEGIN
-    CREATE TABLE PoleRawData (
+    CREATE TABLE PoleTelemetry (
         LocationId             NVARCHAR(100)     NOT NULL,  -- from productName
         LastUpload             DATETIMEOFFSET(3) NOT NULL,
         Source                 VARCHAR(50)       NOT NULL,
@@ -84,9 +84,9 @@ BEGIN
         PRIMARY KEY (LocationId, LastUpload)
     );
 
-    CREATE NONCLUSTERED INDEX IX_PoleRawData_LastUpload
-        ON PoleRawData (LastUpload);  -- for the retention purge query
+    CREATE NONCLUSTERED INDEX IX_PoleTelemetry_LastUpload
+        ON PoleTelemetry (LastUpload);  -- for the retention purge query
 
-    CREATE NONCLUSTERED INDEX IX_PoleRawData_SP_ExecId
-        ON PoleRawData (SP_ExecId);
+    CREATE NONCLUSTERED INDEX IX_PoleTelemetry_SP_ExecId
+        ON PoleTelemetry (SP_ExecId);
 END

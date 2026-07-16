@@ -13,7 +13,7 @@ ENVIRONMENT = os.environ.get("ENVIRONMENT", "Dev")
 SOURCE_NAME = "Leadsun"
 RETENTION_MONTHS = 6
 
-# LastUpload is half of PoleRawData's composite PRIMARY KEY (LocationId,
+# LastUpload is half of PoleTelemetry's composite PRIMARY KEY (LocationId,
 # LastUpload), so it can never be NULL -- but a handful of real records
 # come back from Leadsun with lastUpload genuinely null (a device that
 # hasn't reported an upload time yet). Rather than drop those records,
@@ -138,7 +138,7 @@ _NON_KEY_COLUMNS = [c for c in _ALL_COLUMNS if c not in _PK_COLUMNS]
 # the UPDATE SET list above.
 _DIFF_CHECK_COLUMNS = [c for c in _NON_KEY_COLUMNS if c != "SP_ExecId"]
 
-# Fields Leadsun sends that aren't part of PoleRawData's stored columns at
+# Fields Leadsun sends that aren't part of PoleTelemetry's stored columns at
 # all (they're added by this loader, not read from the API).
 _LOADER_OWNED_FIELDS = {"Source", "SP_ExecId"}
 
@@ -168,7 +168,7 @@ def _parse_iso_datetime(value):
 
 def _map_lamp_record(record: dict) -> dict:
     """
-    Maps one raw Leadsun lamp record into PoleRawData's shape: every
+    Maps one raw Leadsun lamp record into PoleTelemetry's shape: every
     confirmed field gets its own typed column (see _ALL_COLUMNS); anything
     NOT in that list is captured in ExtraFieldsJson instead of dropped.
     String values are trimmed (Leadsun sends at least one field --
@@ -196,7 +196,7 @@ def _map_lamp_record(record: dict) -> dict:
     # _MISSING_LAST_UPLOAD_SENTINEL above). A value that's PRESENT but
     # fails to parse is left as None on purpose -- that's a real parsing
     # problem (unexpected format), not a legitimately-missing timestamp,
-    # and load_pole_raw_data() still treats it as a row-level error rather
+    # and load_pole_telemetry() still treats it as a row-level error rather
     # than silently sentineling over what might be a bug.
     raw_last_upload = capitalized.get("LastUpload")
     if raw_last_upload in (None, ""):
@@ -255,8 +255,8 @@ def _sql_diff_select_list(columns: list, prefix: str) -> str:
 
 
 _STAGING_TABLE_SQL = f"""
-IF OBJECT_ID('tempdb..#PoleRawDataStaging') IS NOT NULL DROP TABLE #PoleRawDataStaging;
-CREATE TABLE #PoleRawDataStaging (
+IF OBJECT_ID('tempdb..#PoleTelemetryStaging') IS NOT NULL DROP TABLE #PoleTelemetryStaging;
+CREATE TABLE #PoleTelemetryStaging (
     LocationId  NVARCHAR(100)     NULL,
     LastUpload  DATETIMEOFFSET(3) NULL,
     Source      VARCHAR(50)       NULL,
@@ -307,15 +307,15 @@ CREATE TABLE #PoleRawDataStaging (
 """
 
 _STAGING_INSERT_SQL = (
-    f"INSERT INTO #PoleRawDataStaging ({_sql_column_list(_ALL_COLUMNS)})\n"
+    f"INSERT INTO #PoleTelemetryStaging ({_sql_column_list(_ALL_COLUMNS)})\n"
     f"VALUES ({_sql_placeholder_list(_ALL_COLUMNS)})"
 )
 
 # Diff-checked via INTERSECT (NULL-safe across the mixed column types
 # here -- floats, ints, strings, datetimes, a bit).
 _MERGE_FROM_STAGING_SQL = f"""
-MERGE PoleRawData AS target
-USING #PoleRawDataStaging AS source
+MERGE PoleTelemetry AS target
+USING #PoleTelemetryStaging AS source
 ON target.LocationId = source.LocationId AND target.LastUpload = source.LastUpload
 WHEN MATCHED AND NOT EXISTS (
     SELECT {_sql_diff_select_list(_DIFF_CHECK_COLUMNS, 'target')}
@@ -329,11 +329,11 @@ WHEN NOT MATCHED THEN
     VALUES ({_sql_insert_values_list(_ALL_COLUMNS)});
 """
 
-_TRUNCATE_STAGING_SQL = "TRUNCATE TABLE #PoleRawDataStaging"
+_TRUNCATE_STAGING_SQL = "TRUNCATE TABLE #PoleTelemetryStaging"
 
 # Single-row fallback, used only if a chunk's bulk staging+merge fails.
 _ROW_UPSERT_SQL = f"""
-MERGE PoleRawData AS target
+MERGE PoleTelemetry AS target
 USING (
     SELECT {_sql_source_select_list(_ALL_COLUMNS)}
 ) AS source
@@ -354,11 +354,11 @@ WHEN NOT MATCHED THEN
 # compares datetimeoffset values by actual UTC instant, so this is correct
 # regardless of what offset a given LastUpload was stored with.
 _RETENTION_PURGE_SQL = f"""
-DELETE FROM PoleRawData WHERE LastUpload < DATEADD(MONTH, -{RETENTION_MONTHS}, SYSDATETIMEOFFSET())
+DELETE FROM PoleTelemetry WHERE LastUpload < DATEADD(MONTH, -{RETENTION_MONTHS}, SYSDATETIMEOFFSET())
 """
 
 
-def load_pole_raw_data() -> None:
+def load_pole_telemetry() -> None:
     start_time = _to_dto_string(_now_eastern())
     conn = get_connection()
     cursor = conn.cursor()
@@ -376,7 +376,7 @@ def load_pole_raw_data() -> None:
             OUTPUT INSERTED.Id
             VALUES (?, ?, ?, ?, 0, 0)
             """,
-            "loadPoleRawData",
+            "loadPoleTelemetry",
             ENVIRONMENT,
             start_time,
             SOURCE_NAME,
@@ -389,7 +389,7 @@ def load_pole_raw_data() -> None:
         lamps = fetch_lamps()
         fetch_seconds = time.perf_counter() - fetch_start
         logging.info(
-            "loadPoleRawData: fetched %d record(s) in %.1fs.",
+            "loadPoleTelemetry: fetched %d record(s) in %.1fs.",
             len(lamps),
             fetch_seconds,
         )
@@ -397,7 +397,7 @@ def load_pole_raw_data() -> None:
         # 3. Map + upsert in chunks (stage a chunk, one set-based MERGE,
         # truncate, repeat). Records missing LocationId or a parseable
         # LastUpload are counted as row-level errors and skipped -- both
-        # are part of PoleRawData's primary key, so neither can be NULL.
+        # are part of PoleTelemetry's primary key, so neither can be NULL.
         upsert_start = time.perf_counter()
         param_rows = []
         for lamp in lamps:
@@ -405,7 +405,7 @@ def load_pole_raw_data() -> None:
             if mapped["LocationId"] is None or mapped["LastUpload"] is None:
                 total_errors += 1
                 logging.error(
-                    "loadPoleRawData: skipping record with missing LocationId/LastUpload: %s",
+                    "loadPoleTelemetry: skipping record with missing LocationId/LastUpload: %s",
                     mapped,
                 )
                 continue
@@ -422,7 +422,7 @@ def load_pole_raw_data() -> None:
                 total_success += len(batch)
             except Exception as batch_error:
                 logging.warning(
-                    "loadPoleRawData: chunk of %d failed to bulk-merge (%s); retrying row-by-row.",
+                    "loadPoleTelemetry: chunk of %d failed to bulk-merge (%s); retrying row-by-row.",
                     len(batch),
                     batch_error,
                 )
@@ -434,14 +434,14 @@ def load_pole_raw_data() -> None:
                     except Exception as row_error:
                         total_errors += 1
                         logging.error(
-                            "loadPoleRawData: failed to upsert %s: %s",
+                            "loadPoleTelemetry: failed to upsert %s: %s",
                             row[0],  # LocationId is the first positional param
                             row_error,
                         )
 
         conn.commit()
         logging.info(
-            "loadPoleRawData: upsert phase took %.1fs for %d record(s).",
+            "loadPoleTelemetry: upsert phase took %.1fs for %d record(s).",
             time.perf_counter() - upsert_start,
             len(lamps),
         )
@@ -453,7 +453,7 @@ def load_pole_raw_data() -> None:
         purged_count = cursor.rowcount
         conn.commit()
         logging.info(
-            "loadPoleRawData: purged %d record(s) older than %d months.",
+            "loadPoleTelemetry: purged %d record(s) older than %d months.",
             purged_count,
             RETENTION_MONTHS,
         )
@@ -478,7 +478,7 @@ def load_pole_raw_data() -> None:
         conn.commit()
 
     except Exception as ex:
-        logging.error("loadPoleRawData: run failed: %s", ex)
+        logging.error("loadPoleTelemetry: run failed: %s", ex)
         if sp_exec_id:
             cursor.execute(
                 """

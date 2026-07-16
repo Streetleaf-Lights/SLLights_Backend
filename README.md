@@ -1,9 +1,9 @@
 # LightsApp — Airtable + Leadsun → Azure SQL Sync (Python Azure Functions)
 
 A Python Azure Functions project (v2 programming model) that syncs pole,
-project, and customer data from Airtable, plus raw lamp telemetry from the
-Leadsun API, into Azure SQL Database on a schedule, running on a Flex
-Consumption (Linux) plan.
+project, and customer data from Airtable, plus device-model specs and raw
+lamp telemetry from the Leadsun API, into Azure SQL Database on a
+schedule, running on a Flex Consumption (Linux) plan.
 
 ## Project structure
 
@@ -13,18 +13,21 @@ Backend/
 │                            #   - loadAirTableData: timer trigger, fires 6 AM/6 PM Eastern
 │                            #     runs load_poles() -> load_projects() -> load_customers()
 │                            #   - loadAirTableDataManual: manual HTTP trigger, blocked in Prod
-│                            #   - loadPoleRawData: SEPARATE timer trigger, fires every 10 minutes,
-│                            #     runs load_pole_raw_data() (Leadsun) -- unrelated to the above
-│                            #   - loadPoleRawDataManual: manual HTTP trigger, blocked in Prod
+│                            #   - loadLeadsunData: SEPARATE timer trigger, fires every 10 minutes,
+│                            #     runs load_pole_models() -> load_pole_telemetry() -- unrelated to
+│                            #     the above (was called loadPoleRawData before it covered two
+│                            #     loaders instead of one)
+│                            #   - loadLeadsunDataManual: manual HTTP trigger, blocked in Prod
 ├── shared/
 │   ├── airtable_client.py       # Paginated Airtable fetch (fetch_all_records)
-│   ├── leadsun_client.py        # Mutual-TLS fetch from the Leadsun API (fetch_lamps)
+│   ├── leadsun_client.py        # Mutual-TLS fetch from the Leadsun API (fetch_lamps, fetch_models)
 │   ├── sql_client.py            # Azure SQL connection helper (get_connection)
 │   ├── datetime_utils.py        # Shared Eastern-time / DATETIMEOFFSET helpers
 │   ├── customers_loader.py      # Airtable → Customers upsert logic (load_customers)
 │   ├── projects_loader.py       # Airtable → Projects upsert logic (load_projects)
 │   ├── poles_loader.py          # Airtable → Poles upsert logic (load_poles)
-│   └── pole_raw_data_loader.py  # Leadsun → PoleRawData upsert + retention (load_pole_raw_data)
+│   ├── pole_models_loader.py    # Leadsun → PoleModels upsert logic (load_pole_models)
+│   └── pole_telemetry_loader.py # Leadsun → PoleTelemetry upsert + retention (load_pole_telemetry)
 ├── sql/                     # One folder per table; each has a guarded CREATE
 │   │                        # and a scratch SELECT for querying/debugging in SSMS/ADS
 │   ├── Customers/
@@ -36,9 +39,15 @@ Backend/
 │   ├── Projects/
 │   │   ├── Create tbl Projects.sql
 │   │   └── Select tbl Projects.sql
-│   ├── PoleRawData/
-│   │   ├── Create tbl PoleRawData.sql
-│   │   └── Select tbl PoleRawData.sql
+│   ├── PoleModels/
+│   │   ├── Create tbl PoleModels.sql
+│   │   └── Select tbl PoleModels.sql
+│   ├── PoleTelemetry/
+│   │   ├── Create tbl PoleTelemetry.sql
+│   │   └── Select tbl PoleTelemetry.sql
+│   ├── Rename PoleModel to PoleModels and PoleRawData to PoleTelemetry.sql
+│   │                        # One-time migration for environments where these
+│   │                        # tables already exist under their old names
 │   └── SP_Execution/
 │       ├── Create tbl SP_Execution.sql
 │       └── Select tbl SP_Execution.sql
@@ -109,28 +118,29 @@ Backend/
 5. Test the manual HTTP triggers:
    ```bash
    curl -X POST http://localhost:7071/api/loadAirTableDataManual
-   curl -X POST http://localhost:7071/api/loadPoleRawDataManual
+   curl -X POST http://localhost:7071/api/loadLeadsunDataManual
    ```
    (Confirmed against `host.json` — no custom `routePrefix` is set, so the
    `/api/` prefix is correct as shown.)
 
 ## Running the tests
 
-230 tests, fully mocked — no real Airtable, Leadsun, or Azure SQL calls,
+277 tests, fully mocked — no real Airtable, Leadsun, or Azure SQL calls,
 no credentials needed for the default run.
 
 | File | Focus |
 |---|---|
 | `tests/test_airtable_client.py` | Pagination (single/multi-page), offset handling, adaptive rate-limit pacing (sleeps only the remaining gap, skips it entirely when a request was already slow), optional `fields[]` payload restriction, auth header, HTTP error propagation |
-| `tests/test_leadsun_client.py` | Cert materialized to a temp file with the right content, temp file cleaned up on both success and failure, correct URL/timeout, HTTP error propagation, `verify=` resolution (default/pinned CA/skip-verify precedence), and the hostname-check-bypass adapter — including a real (non-mocked) check that `assert_hostname=False` actually reaches urllib3's pool config, not just the `SSLContext` |
+| `tests/test_leadsun_client.py` | Cert materialized to a temp file with the right content, temp file cleaned up on both success and failure, correct URL/timeout, HTTP error propagation, `verify=` resolution (default/pinned CA/skip-verify precedence), the hostname-check-bypass adapter — including a real (non-mocked) check that `assert_hostname=False` actually reaches urllib3's pool config, not just the `SSLContext` — and `fetch_models()` hitting the `/models` endpoint via the same shared `_get()` |
 | `tests/test_sql_client.py` | Connection string from env, missing env var, pyodbc error passthrough |
 | `tests/test_datetime_utils.py` | `to_dto_string` offset formatting, `airtable_created_time_to_eastern` (winter/summer DST) |
 | `tests/test_customers_loader.py` | `_map_record_to_customer` field mapping, full `load_customers()` flow (success, partial row failure, top-level failure + `ErrorMessage` update, cleanup-on-error), MERGE SQL structural checks, `ntext`-cast regression check, fetch/upsert phase-timing logs |
 | `tests/test_projects_loader.py` | Same shape as `test_customers_loader.py`, for `load_projects()` — including the linked-Customer-id mapping, the NULL-safe `INTERSECT` diff check, the `ntext`-cast fix regression check, and fetch/upsert phase-timing logs |
 | `tests/test_poles_loader.py` | Same shape again, for `load_poles()` — including the linked-Project-id mapping, the LAT/LONG error-string/whitespace cleanup, the staging-table bulk MERGE (with chunk-level fallback to row-by-row on a failed chunk), and the Airtable `fields[]` restriction |
-| `tests/test_pole_raw_data_loader.py` | `_capitalize_key` (PascalCase, not `str.capitalize()`'s behavior), `_parse_iso_datetime`, `_map_lamp_record` against the real confirmed sample (productName→LocationId, id→LeadsunId, projectId/projectName→LeadsunProjectId/Name renames, string trimming, `ExtraFieldsJson` capture for unexpected fields), the missing-`LastUpload` sentinel (stable across calls, never eligible for retention purge, distinct from a genuine parse failure), staging-table bulk MERGE + fallback, retention purge logging |
-| `tests/test_function_app.py` | Timer trigger fires only at 6 AM/6 PM Eastern (verified across the DST boundary with freezegun), `past_due` handling, manual HTTP trigger's `Prod` block, synchronous (non-threaded) execution, **Poles runs before Projects runs before Customers** in both triggers, a failure in an earlier loader blocks the later ones, and **`loadPoleRawData` runs unconditionally** (no hour-gating) and never touches the Airtable loaders |
-| `tests/test_schema_integration.py` | Column-name consistency between the code's SQL and a documented expected schema (all four tables); two opt-in **real** end-to-end tests (Airtable+SQL, and separately Leadsun+SQL) |
+| `tests/test_pole_models_loader.py` | `_capitalize_key`, `_parse_numeric_string` (int vs. float vs. non-numeric passthrough) against the real confirmed `/models` sample, the deliberate `LampsUsing` exception (bitmask string, not converted), `ModelId` needing no rename/conversion (native int, and *is* the real PK here unlike PoleTelemetry's `id`→`LeadsunId`), staging-table bulk MERGE + fallback |
+| `tests/test_pole_telemetry_loader.py` | `_capitalize_key` (PascalCase, not `str.capitalize()`'s behavior), `_parse_iso_datetime`, `_map_lamp_record` against the real confirmed sample (productName→LocationId, id→LeadsunId, projectId/projectName→LeadsunProjectId/Name renames, string trimming, `ExtraFieldsJson` capture for unexpected fields), the missing-`LastUpload` sentinel (stable across calls, never eligible for retention purge, distinct from a genuine parse failure), staging-table bulk MERGE + fallback, retention purge logging |
+| `tests/test_function_app.py` | Timer trigger fires only at 6 AM/6 PM Eastern (verified across the DST boundary with freezegun), `past_due` handling, manual HTTP trigger's `Prod` block, synchronous (non-threaded) execution, **Poles runs before Projects runs before Customers** in both triggers, a failure in an earlier loader blocks the later ones, and **`loadLeadsunData` runs unconditionally** (no hour-gating), runs **Model before RawData**, and never touches the Airtable loaders |
+| `tests/test_schema_integration.py` | Column-name consistency between the code's SQL and a documented expected schema (all five tables); two opt-in **real** end-to-end tests (Airtable+SQL, and separately Leadsun+SQL) |
 
 ```bash
 pytest -v
@@ -151,7 +161,7 @@ export ENVIRONMENT=Dev   # test refuses to run if this is "Prod"
 pytest -v -m integration
 ```
 
-**Leadsun → SQL** (`load_pole_raw_data()`):
+**Leadsun → SQL** (`load_pole_models()` → `load_pole_telemetry()`):
 ```bash
 export RUN_LIVE_LEADSUN_INTEGRATION_TEST=1
 export LEADSUN_CLIENT_CERT_PEM=...
@@ -161,8 +171,8 @@ pytest -v -m integration
 ```
 
 The Airtable test **writes real rows** to `SP_Execution`, `Poles`,
-`Projects`, and `Customers`. The Leadsun test writes to `SP_Execution` and
-`PoleRawData`. Point either at Dev, never Prod.
+`Projects`, and `Customers`. The Leadsun test writes to `SP_Execution`,
+`PoleModels`, and `PoleTelemetry`. Point either at Dev, never Prod.
 
 ## Adding more functions
 
@@ -379,13 +389,80 @@ reference for a from-scratch project, not as the LightsApp deploy runbook.
   `"load<X>: upsert phase took X.Xs for N record(s)"`, so the same
   before/after visibility is available everywhere, not just for Poles.
 
-- **`loadPoleRawData` — new, separate pipeline (Leadsun → `PoleRawData`)**:
-  runs on its own timer trigger every 10 minutes
+- **`loadLeadsunData` — separate pipeline (Leadsun → `PoleModels` +
+  `PoleTelemetry`)**: runs on its own timer trigger every 10 minutes
   (`schedule="0 */10 * * * *"`), completely independent of
   `loadAirTableData` — different source, different cadence, no dependency
   between the two. Has its own manual HTTP trigger
-  (`loadPoleRawDataManual`), same `Prod`-blocking convention as the others.
+  (`loadLeadsunDataManual`), same `Prod`-blocking convention as the others.
+  This pipeline has been through two renames, in order:
+  1. The **Azure Function** itself was renamed from `loadPoleRawData` to
+     `loadLeadsunData` once it started orchestrating two loaders
+     (`load_pole_models()` → `load_pole_telemetry()`, in that order)
+     instead of one — mirrors `loadAirTableData`'s naming (source name +
+     "Data" as the umbrella, individual `load_<x>()` functions
+     underneath). Since this renamed a live, already-deployed Azure
+     Function, redeploying it meant Azure treated it as a new function —
+     no data loss, but a clean break in Application Insights' invocation
+     history under the old name, and the manual trigger's URL changed
+     (`/api/loadPoleRawDataManual` → `/api/loadLeadsunDataManual`).
+  2. The **tables** `PoleModel` → `PoleModels` and `PoleRawData` →
+     `PoleTelemetry` were renamed for consistency (`PoleModel` was
+     singular where every other reference table here — `Customers`,
+     `Projects`, `Poles` — is plural; `PoleTelemetry` is a more accurate,
+     industry-standard name now that the schema is fully enumerated
+     rather than the JSON-blob "raw" landing zone it started as). This
+     cascaded to the Python side too: `pole_model_loader.py` →
+     `pole_models_loader.py` (`load_pole_model()` → `load_pole_models()`),
+     `pole_raw_data_loader.py` → `pole_telemetry_loader.py`
+     (`load_pole_raw_data()` → `load_pole_telemetry()`), the `sql/`
+     folders, and the `SP_Execution.Name` values these loaders log under
+     (`"loadPoleModel"` → `"loadPoleModels"`,
+     `"loadPoleRawData"` → `"loadPoleTelemetry"`). **Since these tables
+     already existed live with real data**, `sql/Rename PoleModel to
+     PoleModels and PoleRawData to PoleTelemetry.sql` has the one-time
+     `sp_rename` migration (tables + their indexes) — run it once per
+     environment *before* deploying this renamed code, or the MERGE/
+     DELETE statements will fail with "invalid object name" against a
+     database that still has the old table names. Safe to run more than
+     once; each rename is guarded to only fire if the old name still
+     exists.
 
+  **`PoleModels` — new table, a device-model reference/catalog, not
+  per-device telemetry.** Confirmed against a real Leadsun `/models`
+  response (20 columns). Unlike `PoleTelemetry`, this is a simple
+  (non-composite) primary key: **`ModelId` alone** — there's no
+  `LocationId`/`LastUpload` concept here, just specs per device model.
+  `ModelId` arrives as a real JSON integer already (not a string, unlike
+  most of this table's other fields) and needs no rename either — unlike
+  `PoleTelemetry`'s `id` → `LeadsunId`, a bare `ModelId` column here
+  genuinely *is* this table's primary key, so there's no confusing
+  collision with this project's conventions to avoid.
+
+  **Numeric-string conversion** (`pole_models_loader._parse_numeric_string()`):
+  several fields arrive from the API as numeric-looking strings (`"80"`,
+  `"12.8"`, ...) and are converted to real `int`/`float` values rather
+  than stored as text — tries `int()` first (no decimal point), then
+  `float()`, leaving genuinely non-numeric or missing values as `None`/
+  as-is. Stored uniformly as `FLOAT` columns (safe for both whole and
+  fractional values) rather than picking `INT` vs `FLOAT` per column.
+  **One deliberate exception**: `LampsUsing` (`"00000001"` in the sample)
+  looks numeric but is treated as a bitmask-style string and left
+  unconverted — same reasoning as `PoleTelemetry`'s `SolarBoardDcStatus`/
+  `LampBatteryStatus`, where leading zeros are meaningful and would be
+  silently lost by converting to an int. Worth double-checking this is
+  the intended behavior for that field.
+
+  Same `ExtraFieldsJson` safety net as `PoleTelemetry` (any field Leadsun
+  sends that isn't a known column lands there, capitalized, instead of
+  being dropped), and the same staging-table bulk MERGE pattern (batches
+  of `pole_models_loader._UPSERT_BATCH_SIZE`, 2000, with row-by-row
+  fallback on a failed chunk) — kept for consistency with the rest of the
+  Leadsun pipeline even though `PoleModels` is a small reference table and
+  doesn't need the performance benefit the way `Poles`/`PoleTelemetry` do.
+
+  **`PoleTelemetry`** (the renamed `PoleRawData`): same pipeline and
+  schema as before, just renamed for the reasons above.
   **Schema is confirmed against a real Leadsun `/lamps` response** (46
   columns) — every field is promoted to its own typed column, matching
   "consistent with our tables" directly rather than the JSON-blob fallback
@@ -415,7 +492,7 @@ reference for a from-scratch project, not as the LightsApp deploy runbook.
   applied to Poles' `Lat`/`Long`.
 
   The single source of truth for the column list (order included) is
-  `pole_raw_data_loader._ALL_COLUMNS` — the staging table DDL, the
+  `pole_telemetry_loader._ALL_COLUMNS` — the staging table DDL, the
   `MERGE`'s `INSERT`/`UPDATE` column lists, and the Python param-tuple
   order are all built from it (or cross-checked against it in tests), so
   there's one place to change if a column ever needs to move.
@@ -432,7 +509,7 @@ reference for a from-scratch project, not as the LightsApp deploy runbook.
   **Upsert key = `(LocationId, LastUpload)`**, directly as the table's
   composite `PRIMARY KEY` — matches "upsert is based on the productName
   and lastUpload" literally. Uses the same staging-table bulk MERGE pattern
-  as Poles (batches of `pole_raw_data_loader._UPSERT_BATCH_SIZE`, 2000,
+  as Poles (batches of `pole_telemetry_loader._UPSERT_BATCH_SIZE`, 2000,
   with row-by-row fallback on a failed chunk) rather than starting naive,
   since that pattern's already proven out.
 
@@ -441,11 +518,11 @@ reference for a from-scratch project, not as the LightsApp deploy runbook.
   at the end of every invocation (every 10 minutes) — not a separate
   scheduled job or partitioning scheme, since the loader already runs
   frequently enough that a simple indexed delete is plenty. Change
-  `RETENTION_MONTHS` in `pole_raw_data_loader.py` to adjust the window.
+  `RETENTION_MONTHS` in `pole_telemetry_loader.py` to adjust the window.
 
   **Records with a genuinely missing `lastUpload`** (a handful of real
   devices report this — presumably ones that haven't uploaded yet) get a
-  stable placeholder, `pole_raw_data_loader._MISSING_LAST_UPLOAD_SENTINEL`
+  stable placeholder, `pole_telemetry_loader._MISSING_LAST_UPLOAD_SENTINEL`
   (`9999-12-31 23:59:59.999 +00:00`), instead of being dropped —
   `LastUpload` is half of the composite primary key, so it can never
   actually be `NULL`. The sentinel is deliberately: (1) the *same* value

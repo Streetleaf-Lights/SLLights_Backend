@@ -8,6 +8,13 @@ from requests.adapters import HTTPAdapter
 
 LEADSUN_API_URL = os.environ.get("LEADSUN_API_URL", "https://leadsunedge-us.com:8550/lamps")
 
+# Kept as a separate setting from LEADSUN_API_URL (not renamed to something
+# like LEADSUN_LAMPS_URL) so an already-configured LEADSUN_API_URL setting
+# keeps working unchanged for existing deployments.
+LEADSUN_MODELS_URL = os.environ.get(
+    "LEADSUN_MODELS_URL", "https://leadsunedge-us.com:8550/models"
+)
+
 # Combined certificate + unencrypted private key, PEM format (both blocks
 # in one file -- confirmed against the cert provided while building this:
 # one "BEGIN CERTIFICATE" block, one unencrypted "BEGIN PRIVATE KEY" block).
@@ -131,22 +138,16 @@ def _resolve_verify_option():
     return True
 
 
-def fetch_lamps() -> list:
+def _get(url: str) -> list:
     """
-    Fetches every lamp/pole record from the Leadsun API.
+    Shared GET logic for both Leadsun endpoints (/lamps, /models): mutual
+    TLS with the client cert, plus whichever server-certificate
+    verification mode is configured (default, pinned CA, hostname-check
+    bypass, or fully disabled).
 
-    ASSUMPTIONS -- unverified, since this sandbox has no network path to
-    leadsunedge-us.com to confirm against a real response:
-      - One GET returns everything; no pagination params are sent. If the
-        real API paginates, this needs an offset/cursor loop added, similar
-        to shared/airtable_client.py's fetch_all_records().
-      - The response body is a JSON array of lamp objects directly, not
-        wrapped in an envelope like {"data": [...]} or {"lamps": [...]}.
-
-    Returns:
-        A list of raw lamp record dicts, in whatever shape/casing the
-        Leadsun API sends them (capitalization/renaming happens in
-        shared/pole_raw_data_loader.py, not here).
+    Returns the parsed JSON response body, in whatever shape/casing the
+    Leadsun API sends it (capitalization/renaming happens in the loader
+    modules, not here).
     """
     cert_path = _write_client_cert_to_temp_file()
     verify_option = _resolve_verify_option()
@@ -165,11 +166,9 @@ def fetch_lamps() -> list:
             ssl_context = _build_no_hostname_check_ssl_context(ca_cert_path)
             session = requests.Session()
             session.mount("https://", _NoHostnameCheckAdapter(ssl_context))
-            response = session.get(LEADSUN_API_URL, cert=cert_path, timeout=30)
+            response = session.get(url, cert=cert_path, timeout=30)
         else:
-            response = requests.get(
-                LEADSUN_API_URL, cert=cert_path, verify=verify_option, timeout=30
-            )
+            response = requests.get(url, cert=cert_path, verify=verify_option, timeout=30)
         response.raise_for_status()
         return response.json()
     finally:
@@ -178,3 +177,26 @@ def fetch_lamps() -> list:
             os.unlink(verify_option)
         if session is not None:
             session.close()
+
+
+def fetch_lamps() -> list:
+    """
+    Fetches every lamp/pole record from the Leadsun /lamps endpoint.
+
+    ASSUMPTIONS -- unverified, since this sandbox has no network path to
+    leadsunedge-us.com to confirm against a real response:
+      - One GET returns everything; no pagination params are sent. If the
+        real API paginates, this needs an offset/cursor loop added, similar
+        to shared/airtable_client.py's fetch_all_records().
+      - The response body is a JSON array of lamp objects directly, not
+        wrapped in an envelope like {"data": [...]} or {"lamps": [...]}.
+    """
+    return _get(LEADSUN_API_URL)
+
+
+def fetch_models() -> list:
+    """
+    Fetches every pole/lamp model definition from the Leadsun /models
+    endpoint (confirmed: plain JSON array, no pagination, same as /lamps).
+    """
+    return _get(LEADSUN_MODELS_URL)

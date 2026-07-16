@@ -217,17 +217,66 @@ def mock_requests_get_leadsun(mocker):
 
 
 @pytest.fixture
-def patch_get_connection_pole_raw_data(mocker, mock_conn):
-    """Patches shared.pole_raw_data_loader.get_connection to return mock_conn."""
+def patch_get_connection_pole_telemetry(mocker, mock_conn):
+    """Patches shared.pole_telemetry_loader.get_connection to return mock_conn."""
     return mocker.patch(
-        "shared.pole_raw_data_loader.get_connection", return_value=mock_conn
+        "shared.pole_telemetry_loader.get_connection", return_value=mock_conn
     )
 
 
 @pytest.fixture
 def patch_fetch_lamps(mocker):
-    """Patches shared.pole_raw_data_loader.fetch_lamps (already imported by name)."""
-    return mocker.patch("shared.pole_raw_data_loader.fetch_lamps")
+    """Patches shared.pole_telemetry_loader.fetch_lamps (already imported by name)."""
+    return mocker.patch("shared.pole_telemetry_loader.fetch_lamps")
+
+
+@pytest.fixture
+def patch_get_connection_pole_models(mocker, mock_conn):
+    """Patches shared.pole_models_loader.get_connection to return mock_conn."""
+    return mocker.patch(
+        "shared.pole_models_loader.get_connection", return_value=mock_conn
+    )
+
+
+@pytest.fixture
+def patch_fetch_models(mocker):
+    """Patches shared.pole_models_loader.fetch_models (already imported by name)."""
+    return mocker.patch("shared.pole_models_loader.fetch_models")
+
+
+@pytest.fixture
+def make_model_record():
+    """
+    Factory for building a raw Leadsun model record dict, matching a real
+    confirmed /models API response exactly (field names, string-encoded
+    numbers, and the "" / null fields).
+    """
+
+    def _make(model_id=82, extra_fields=None):
+        record = {
+            "modelId": model_id,
+            "modelName": "RS30-C",
+            "sunboardPower": "80",
+            "lightPower": "30",
+            "battery": "460",
+            "systemVoltage": "12.8",
+            "commType": "Lora",
+            "lightDisType": "",
+            "iconUrl": None,
+            "lampsUsing": "00000001",
+            "batteryVoltage": None,
+            "isAc": False,
+            "isDcOut": False,
+            "modelSeries": None,
+            "batteryCapacity1": "230",
+            "batteryCapacity2": "230",
+            "solarBoardVoltage": "18",
+        }
+        if extra_fields:
+            record.update(extra_fields)
+        return record
+
+    return _make
 
 
 @pytest.fixture
