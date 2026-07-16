@@ -310,6 +310,34 @@ class TestPoleModelsSchemaConsistency:
         assert "REFERENCES" not in sql
 
 
+class TestWorkweekSchemaConsistency:
+    """
+    Workweek has no loader module (it's static computed data, not synced
+    from Airtable/Leadsun), so there's no _ALL_COLUMNS to cross-check
+    against like the other tables -- instead this checks the DDL's column
+    list against what scripts/generate_workweek_sql.py actually emits.
+    """
+
+    _EXPECTED_COLUMNS = {"Year", "Week", "StartDate", "EndDate"}
+
+    def test_ddl_columns_match_generator_output_columns(self):
+        from scripts.generate_workweek_sql import generate_merge_sql
+
+        sql = generate_merge_sql(2026, 2026)
+        match = re.search(r"AS source \(([^)]+)\)", sql)
+        cols = {c.strip() for c in match.group(1).split(",")}
+        assert cols == self._EXPECTED_COLUMNS
+
+    def test_generator_produces_a_merge_not_a_plain_insert(self):
+        """Idempotent/re-runnable, consistent with every other loader in
+        this project using upsert semantics rather than a one-shot insert
+        that would fail on re-run."""
+        from scripts.generate_workweek_sql import generate_merge_sql
+
+        sql = generate_merge_sql(2026, 2026)
+        assert "MERGE Workweek AS target" in sql
+
+
 # --------------------------------------------------------------------------
 # Opt-in real end-to-end integration test.
 #

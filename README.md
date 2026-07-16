@@ -3,7 +3,9 @@
 A Python Azure Functions project (v2 programming model) that syncs pole,
 project, and customer data from Airtable, plus device-model specs and raw
 lamp telemetry from the Leadsun API, into Azure SQL Database on a
-schedule, running on a Flex Consumption (Linux) plan.
+schedule, running on a Flex Consumption (Linux) plan. Also includes a
+standalone `Workweek` calendar reference table (static, not synced from
+any external source).
 
 ## Project structure
 
@@ -18,6 +20,7 @@ Backend/
 │                            #     the above (was called loadPoleRawData before it covered two
 │                            #     loaders instead of one)
 │                            #   - loadLeadsunDataManual: manual HTTP trigger, blocked in Prod
+│                            #   - Both timer triggers skip entirely when ENVIRONMENT == "Dev"
 ├── shared/
 │   ├── airtable_client.py       # Paginated Airtable fetch (fetch_all_records)
 │   ├── leadsun_client.py        # Mutual-TLS fetch from the Leadsun API (fetch_lamps, fetch_models)
@@ -28,6 +31,9 @@ Backend/
 │   ├── poles_loader.py          # Airtable → Poles upsert logic (load_poles)
 │   ├── pole_models_loader.py    # Leadsun → PoleModels upsert logic (load_pole_models)
 │   └── pole_telemetry_loader.py # Leadsun → PoleTelemetry upsert + retention (load_pole_telemetry)
+├── scripts/
+│   └── generate_workweek_sql.py # Standalone (no Azure Functions runtime needed) generator
+│                                 # for Workweek's populate script -- see below
 ├── sql/                     # One folder per table; each has a guarded CREATE
 │   │                        # and a scratch SELECT for querying/debugging in SSMS/ADS
 │   ├── Customers/
@@ -45,6 +51,10 @@ Backend/
 │   ├── PoleTelemetry/
 │   │   ├── Create tbl PoleTelemetry.sql
 │   │   └── Select tbl PoleTelemetry.sql
+│   ├── Workweek/
+│   │   ├── Create tbl Workweek.sql
+│   │   ├── Select tbl Workweek.sql
+│   │   └── Populate tbl Workweek 2026-2030.sql  # generated, idempotent MERGE
 │   ├── Rename PoleModel to PoleModels and PoleRawData to PoleTelemetry.sql
 │   │                        # One-time migration for environments where these
 │   │                        # tables already exist under their old names
@@ -125,7 +135,7 @@ Backend/
 
 ## Running the tests
 
-288 tests, fully mocked — no real Airtable, Leadsun, or Azure SQL calls,
+310 tests, fully mocked — no real Airtable, Leadsun, or Azure SQL calls,
 no credentials needed for the default run.
 
 | File | Focus |
@@ -140,7 +150,8 @@ no credentials needed for the default run.
 | `tests/test_pole_models_loader.py` | `_capitalize_key`, `_parse_numeric_string` (int vs. float vs. non-numeric passthrough) against the real confirmed `/models` sample, the deliberate `LampsUsing` exception (bitmask string, not converted), `ModelId` needing no rename/conversion (native int, and *is* the real PK here unlike PoleTelemetry's `id`→`LeadsunId`), staging-table bulk MERGE + fallback |
 | `tests/test_pole_telemetry_loader.py` | `_capitalize_key` (PascalCase, not `str.capitalize()`'s behavior), `_parse_iso_datetime`, `_map_lamp_record` against the real confirmed sample (productName→LocationId, id→LeadsunId, projectId/projectName→LeadsunProjectId/Name renames, string trimming, `ExtraFieldsJson` capture for unexpected fields), the missing-`LastUpload` sentinel (stable across calls, never eligible for retention purge, distinct from a genuine parse failure), staging-table bulk MERGE + fallback, retention purge logging |
 | `tests/test_function_app.py` | Timer trigger fires only at 6 AM/6 PM Eastern (verified across the DST boundary with freezegun), `past_due` handling, manual HTTP trigger's `Prod` block, synchronous (non-threaded) execution, **Poles runs before Projects runs before Customers** in both triggers, a failure in an earlier loader blocks the later ones, **`loadLeadsunData` runs unconditionally** (no hour-gating) otherwise, runs **Model before RawData**, and never touches the Airtable loaders — and **both timer triggers skip entirely when `ENVIRONMENT == "Dev"`**, before even checking `past_due`, while both manual triggers are unaffected by that guard |
-| `tests/test_schema_integration.py` | Column-name consistency between the code's SQL and a documented expected schema (all five tables); two opt-in **real** end-to-end tests (Airtable+SQL, and separately Leadsun+SQL) |
+| `tests/test_generate_workweek_sql.py` | `sunday_on_or_before()`, full validation of the generated rows (260 for 2026-2030: no duplicates, every week exactly 7 days Sun-Sat, no gaps/overlaps within a year, Jan 1 always in that year's Week 1, leap-day coverage), and that the emitted SQL is a `MERGE` (idempotent), not a plain `INSERT` |
+| `tests/test_schema_integration.py` | Column-name consistency between the code's SQL and a documented expected schema (all five loader-backed tables, plus a lighter DDL-vs-generator check for `Workweek`); two opt-in **real** end-to-end tests (Airtable+SQL, and separately Leadsun+SQL) |
 
 ```bash
 pytest -v
@@ -649,3 +660,44 @@ reference for a from-scratch project, not as the LightsApp deploy runbook.
   - If both `LEADSUN_SKIP_TLS_VERIFY` and `LEADSUN_SKIP_HOSTNAME_CHECK`
     are set, `LEADSUN_SKIP_TLS_VERIFY` wins — the fully-open path already
     covers it, no need for the custom adapter too.
+
+- **`Workweek` — a static calendar reference table, not synced from
+  anywhere.** Unlike every other table in this project, there's no
+  external API, no loader function, no Azure Function, and no
+  `Source`/`SP_ExecId` columns — it's pure computed date arithmetic.
+  `scripts/generate_workweek_sql.py` is a standalone script (stdlib only,
+  no `pyodbc`/Azure Functions runtime needed) that emits an idempotent
+  `MERGE` statement for a given year range;
+  `sql/Workweek/Populate tbl Workweek 2026-2030.sql` is its output for the
+  requested range, already generated and ready to run.
+
+  **The convention, and why one was needed**: `Week` runs 1-52 always
+  (never 53), and every week is a full 7-day Sunday-Saturday span — but
+  52 × 7 = 364 days, one or two short of a full 365/366-day year, so some
+  convention has to absorb the difference. This one anchors **Week 1 of
+  year Y to the Sunday on-or-before January 1 of Y** (so Jan 1 always
+  falls in that year's Week 1), with each year computed independently
+  from its own January 1 rather than continuously rolling across years.
+  The practical effect: Week 1 of a year sometimes dips a few days into
+  the *previous* December (e.g. 2026's Week 1 starts Sun 2025-12-28,
+  since Jan 1 2026 is a Thursday), and correspondingly the last 2-8 days
+  of each December become part of the *following* year's Week 1 rather
+  than that year's (non-existent) Week 53. No calendar date within a
+  continuously-populated range is ever left uncovered — it just sometimes
+  lands under the year you might not expect at a glance. This is a real
+  interpretation choice, not the only valid one (ISO 8601 weeks, e.g.,
+  use Monday-Sunday and allow 53 weeks in some years) — if a different
+  convention is wanted later, `generate_workweek_sql.py` is the one place
+  to change the logic; regenerate and re-run the resulting script
+  afterward.
+
+  **Extending to future years** is a one-line command, no code changes
+  needed:
+  ```bash
+  python3 scripts/generate_workweek_sql.py 2031 2035 > "sql/Workweek/Populate tbl Workweek 2031-2035.sql"
+  ```
+  Then run the resulting `.sql` file against the database. The `MERGE` is
+  idempotent — re-running any populate script (including the existing
+  2026-2030 one) is always safe and won't create duplicates or error on
+  a second run, unlike a plain `INSERT` would against the `(Year, Week)`
+  primary key.
