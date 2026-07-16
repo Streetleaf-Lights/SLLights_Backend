@@ -96,6 +96,37 @@ def _build_no_hostname_check_ssl_context(ca_cert_path):
     return context
 
 
+_PRIVATE_KEY_MARKERS = (
+    "-----BEGIN PRIVATE KEY-----",
+    "-----BEGIN RSA PRIVATE KEY-----",
+    "-----BEGIN ENCRYPTED PRIVATE KEY-----",
+)
+
+
+def _validate_pem_has_certificate(pem_content: str, setting_name: str) -> None:
+    """
+    Fails fast with a clear, actionable message if pem_content is missing a
+    certificate block, instead of letting a mangled value fail deep inside
+    urllib3/OpenSSL with a cryptic "[SSL] PEM lib" error that gives no clue
+    which setting or what's actually wrong. This exact failure mode has
+    already bitten this setup once (JSON-escaping in local.settings.json)
+    and once more on the Azure side (the app setting's value likely got
+    truncated or had its newlines flattened when set via the Portal UI) --
+    worth catching early rather than debugging via stack trace each time.
+    """
+    if "-----BEGIN CERTIFICATE-----" not in pem_content:
+        raise ValueError(
+            f"{setting_name} doesn't contain a '-----BEGIN CERTIFICATE-----' "
+            f"block. This usually means the app setting's value got "
+            f"truncated, had its newlines flattened, or still has 'Bag "
+            f"Attributes' metadata lines left in from an openssl pkcs12 "
+            f"export. Re-check the value against the original .pem file --"
+            f"setting it via `az functionapp config appsettings set "
+            f"--settings \"{setting_name}=$(cat file.pem)\"` avoids the "
+            f"Portal text box mangling multi-line values."
+        )
+
+
 def _write_pem_to_temp_file(pem_content: str) -> str:
     """Materializes PEM text to a temp file (requests' cert=/verify=
     parameters need actual filesystem paths, not raw PEM text). Caller is
@@ -114,6 +145,16 @@ def _write_client_cert_to_temp_file() -> str:
     every call (cheap -- a few KB) so a rotated cert setting takes effect
     on the very next run without needing a restart.
     """
+    _validate_pem_has_certificate(LEADSUN_CLIENT_CERT_PEM, "LEADSUN_CLIENT_CERT_PEM")
+    if not any(marker in LEADSUN_CLIENT_CERT_PEM for marker in _PRIVATE_KEY_MARKERS):
+        raise ValueError(
+            "LEADSUN_CLIENT_CERT_PEM doesn't contain a private key block "
+            "(expected '-----BEGIN ... PRIVATE KEY-----'). Same likely "
+            "causes as a missing certificate block -- the setting's value "
+            "is probably truncated or mangled. Re-set it via `az functionapp "
+            'config appsettings set --settings "LEADSUN_CLIENT_CERT_PEM='
+            '$(cat file.pem)"` to avoid Portal text-box mangling.'
+        )
     return _write_pem_to_temp_file(LEADSUN_CLIENT_CERT_PEM)
 
 
@@ -134,6 +175,7 @@ def _resolve_verify_option():
         )
         return False
     if LEADSUN_SERVER_CA_CERT:
+        _validate_pem_has_certificate(LEADSUN_SERVER_CA_CERT, "LEADSUN_SERVER_CA_CERT")
         return _write_pem_to_temp_file(LEADSUN_SERVER_CA_CERT)
     return True
 

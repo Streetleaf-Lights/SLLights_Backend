@@ -23,6 +23,11 @@ ENVIRONMENT = os.environ.get("ENVIRONMENT", "Dev")
 # 6 PM Eastern year-round without touching the cron expression across DST
 # changes, this fires every hour on the hour and only does real work when the
 # current Eastern-time hour matches one of TARGET_HOURS.
+#
+# Skips entirely when ENVIRONMENT == "Dev": local/dev runs shouldn't hit the
+# real Airtable/SQL on a timer just because `func start` happens to be
+# running -- use loadAirTableDataManual (unaffected by this check) to run it
+# on demand instead.
 @app.timer_trigger(
     schedule="0 0 * * * *",
     arg_name="myTimer",
@@ -30,6 +35,13 @@ ENVIRONMENT = os.environ.get("ENVIRONMENT", "Dev")
     use_monitor=True,
 )
 def loadAirTableData(myTimer: func.TimerRequest) -> None:
+    if ENVIRONMENT == "Dev":
+        logging.info(
+            "loadAirTableData: skipping timer-triggered run in Dev -- use "
+            "loadAirTableDataManual instead."
+        )
+        return
+
     if myTimer.past_due:
         logging.warning("loadAirTableData: timer is past due!")
 
@@ -60,11 +72,13 @@ def loadAirTableData(myTimer: func.TimerRequest) -> None:
     logging.info("loadAirTableData: run complete.")
 
 
-# Manual trigger for testing outside the scheduled hours -- run it anytime with:
+# Manual trigger -- run it anytime with:
 #   func start  (locally), then:
 #   curl -X POST http://localhost:7071/api/loadAirTableDataManual
 # or, once deployed to a non-Prod slot, POST to the deployed URL with the
-# function key. Blocked outright in Prod so it can't accidentally be hit there.
+# function key. Blocked outright in Prod so it can't accidentally be hit
+# there. Unaffected by loadAirTableData's Dev-skip above -- in Dev, this is
+# now the only way to trigger a run at all.
 @app.route(
     route="loadAirTableDataManual", methods=["POST"], auth_level=func.AuthLevel.FUNCTION
 )
@@ -101,6 +115,13 @@ def loadAirTableDataManual(req: func.HttpRequest) -> func.HttpResponse:
     use_monitor=True,
 )
 def loadLeadsunData(myTimer: func.TimerRequest) -> None:
+    if ENVIRONMENT == "Dev":
+        logging.info(
+            "loadLeadsunData: skipping timer-triggered run in Dev -- use "
+            "loadLeadsunDataManual instead."
+        )
+        return
+
     if myTimer.past_due:
         logging.warning("loadLeadsunData: timer is past due!")
 
@@ -111,7 +132,9 @@ def loadLeadsunData(myTimer: func.TimerRequest) -> None:
 
 
 # Manual trigger for testing outside the 10-minute schedule -- same
-# Prod-blocking convention as loadAirTableDataManual.
+# Prod-blocking convention as loadAirTableDataManual, and unaffected by
+# loadLeadsunData's Dev-skip above -- in Dev, this is the only way to
+# trigger a run at all.
 @app.route(
     route="loadLeadsunDataManual", methods=["POST"], auth_level=func.AuthLevel.FUNCTION
 )

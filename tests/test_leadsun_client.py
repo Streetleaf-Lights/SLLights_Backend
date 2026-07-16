@@ -8,6 +8,56 @@ import pytest
 from shared import leadsun_client
 
 
+class TestValidatePemHasCertificate:
+    def test_valid_pem_passes(self):
+        leadsun_client._validate_pem_has_certificate(
+            "-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----", "SOME_SETTING"
+        )  # must not raise
+
+    def test_missing_certificate_marker_raises_with_setting_name_in_message(self):
+        with pytest.raises(ValueError, match="SOME_SETTING"):
+            leadsun_client._validate_pem_has_certificate("not a real cert", "SOME_SETTING")
+
+    def test_missing_certificate_marker_message_mentions_the_likely_causes(self):
+        with pytest.raises(ValueError, match="truncated"):
+            leadsun_client._validate_pem_has_certificate("garbage", "SOME_SETTING")
+
+
+class TestWriteClientCertToTempFileValidation:
+    def test_raises_clear_error_when_certificate_block_missing(self, monkeypatch):
+        monkeypatch.setattr(leadsun_client, "LEADSUN_CLIENT_CERT_PEM", "not a real pem at all")
+        with pytest.raises(ValueError, match="LEADSUN_CLIENT_CERT_PEM"):
+            leadsun_client._write_client_cert_to_temp_file()
+
+    def test_raises_clear_error_when_private_key_block_missing(self, monkeypatch):
+        cert_only = "-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----"
+        monkeypatch.setattr(leadsun_client, "LEADSUN_CLIENT_CERT_PEM", cert_only)
+        with pytest.raises(ValueError, match="private key"):
+            leadsun_client._write_client_cert_to_temp_file()
+
+    def test_accepts_rsa_private_key_marker_variant(self, monkeypatch):
+        pem = (
+            "-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----\n"
+            "-----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY-----"
+        )
+        monkeypatch.setattr(leadsun_client, "LEADSUN_CLIENT_CERT_PEM", pem)
+        path = leadsun_client._write_client_cert_to_temp_file()
+        os.unlink(path)  # must not raise getting here
+
+    def test_valid_combined_pem_writes_successfully(self, monkeypatch):
+        monkeypatch.setattr(
+            leadsun_client,
+            "LEADSUN_CLIENT_CERT_PEM",
+            "-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----\n"
+            "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----",
+        )
+        path = leadsun_client._write_client_cert_to_temp_file()
+        try:
+            assert os.path.exists(path)
+        finally:
+            os.unlink(path)
+
+
 def test_write_client_cert_to_temp_file_creates_file_with_pem_content():
     path = leadsun_client._write_client_cert_to_temp_file()
     try:
@@ -138,14 +188,14 @@ class TestResolveVerifyOption:
         assert leadsun_client._resolve_verify_option() is True
 
     def test_returns_temp_file_path_when_server_ca_cert_configured(self, monkeypatch):
-        monkeypatch.setattr(leadsun_client, "LEADSUN_SERVER_CA_CERT", "fake-ca-pem-content")
+        monkeypatch.setattr(leadsun_client, "LEADSUN_SERVER_CA_CERT", "-----BEGIN CERTIFICATE-----\nfake-ca-pem-content\n-----END CERTIFICATE-----")
         monkeypatch.setattr(leadsun_client, "LEADSUN_SKIP_TLS_VERIFY", False)
 
         path = leadsun_client._resolve_verify_option()
         try:
             assert isinstance(path, str)
             with open(path) as f:
-                assert f.read() == "fake-ca-pem-content"
+                assert f.read() == "-----BEGIN CERTIFICATE-----\nfake-ca-pem-content\n-----END CERTIFICATE-----"
         finally:
             os.unlink(path)
 
@@ -161,7 +211,7 @@ class TestResolveVerifyOption:
         than silently picking one -- but this combination is unusual
         enough that it's worth it being deterministic either way."""
         monkeypatch.setattr(leadsun_client, "LEADSUN_SKIP_TLS_VERIFY", True)
-        monkeypatch.setattr(leadsun_client, "LEADSUN_SERVER_CA_CERT", "fake-ca-pem-content")
+        monkeypatch.setattr(leadsun_client, "LEADSUN_SERVER_CA_CERT", "-----BEGIN CERTIFICATE-----\nfake-ca-pem-content\n-----END CERTIFICATE-----")
         assert leadsun_client._resolve_verify_option() is False
 
 
@@ -186,7 +236,7 @@ class TestFetchLampsVerifyIntegration:
         assert mock_requests_get_leadsun.call_args.kwargs["verify"] is False
 
     def test_passes_ca_cert_temp_path_and_cleans_it_up(self, mocker, monkeypatch):
-        monkeypatch.setattr(leadsun_client, "LEADSUN_SERVER_CA_CERT", "fake-ca-pem-content")
+        monkeypatch.setattr(leadsun_client, "LEADSUN_SERVER_CA_CERT", "-----BEGIN CERTIFICATE-----\nfake-ca-pem-content\n-----END CERTIFICATE-----")
         monkeypatch.setattr(leadsun_client, "LEADSUN_SKIP_TLS_VERIFY", False)
 
         captured = {}
@@ -204,7 +254,7 @@ class TestFetchLampsVerifyIntegration:
 
         leadsun_client.fetch_lamps()
 
-        assert captured["verify_content"] == "fake-ca-pem-content"
+        assert captured["verify_content"] == "-----BEGIN CERTIFICATE-----\nfake-ca-pem-content\n-----END CERTIFICATE-----"
         assert os.path.exists(captured["verify_path"]) is False  # cleaned up after
 
 
@@ -252,7 +302,7 @@ class TestFetchLampsHostnameCheckBypass:
     def test_uses_session_with_custom_adapter_when_enabled(self, mocker, monkeypatch):
         monkeypatch.setattr(leadsun_client, "LEADSUN_SKIP_HOSTNAME_CHECK", True)
         monkeypatch.setattr(leadsun_client, "LEADSUN_SKIP_TLS_VERIFY", False)
-        monkeypatch.setattr(leadsun_client, "LEADSUN_SERVER_CA_CERT", "fake-ca-pem-content")
+        monkeypatch.setattr(leadsun_client, "LEADSUN_SERVER_CA_CERT", "-----BEGIN CERTIFICATE-----\nfake-ca-pem-content\n-----END CERTIFICATE-----")
         mocker.patch("shared.leadsun_client.ssl.create_default_context")
 
         mock_session_instance = mocker.MagicMock()
@@ -323,7 +373,7 @@ class TestFetchLampsHostnameCheckBypass:
     def test_session_and_temp_files_cleaned_up_on_failure(self, mocker, monkeypatch):
         monkeypatch.setattr(leadsun_client, "LEADSUN_SKIP_HOSTNAME_CHECK", True)
         monkeypatch.setattr(leadsun_client, "LEADSUN_SKIP_TLS_VERIFY", False)
-        monkeypatch.setattr(leadsun_client, "LEADSUN_SERVER_CA_CERT", "fake-ca-pem-content")
+        monkeypatch.setattr(leadsun_client, "LEADSUN_SERVER_CA_CERT", "-----BEGIN CERTIFICATE-----\nfake-ca-pem-content\n-----END CERTIFICATE-----")
         mocker.patch("shared.leadsun_client.ssl.create_default_context")
 
         mock_session_instance = mocker.MagicMock()

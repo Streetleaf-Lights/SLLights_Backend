@@ -125,13 +125,13 @@ Backend/
 
 ## Running the tests
 
-277 tests, fully mocked — no real Airtable, Leadsun, or Azure SQL calls,
+288 tests, fully mocked — no real Airtable, Leadsun, or Azure SQL calls,
 no credentials needed for the default run.
 
 | File | Focus |
 |---|---|
 | `tests/test_airtable_client.py` | Pagination (single/multi-page), offset handling, adaptive rate-limit pacing (sleeps only the remaining gap, skips it entirely when a request was already slow), optional `fields[]` payload restriction, auth header, HTTP error propagation |
-| `tests/test_leadsun_client.py` | Cert materialized to a temp file with the right content, temp file cleaned up on both success and failure, correct URL/timeout, HTTP error propagation, `verify=` resolution (default/pinned CA/skip-verify precedence), the hostname-check-bypass adapter — including a real (non-mocked) check that `assert_hostname=False` actually reaches urllib3's pool config, not just the `SSLContext` — and `fetch_models()` hitting the `/models` endpoint via the same shared `_get()` |
+| `tests/test_leadsun_client.py` | Cert materialized to a temp file with the right content, temp file cleaned up on both success and failure, correct URL/timeout, HTTP error propagation, `verify=` resolution (default/pinned CA/skip-verify precedence), the hostname-check-bypass adapter — including a real (non-mocked) check that `assert_hostname=False` actually reaches urllib3's pool config, not just the `SSLContext` — `fetch_models()` hitting the `/models` endpoint via the same shared `_get()`, and the fail-fast PEM validation (missing certificate/private-key blocks raise a clear error instead of a deep OpenSSL failure) |
 | `tests/test_sql_client.py` | Connection string from env, missing env var, pyodbc error passthrough |
 | `tests/test_datetime_utils.py` | `to_dto_string` offset formatting, `airtable_created_time_to_eastern` (winter/summer DST) |
 | `tests/test_customers_loader.py` | `_map_record_to_customer` field mapping, full `load_customers()` flow (success, partial row failure, top-level failure + `ErrorMessage` update, cleanup-on-error), MERGE SQL structural checks, `ntext`-cast regression check, fetch/upsert phase-timing logs |
@@ -139,7 +139,7 @@ no credentials needed for the default run.
 | `tests/test_poles_loader.py` | Same shape again, for `load_poles()` — including the linked-Project-id mapping, the LAT/LONG error-string/whitespace cleanup, the staging-table bulk MERGE (with chunk-level fallback to row-by-row on a failed chunk), and the Airtable `fields[]` restriction |
 | `tests/test_pole_models_loader.py` | `_capitalize_key`, `_parse_numeric_string` (int vs. float vs. non-numeric passthrough) against the real confirmed `/models` sample, the deliberate `LampsUsing` exception (bitmask string, not converted), `ModelId` needing no rename/conversion (native int, and *is* the real PK here unlike PoleTelemetry's `id`→`LeadsunId`), staging-table bulk MERGE + fallback |
 | `tests/test_pole_telemetry_loader.py` | `_capitalize_key` (PascalCase, not `str.capitalize()`'s behavior), `_parse_iso_datetime`, `_map_lamp_record` against the real confirmed sample (productName→LocationId, id→LeadsunId, projectId/projectName→LeadsunProjectId/Name renames, string trimming, `ExtraFieldsJson` capture for unexpected fields), the missing-`LastUpload` sentinel (stable across calls, never eligible for retention purge, distinct from a genuine parse failure), staging-table bulk MERGE + fallback, retention purge logging |
-| `tests/test_function_app.py` | Timer trigger fires only at 6 AM/6 PM Eastern (verified across the DST boundary with freezegun), `past_due` handling, manual HTTP trigger's `Prod` block, synchronous (non-threaded) execution, **Poles runs before Projects runs before Customers** in both triggers, a failure in an earlier loader blocks the later ones, and **`loadLeadsunData` runs unconditionally** (no hour-gating), runs **Model before RawData**, and never touches the Airtable loaders |
+| `tests/test_function_app.py` | Timer trigger fires only at 6 AM/6 PM Eastern (verified across the DST boundary with freezegun), `past_due` handling, manual HTTP trigger's `Prod` block, synchronous (non-threaded) execution, **Poles runs before Projects runs before Customers** in both triggers, a failure in an earlier loader blocks the later ones, **`loadLeadsunData` runs unconditionally** (no hour-gating) otherwise, runs **Model before RawData**, and never touches the Airtable loaders — and **both timer triggers skip entirely when `ENVIRONMENT == "Dev"`**, before even checking `past_due`, while both manual triggers are unaffected by that guard |
 | `tests/test_schema_integration.py` | Column-name consistency between the code's SQL and a documented expected schema (all five tables); two opt-in **real** end-to-end tests (Airtable+SQL, and separately Leadsun+SQL) |
 
 ```bash
@@ -260,6 +260,17 @@ reference for a from-scratch project, not as the LightsApp deploy runbook.
   Consumption again, that's the pattern to reach for —
   `tests/test_function_app.py` has a tripwire test that'll fail the moment
   threading is reintroduced.
+- **Both timer triggers skip entirely when `ENVIRONMENT == "Dev"`** —
+  `loadAirTableData` and `loadLeadsunData` both check this first, before
+  even looking at `myTimer.past_due`, and just log and return if it's
+  `"Dev"`. This means running `func start` locally no longer fires real
+  Airtable/Leadsun/SQL work on a schedule just because the host is up —
+  the **manual triggers are unaffected by this check** and remain the only
+  way to trigger a run while `ENVIRONMENT=Dev` (they already only block in
+  `"Prod"`, unchanged). Set `ENVIRONMENT` to anything else (`"Staging"`,
+  unset defaults to `"Dev"` though, so this needs to be explicit) to get
+  the timers actually firing again, e.g. for a deployed Dev *slot* that
+  should still run on schedule.
 - **Schema discrepancy to verify**: `customers_loader.py`'s MERGE statement
   reads/writes a `Customers` column called `SP_ExecId`. Earlier schema
   design work in this project created that column as `BatchId` instead.
@@ -550,14 +561,39 @@ reference for a from-scratch project, not as the LightsApp deploy runbook.
   materializes it to a temp file fresh on every call (cheap — a few KB),
   since `requests`' `cert=` parameter needs an actual filesystem path, not
   raw PEM text. The temp file is deleted immediately after the request,
-  success or failure. To set this up in Azure: open the Function App's
-  Configuration blade, add `LEADSUN_CLIENT_CERT_PEM` as a new application
-  setting, and paste the full `.pem` file contents as the value (Azure
-  Portal's setting-value field accepts multi-line text directly — no
-  base64 encoding needed). For local dev, put it in `local.settings.json`
-  with real newlines escaped to `\n` (see the local setup section above) —
+  success or failure.
+
+  **To set this up in Azure, prefer the CLI over pasting into the Portal
+  UI**:
+  ```bash
+  az functionapp config appsettings set \
+    --name <function-app-name> --resource-group <resource-group> \
+    --settings "LEADSUN_CLIENT_CERT_PEM=$(cat leadsun_clean.pem)"
+  ```
+  This reads the file's raw bytes directly — pasting multi-line PEM text
+  into the Portal's Configuration blade text box has actually mangled the
+  value in practice (surfacing as `SSLError: [SSL] PEM lib` deep inside
+  urllib3/OpenSSL when `context.load_cert_chain()` tries to parse a
+  truncated/flattened cert). Verify what actually landed with:
+  ```bash
+  az functionapp config appsettings list \
+    --name <function-app-name> --resource-group <resource-group> \
+    --query "[?name=='LEADSUN_CLIENT_CERT_PEM'].value" -o tsv | wc -l
+  ```
+  (should match the local file's line count). For local dev, put it in
+  `local.settings.json` with real newlines escaped to `\n` (see the local
+  setup section above) —
   `python3 -c "import json; print(json.dumps(open('leadsun.pem').read()))"`
   will do that escaping correctly rather than editing it by hand.
+
+  **Fail-fast validation**: since a mangled `LEADSUN_CLIENT_CERT_PEM` (or
+  `LEADSUN_SERVER_CA_CERT`) otherwise fails deep inside urllib3/OpenSSL
+  with an unhelpful `[SSL] PEM lib` error that doesn't say which setting
+  or what's wrong, `leadsun_client._validate_pem_has_certificate()` checks
+  for a `-----BEGIN CERTIFICATE-----` block up front (and
+  `_write_client_cert_to_temp_file()` additionally checks for a private
+  key block), raising a clear `ValueError` naming the setting and the
+  likely cause instead.
 
   **Separate issue — verifying the *server's* certificate**: distinct from
   the client cert above, `leadsunedge-us.com` presents a **self-signed**

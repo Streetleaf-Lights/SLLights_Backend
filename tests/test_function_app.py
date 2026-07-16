@@ -49,6 +49,18 @@ def patch_all_loaders(mocker):
 
 
 class TestLoadAirTableDataTimer:
+    @pytest.fixture(autouse=True)
+    def _non_dev_environment(self, monkeypatch):
+        """
+        Most tests in this class verify the timer actually runs its
+        loaders, which now requires ENVIRONMENT != "Dev" (the test suite's
+        own default, set in conftest.py, IS "Dev" -- so without this,
+        every one of these tests would silently hit the new Dev-skip
+        guard and fail). The dedicated Dev-skip tests below override this
+        back to "Dev" explicitly.
+        """
+        monkeypatch.setattr(function_app, "ENVIRONMENT", "Staging")
+
     @freeze_time("2026-07-13 10:00:00")  # 6:00 AM EDT
     def test_runs_at_6am_eastern_summer(self, mocker):
         mock_poles, mock_projects, mock_customers, _ = patch_all_loaders(mocker)
@@ -149,6 +161,34 @@ class TestLoadAirTableDataTimer:
             function_app.loadAirTableData(make_timer_request())
 
         mock_customers.assert_not_called()
+
+    @freeze_time("2026-07-13 10:00:00")  # a valid target hour -- would run if not for Dev
+    def test_skips_entirely_when_environment_is_dev(self, mocker, monkeypatch):
+        monkeypatch.setattr(function_app, "ENVIRONMENT", "Dev")
+        mock_poles, mock_projects, mock_customers, _ = patch_all_loaders(mocker)
+
+        function_app.loadAirTableData(make_timer_request())
+
+        mock_poles.assert_not_called()
+        mock_projects.assert_not_called()
+        mock_customers.assert_not_called()
+
+    @freeze_time("2026-07-13 10:00:00")
+    def test_dev_skip_logs_and_does_not_check_past_due(self, mocker, monkeypatch, caplog):
+        """Dev-skip happens before anything else -- not even past_due
+        gets logged or inspected."""
+        monkeypatch.setattr(function_app, "ENVIRONMENT", "Dev")
+        mocker.patch("function_app.load_poles")
+        mocker.patch("function_app.load_projects")
+        mocker.patch("function_app.load_customers")
+
+        with caplog.at_level("INFO"):
+            function_app.loadAirTableData(make_timer_request(past_due=True))
+
+        assert any(
+            "skipping timer-triggered run in Dev" in rec.message for rec in caplog.records
+        )
+        assert not any("past due" in rec.message for rec in caplog.records)
 
 
 # --------------------------------------------------------------------------
@@ -274,6 +314,14 @@ def patch_leadsun_loaders(mocker):
 
 
 class TestLoadLeadsunDataTimer:
+    @pytest.fixture(autouse=True)
+    def _non_dev_environment(self, monkeypatch):
+        """Same reasoning as TestLoadAirTableDataTimer's fixture of the
+        same name -- the test suite's own ENVIRONMENT default is "Dev","
+        which would otherwise trip the new Dev-skip guard on every test
+        below that expects the loaders to actually run."""
+        monkeypatch.setattr(function_app, "ENVIRONMENT", "Staging")
+
     def test_runs_unconditionally(self, mocker):
         """Unlike loadAirTableData, there's no hour-gating -- every timer
         fire (every 10 minutes) should call both loaders."""
@@ -328,6 +376,30 @@ class TestLoadLeadsunDataTimer:
         mock_poles.assert_not_called()
         mock_projects.assert_not_called()
         mock_customers.assert_not_called()
+
+    def test_skips_entirely_when_environment_is_dev(self, mocker, monkeypatch):
+        monkeypatch.setattr(function_app, "ENVIRONMENT", "Dev")
+        mock_model, mock_raw_data, _ = patch_leadsun_loaders(mocker)
+
+        function_app.loadLeadsunData(make_timer_request())
+
+        mock_model.assert_not_called()
+        mock_raw_data.assert_not_called()
+
+    def test_dev_skip_logs_and_does_not_check_past_due(self, mocker, monkeypatch, caplog):
+        """Dev-skip happens before anything else -- not even past_due
+        gets logged or inspected."""
+        monkeypatch.setattr(function_app, "ENVIRONMENT", "Dev")
+        mocker.patch("function_app.load_pole_models")
+        mocker.patch("function_app.load_pole_telemetry")
+
+        with caplog.at_level("INFO"):
+            function_app.loadLeadsunData(make_timer_request(past_due=True))
+
+        assert any(
+            "skipping timer-triggered run in Dev" in rec.message for rec in caplog.records
+        )
+        assert not any("past due" in rec.message for rec in caplog.records)
 
 
 class TestLoadLeadsunDataManual:
