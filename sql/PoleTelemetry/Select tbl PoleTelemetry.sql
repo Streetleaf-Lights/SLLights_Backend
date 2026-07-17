@@ -50,5 +50,6 @@ SELECT TOP 100
     ExtraFieldsJson
 FROM PoleTelemetry
 WHERE 1 = 1
-AND LocationId = '12101-5540'
+-- AND LocationId = '12101-5540'
+-- AND SP_ExecId = 442
 ORDER BY LastUpload DESC;

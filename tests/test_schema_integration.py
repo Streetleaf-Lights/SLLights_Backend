@@ -34,7 +34,7 @@ import re
 
 import pytest
 
-from shared import customers_loader, projects_loader, poles_loader, pole_telemetry_loader, pole_models_loader
+from shared import customers_loader, projects_loader, poles_loader, pole_telemetry_loader, pole_models_loader, pole_vitals_loader
 
 
 # --------------------------------------------------------------------------
@@ -310,6 +310,44 @@ class TestPoleModelsSchemaConsistency:
         assert "REFERENCES" not in sql
 
 
+class TestPoleVitalsSchemaConsistency:
+    """
+    PoleVitals has no single _ALL_COLUMNS source of truth like the other
+    loaders (it's four hand-written MERGE statements, not a generic
+    fetch-map-upsert pipeline), so this hardcodes the expected column set
+    from the DDL and cross-checks each period type's INSERT column list
+    against it directly.
+    """
+
+    _EXPECTED_COLUMNS = {
+        "LocationId",
+        "PeriodType",
+        "PeriodStart",
+        "PeriodEnd",
+        "AvgBatteryPercentage",
+        "AvgPanelPercentage",
+        "AvgLightPercentage",
+        "RecordCount",
+        "Source",
+        "SP_ExecId",
+    }
+
+    @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
+    def test_insert_column_list_matches_expected_schema(self, period_type):
+        sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE[period_type]
+        match = re.search(r"INSERT \(([^)]+)\)", sql)
+        cols = {c.strip() for c in match.group(1).split(",")}
+        assert cols == self._EXPECTED_COLUMNS
+
+    @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
+    def test_update_set_columns_never_touch_the_match_key(self, period_type):
+        sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE[period_type]
+        match = re.search(r"THEN UPDATE SET\s*(.+?)\s*WHEN NOT MATCHED", sql, re.DOTALL)
+        assignments = match.group(1).strip().rstrip(",").split(",")
+        cols = {a.split("=")[0].strip() for a in assignments}
+        assert cols == self._EXPECTED_COLUMNS - {"LocationId", "PeriodType", "PeriodStart"}
+
+
 class TestWorkweekSchemaConsistency:
     """
     Workweek has no loader module (it's static computed data, not synced
@@ -397,7 +435,7 @@ _LEADSUN_LIVE_TESTS_ENABLED = os.environ.get("RUN_LIVE_LEADSUN_INTEGRATION_TEST"
     ),
 )
 class TestLeadsunLiveIntegration:
-    def test_load_pole_models_then_pole_telemetry_against_real_leadsun_api_and_sql(self):
+    def test_load_pole_models_then_telemetry_then_vitals_against_real_leadsun_api_and_sql(self):
         assert os.environ.get("ENVIRONMENT", "Dev") != "Prod", (
             "Refusing to run the live integration test with ENVIRONMENT=Prod. "
             "Point this at a Dev/Staging environment."
@@ -406,7 +444,9 @@ class TestLeadsunLiveIntegration:
 
         importlib.reload(pole_models_loader)
         importlib.reload(pole_telemetry_loader)
+        importlib.reload(pole_vitals_loader)
 
-        # Same order as function_app.py's loadLeadsunData: Model -> RawData.
+        # Same order as function_app.py's loadLeadsunData: Models -> Telemetry -> Vitals.
         pole_models_loader.load_pole_models()  # will raise on failure -- that's the assertion
         pole_telemetry_loader.load_pole_telemetry()
+        pole_vitals_loader.load_pole_vitals()

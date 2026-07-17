@@ -10,6 +10,7 @@ from shared.projects_loader import load_projects
 from shared.poles_loader import load_poles
 from shared.pole_models_loader import load_pole_models
 from shared.pole_telemetry_loader import load_pole_telemetry
+from shared.pole_vitals_loader import load_pole_vitals
 
 app = func.FunctionApp()
 
@@ -104,10 +105,10 @@ def loadAirTableDataManual(req: func.HttpRequest) -> func.HttpResponse:
 # Renamed from loadPoleRawData now that it orchestrates two loaders, not
 # one -- mirrors loadAirTableData's naming (source name + "Data" as the
 # umbrella, individual load_<x>() functions underneath). Load order is
-# Models -> Telemetry: PoleModels is a device-model reference table, and
-# PoleTelemetry's ExtraFieldsJson/readings don't actually join against it
-# at the DB level, but conceptually the catalog should exist before the
-# telemetry that references those models.
+# Models -> Telemetry -> Vitals: PoleModels is a device-model reference
+# table needed by PoleVitals' Panel/Light percentage formulas (SunboardPower/
+# LightPower), PoleTelemetry is the raw readings PoleVitals aggregates, and
+# PoleVitals depends on both already being current for this cycle.
 @app.timer_trigger(
     schedule="0 */10 * * * *",
     arg_name="myTimer",
@@ -128,6 +129,7 @@ def loadLeadsunData(myTimer: func.TimerRequest) -> None:
     logging.info("loadLeadsunData: starting run.")
     load_pole_models()
     load_pole_telemetry()
+    load_pole_vitals()
     logging.info("loadLeadsunData: run complete.")
 
 
@@ -145,6 +147,9 @@ def loadLeadsunDataManual(req: func.HttpRequest) -> func.HttpResponse:
     logging.info("loadLeadsunDataManual: manual run triggered.")
     load_pole_models()
     load_pole_telemetry()
+    load_pole_vitals()
     logging.info("loadLeadsunDataManual: run complete.")
 
-    return func.HttpResponse("loadPoleModels + loadPoleTelemetry run complete.", status_code=200)
+    return func.HttpResponse(
+        "loadPoleModels + loadPoleTelemetry + loadPoleVitals run complete.", status_code=200
+    )

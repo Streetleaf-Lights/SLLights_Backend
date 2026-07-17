@@ -9,3 +9,5 @@ SELECT TOP (1000) [Id]
       ,[SP_ExecId]
       ,[AirTableCreatedDateTime]
   FROM [dbo].[Poles]
+  WHERE 1 = 1
+  -- AND [LocationId] = '12101-5540'

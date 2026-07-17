@@ -10,5 +10,6 @@ SELECT TOP (1000) [Id]
       ,[Phone]
       ,[AirTableCreatedDateTime]
   FROM [dbo].[Customers]
+  WHERE 1 = 1
+  -- AND [Id] = 'recwx649JfiRmWqxF'
   ORDER BY [AirTableCreatedDateTime] DESC
-  

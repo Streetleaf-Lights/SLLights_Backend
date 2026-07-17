@@ -23,4 +23,6 @@ SELECT
     SolarBoardVoltage,
     ExtraFieldsJson
 FROM PoleModels
+WHERE 1 = 1
+-- AND ModelId = 82
 ORDER BY ModelId;

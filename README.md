@@ -3,9 +3,10 @@
 A Python Azure Functions project (v2 programming model) that syncs pole,
 project, and customer data from Airtable, plus device-model specs and raw
 lamp telemetry from the Leadsun API, into Azure SQL Database on a
-schedule, running on a Flex Consumption (Linux) plan. Also includes a
-standalone `Workweek` calendar reference table (static, not synced from
-any external source).
+schedule, running on a Flex Consumption (Linux) plan. Also derives rolling
+Hour/Day/Week/Month health-metric averages (`PoleVitals`) from that
+telemetry, and includes a standalone `Workweek` calendar reference table
+(static, not synced from any external source).
 
 ## Project structure
 
@@ -16,9 +17,9 @@ Backend/
 │                            #     runs load_poles() -> load_projects() -> load_customers()
 │                            #   - loadAirTableDataManual: manual HTTP trigger, blocked in Prod
 │                            #   - loadLeadsunData: SEPARATE timer trigger, fires every 10 minutes,
-│                            #     runs load_pole_models() -> load_pole_telemetry() -- unrelated to
-│                            #     the above (was called loadPoleRawData before it covered two
-│                            #     loaders instead of one)
+│                            #     runs load_pole_models() -> load_pole_telemetry() ->
+│                            #     load_pole_vitals() -- unrelated to the above (was called
+│                            #     loadPoleRawData before it covered more than one loader)
 │                            #   - loadLeadsunDataManual: manual HTTP trigger, blocked in Prod
 │                            #   - Both timer triggers skip entirely when ENVIRONMENT == "Dev"
 ├── shared/
@@ -30,10 +31,12 @@ Backend/
 │   ├── projects_loader.py       # Airtable → Projects upsert logic (load_projects)
 │   ├── poles_loader.py          # Airtable → Poles upsert logic (load_poles)
 │   ├── pole_models_loader.py    # Leadsun → PoleModels upsert logic (load_pole_models)
-│   └── pole_telemetry_loader.py # Leadsun → PoleTelemetry upsert + retention (load_pole_telemetry)
+│   ├── pole_telemetry_loader.py # Leadsun → PoleTelemetry upsert + retention (load_pole_telemetry)
+│   └── pole_vitals_loader.py    # PoleTelemetry+PoleModels(+Workweek) → PoleVitals (load_pole_vitals)
 ├── scripts/
-│   └── generate_workweek_sql.py # Standalone (no Azure Functions runtime needed) generator
-│                                 # for Workweek's populate script -- see below
+│   ├── generate_workweek_sql.py # Standalone (no Azure Functions runtime needed) generator
+│   │                             # for Workweek's populate script -- see below
+│   └── run_pole_vitals_backfill.py # One-off PoleVitals full-history backfill runner
 ├── sql/                     # One folder per table; each has a guarded CREATE
 │   │                        # and a scratch SELECT for querying/debugging in SSMS/ADS
 │   ├── Customers/
@@ -51,6 +54,9 @@ Backend/
 │   ├── PoleTelemetry/
 │   │   ├── Create tbl PoleTelemetry.sql
 │   │   └── Select tbl PoleTelemetry.sql
+│   ├── PoleVitals/
+│   │   ├── Create tbl PoleVitals.sql
+│   │   └── Select tbl PoleVitals.sql
 │   ├── Workweek/
 │   │   ├── Create tbl Workweek.sql
 │   │   ├── Select tbl Workweek.sql
@@ -135,7 +141,7 @@ Backend/
 
 ## Running the tests
 
-310 tests, fully mocked — no real Airtable, Leadsun, or Azure SQL calls,
+410 tests, fully mocked — no real Airtable, Leadsun, or Azure SQL calls,
 no credentials needed for the default run.
 
 | File | Focus |
@@ -149,9 +155,11 @@ no credentials needed for the default run.
 | `tests/test_poles_loader.py` | Same shape again, for `load_poles()` — including the linked-Project-id mapping, the LAT/LONG error-string/whitespace cleanup, the staging-table bulk MERGE (with chunk-level fallback to row-by-row on a failed chunk), and the Airtable `fields[]` restriction |
 | `tests/test_pole_models_loader.py` | `_capitalize_key`, `_parse_numeric_string` (int vs. float vs. non-numeric passthrough) against the real confirmed `/models` sample, the deliberate `LampsUsing` exception (bitmask string, not converted), `ModelId` needing no rename/conversion (native int, and *is* the real PK here unlike PoleTelemetry's `id`→`LeadsunId`), staging-table bulk MERGE + fallback |
 | `tests/test_pole_telemetry_loader.py` | `_capitalize_key` (PascalCase, not `str.capitalize()`'s behavior), `_parse_iso_datetime`, `_map_lamp_record` against the real confirmed sample (productName→LocationId, id→LeadsunId, projectId/projectName→LeadsunProjectId/Name renames, string trimming, `ExtraFieldsJson` capture for unexpected fields), the missing-`LastUpload` sentinel (stable across calls, never eligible for retention purge, distinct from a genuine parse failure), staging-table bulk MERGE + fallback, retention purge logging |
-| `tests/test_function_app.py` | Timer trigger fires only at 6 AM/6 PM Eastern (verified across the DST boundary with freezegun), `past_due` handling, manual HTTP trigger's `Prod` block, synchronous (non-threaded) execution, **Poles runs before Projects runs before Customers** in both triggers, a failure in an earlier loader blocks the later ones, **`loadLeadsunData` runs unconditionally** (no hour-gating) otherwise, runs **Model before RawData**, and never touches the Airtable loaders — and **both timer triggers skip entirely when `ENVIRONMENT == "Dev"`**, before even checking `past_due`, while both manual triggers are unaffected by that guard |
+| `tests/test_pole_vitals_loader.py` | `_compute_cutoff()`'s lookback-window math (per period type, and the wider `backfill=True` window) — pure and unit-tested since the aggregation SQL itself can't be executed in this sandbox; structural checks on all four period types' `MERGE` SQL (formulas, `NULLIF` guards, join conditions, bucketing expressions, `Week`'s `Workweek` join specifically, the `_MISSING_LAST_UPLOAD_SENTINEL` exclusion); `_is_benign_null_aggregate_warning()` (SQLSTATE `01003` treated as success, `22007` and other genuine errors still treated as failures); full-flow tests (`SP_Execution` open/close, per-period-type failure isolation, rowcount aggregation) |
+| `tests/test_function_app.py` | Timer trigger fires only at 6 AM/6 PM Eastern (verified across the DST boundary with freezegun), `past_due` handling, manual HTTP trigger's `Prod` block, synchronous (non-threaded) execution, **Poles runs before Projects runs before Customers** in both triggers, a failure in an earlier loader blocks the later ones, **`loadLeadsunData` runs unconditionally** (no hour-gating) otherwise, runs **Models → Telemetry → Vitals in order** (a failure in an earlier one blocks the later ones here too), and never touches the Airtable loaders — and **both timer triggers skip entirely when `ENVIRONMENT == "Dev"`**, before even checking `past_due`, while both manual triggers are unaffected by that guard |
 | `tests/test_generate_workweek_sql.py` | `sunday_on_or_before()`, full validation of the generated rows (260 for 2026-2030: no duplicates, every week exactly 7 days Sun-Sat, no gaps/overlaps within a year, Jan 1 always in that year's Week 1, leap-day coverage), and that the emitted SQL is a `MERGE` (idempotent), not a plain `INSERT` |
-| `tests/test_schema_integration.py` | Column-name consistency between the code's SQL and a documented expected schema (all five loader-backed tables, plus a lighter DDL-vs-generator check for `Workweek`); two opt-in **real** end-to-end tests (Airtable+SQL, and separately Leadsun+SQL) |
+| `tests/test_run_pole_vitals_backfill.py` | `refuse_if_prod()` (blocks `"Prod"`, allows everything else), `load_local_settings_into_env()` (missing file, missing `Values` key, doesn't clobber an already-set env var) |
+| `tests/test_schema_integration.py` | Column-name consistency between the code's SQL and a documented expected schema (all six loader-backed tables, plus a lighter DDL-vs-generator check for `Workweek`); two opt-in **real** end-to-end tests (Airtable+SQL, and separately Leadsun+SQL, the latter now covering Models → Telemetry → Vitals) |
 
 ```bash
 pytest -v
@@ -660,6 +668,116 @@ reference for a from-scratch project, not as the LightsApp deploy runbook.
   - If both `LEADSUN_SKIP_TLS_VERIFY` and `LEADSUN_SKIP_HOSTNAME_CHECK`
     are set, `LEADSUN_SKIP_TLS_VERIFY` wins — the fully-open path already
     covers it, no need for the custom adapter too.
+
+- **`PoleVitals` — rolling Hour/Day/Week/Month averages of pole health
+  metrics, derived from `PoleTelemetry` + `PoleModels` (+ `Workweek` for
+  Week bucketing).** Unlike every other loader in this project, this one
+  doesn't fetch from an external API — it runs a pure SQL aggregation
+  against tables already loaded earlier in the same cycle
+  (`load_pole_models()` → `load_pole_telemetry()` → `load_pole_vitals()`,
+  in that order, since Vitals depends on both being current).
+
+  **Per-reading formulas** (computed row-by-row, then averaged within
+  each bucket):
+  ```
+  BatteryPercentage = (BatteryElecCurrent1 + BatteryElecCurrent2) / 2
+  PanelPercentage   = (SolarBoardVoltage * SolarBoardElecCurrent) / SunboardPower * 100
+  LightPercentage   = (LampPower1 + LampPower2) / LightPower * 100
+  ```
+  `SunboardPower`/`LightPower` come from `PoleModels`, joined on
+  `PoleTelemetry.ModelId = PoleModels.ModelId` — confirmed present in the
+  real `/lamps` sample used to build `PoleTelemetry`, not a guess. A
+  reading whose model can't be found (`LEFT JOIN`), or whose
+  `SunboardPower`/`LightPower` is `0`, gets `NULL` for that specific
+  percentage via `NULLIF(..., 0)` — `AVG()` ignores `NULL`s, so one bad
+  reading doesn't skew or error out the rest of that bucket.
+
+  **Time zone**: Hour/Day/Month bucket boundaries are computed in
+  *Eastern* wall-clock time (`LastUpload AT TIME ZONE 'Eastern Standard
+  Time'`), matching this project's existing convention (6 AM/6 PM
+  scheduling, etc.) rather than raw UTC — a reading at 11 PM UTC and one
+  at 1 AM UTC the next day could otherwise land in the "wrong" calendar
+  day relative to how a human reading a report would expect.
+
+  **Week bucketing uses the `Workweek` table directly** (`JOIN Workweek w
+  ON CAST(LocalTime AS DATE) BETWEEN w.StartDate AND w.EndDate`), per the
+  explicit request to use "the Workweek definition" — not
+  `DATEPART(WEEK, ...)` or ISO week numbers, which use different
+  boundaries and (for ISO) a different day-of-week start.
+
+  **`PeriodEnd` is exclusive** (the start of the next period) for all
+  four period types — e.g. an Hour bucket's `PeriodEnd` is exactly
+  `PeriodStart + 1 hour`. This is worth noting because it differs from
+  `Workweek`'s own `EndDate` convention (inclusive — the Saturday itself,
+  not the following Sunday); exclusive bounds were chosen here since
+  they're simpler for range queries (`WHERE ts >= PeriodStart AND ts <
+  PeriodEnd`) at hour/day granularity, but if you'd rather match
+  `Workweek`'s inclusive convention for consistency, that's a small change
+  in `pole_vitals_loader.py`'s four `PeriodEnd` expressions.
+
+  **Scale**: `PoleTelemetry` is retained for 6 months and could grow to
+  millions of rows, so re-aggregating the *entire* history every 10
+  minutes would eventually become a real performance problem — the exact
+  trap already hit (and fixed) once for `Poles`/`PoleTelemetry` itself.
+  Each normal run only recomputes **recent buckets** (current + previous,
+  sized per period type — 3 hours for Hour, 2 days for Day, 8 days for
+  Week, 35 days for Month — via `pole_vitals_loader._DEFAULT_LOOKBACK`),
+  bounded by the existing `IX_PoleTelemetry_LastUpload` index, rather than
+  scanning the full retention window. For the **initial backfill** of
+  whatever telemetry already exists, run:
+  ```bash
+  python3 scripts/run_pole_vitals_backfill.py
+  ```
+  from the project root — this reuses `local.settings.json`'s values (the
+  same file `func start` reads) to call `load_pole_vitals(backfill=True)`
+  directly, no Azure Functions runtime needed. It widens the lookback to
+  400 days (comfortably covering the full 6-month retention window) for
+  every period type in that one call, and refuses to run if `ENVIRONMENT`
+  resolves to `"Prod"` — same safety convention as this project's manual
+  HTTP triggers and live integration tests. If your local machine can't
+  reach the same Azure SQL Server (e.g. firewall rules only allow
+  Azure-to-Azure traffic), run the same script instead from the deployed
+  Function App's Kudu/SSH console (Advanced Tools in the Portal), where
+  all the same values are already set as real App Settings.
+
+  **Testing note**: the four `MERGE` statements' *structure* (formulas,
+  joins, bucketing expressions, `NULLIF` guards) is covered by
+  `tests/test_pole_vitals_loader.py`, but the actual **aggregation
+  arithmetic** can't be executed in this sandbox — there's no real SQL
+  Server available to run a `MERGE`/`AT TIME ZONE`/`AVG()` query against.
+  Worth spot-checking the first real run: pick one `LocationId`, manually
+  average a handful of its `PoleTelemetry` rows for a given hour, and
+  confirm it matches the corresponding `PoleVitals` row.
+
+  **Two issues surfaced on the first real Azure run, both now fixed**:
+  - **`SQLSTATE 22007` ("Adding a value to a 'date' column caused an
+    overflow") on Day and Month** — caused by `PoleTelemetry`'s
+    `_MISSING_LAST_UPLOAD_SENTINEL` (`9999-12-31 23:59:59.999 +00:00`,
+    used for readings with a genuinely-missing `lastUpload`). That
+    sentinel is always `>= cutoff` for any reasonable lookback window
+    (it's deliberately far in the future, so retention never purges it),
+    so it always passed the `WHERE t.LastUpload >= ?` filter. Bucketing it
+    into a Day (`9999-12-31`) or Month (`9999-12-01`) and then computing
+    `PeriodEnd` as `+1 day`/`+1 month` tried to produce a date in the
+    year 10000, past `DATE`'s max value. Fixed by explicitly excluding
+    the sentinel (`AND t.LastUpload <> ?`, imported directly from
+    `pole_telemetry_loader._MISSING_LAST_UPLOAD_SENTINEL` — one source of
+    truth, not a duplicated magic string) in all four period types' `WHERE`
+    clauses. Devices that have never reported a real timestamp
+    legitimately have nothing to contribute to a time-bucketed average
+    anyway.
+  - **`SQLSTATE 01003` ("Warning: Null value is eliminated by an
+    aggregate...") on Hour** — not actually an error. It's SQL Server's
+    informational notice that `AVG()` skipped a `NULL`, which is exactly
+    what the `NULLIF`-guarded Panel/Light formulas are *designed* to
+    produce for a reading with a missing model or zero
+    `SunboardPower`/`LightPower`. pyodbc still raises it as a Python
+    exception, though, so without special-casing it a `MERGE` that
+    actually completed successfully got logged and counted as a failure.
+    `pole_vitals_loader._is_benign_null_aggregate_warning()` detects this
+    specific SQLSTATE and treats it as a success (logged at `INFO`, not
+    `ERROR`) — while a genuinely different SQLSTATE (like the `22007`
+    above) still correctly counts as a real failure.
 
 - **`Workweek` — a static calendar reference table, not synced from
   anywhere.** Unlike every other table in this project, there's no

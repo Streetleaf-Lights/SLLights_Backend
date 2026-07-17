@@ -217,6 +217,14 @@ def mock_requests_get_leadsun(mocker):
 
 
 @pytest.fixture
+def patch_get_connection_pole_vitals(mocker, mock_conn):
+    """Patches shared.pole_vitals_loader.get_connection to return mock_conn."""
+    return mocker.patch(
+        "shared.pole_vitals_loader.get_connection", return_value=mock_conn
+    )
+
+
+@pytest.fixture
 def patch_get_connection_pole_telemetry(mocker, mock_conn):
     """Patches shared.pole_telemetry_loader.get_connection to return mock_conn."""
     return mocker.patch(
