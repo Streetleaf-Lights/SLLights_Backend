@@ -1,5 +1,6 @@
 """Tests for function_app.py (timer trigger + manual HTTP trigger)"""
 
+import json
 from unittest.mock import MagicMock
 
 import azure.functions as func
@@ -492,3 +493,91 @@ class TestLoadLeadsunDataManual:
             function_app.loadLeadsunDataManual(make_leadsun_http_request())
 
         mock_vitals.assert_not_called()
+
+
+# --------------------------------------------------------------------------
+# getCustomers -- read-only API endpoint, not part of the ETL pipeline.
+# --------------------------------------------------------------------------
+
+
+def make_get_customers_http_request(customer_id=None, limit=None):
+    params = {}
+    if customer_id is not None:
+        params["customerId"] = customer_id
+    if limit is not None:
+        params["limit"] = limit
+    return func.HttpRequest(
+        method="GET",
+        url="/api/getCustomers",
+        headers={},
+        params=params,
+        body=b"",
+    )
+
+
+class TestGetCustomers:
+    def test_no_customer_id_returns_array_with_200(self, mocker):
+        mocker.patch(
+            "function_app.get_customers",
+            return_value=[{"id": "rec1", "name": "Acme"}, {"id": "rec2", "name": "Widgets Inc"}],
+        )
+
+        response = function_app.getCustomers(make_get_customers_http_request())
+
+        assert response.status_code == 200
+        assert response.mimetype == "application/json"
+        body = json.loads(response.get_body())
+        assert body == [{"id": "rec1", "name": "Acme"}, {"id": "rec2", "name": "Widgets Inc"}]
+
+    def test_customer_id_returns_single_object_with_200(self, mocker):
+        mock_get = mocker.patch(
+            "function_app.get_customers", return_value=[{"id": "rec1", "name": "Acme"}]
+        )
+
+        response = function_app.getCustomers(make_get_customers_http_request(customer_id="rec1"))
+
+        assert response.status_code == 200
+        body = json.loads(response.get_body())
+        assert body == {"id": "rec1", "name": "Acme"}
+        mock_get.assert_called_once_with(customer_id="rec1", limit=None)
+
+    def test_customer_id_not_found_returns_404(self, mocker):
+        mocker.patch("function_app.get_customers", return_value=[])
+
+        response = function_app.getCustomers(make_get_customers_http_request(customer_id="rec999"))
+
+        assert response.status_code == 404
+        body = json.loads(response.get_body())
+        assert "error" in body
+
+    def test_limit_is_parsed_and_passed_through(self, mocker):
+        mock_get = mocker.patch("function_app.get_customers", return_value=[])
+
+        function_app.getCustomers(make_get_customers_http_request(limit="5"))
+
+        mock_get.assert_called_once_with(customer_id=None, limit=5)
+
+    def test_non_numeric_limit_returns_400_without_querying(self, mocker):
+        mock_get = mocker.patch("function_app.get_customers")
+
+        response = function_app.getCustomers(make_get_customers_http_request(limit="abc"))
+
+        assert response.status_code == 400
+        mock_get.assert_not_called()
+
+    def test_query_failure_returns_500_not_a_raw_exception(self, mocker):
+        mocker.patch("function_app.get_customers", side_effect=RuntimeError("db down"))
+
+        response = function_app.getCustomers(make_get_customers_http_request())
+
+        assert response.status_code == 500
+        body = json.loads(response.get_body())
+        assert "error" in body
+
+    def test_response_is_valid_json_even_for_empty_list(self, mocker):
+        mocker.patch("function_app.get_customers", return_value=[])
+
+        response = function_app.getCustomers(make_get_customers_http_request())
+
+        assert response.status_code == 200
+        assert json.loads(response.get_body()) == []

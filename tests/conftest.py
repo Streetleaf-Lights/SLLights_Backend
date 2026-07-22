@@ -134,6 +134,14 @@ def patch_get_connection(mocker, mock_conn):
 
 
 @pytest.fixture
+def patch_get_connection_customers_api(mocker, mock_conn):
+    """Patches shared.customers_api.get_connection to return mock_conn."""
+    return mocker.patch(
+        "shared.customers_api.get_connection", return_value=mock_conn
+    )
+
+
+@pytest.fixture
 def patch_fetch_all_records(mocker):
     """Patches shared.customers_loader.fetch_all_records (already imported by name)."""
     return mocker.patch("shared.customers_loader.fetch_all_records")

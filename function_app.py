@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 from datetime import datetime
@@ -11,6 +12,7 @@ from shared.poles_loader import load_poles
 from shared.pole_models_loader import load_pole_models
 from shared.pole_telemetry_loader import load_pole_telemetry
 from shared.pole_vitals_loader import load_pole_vitals
+from shared.customers_api import get_customers
 
 app = func.FunctionApp()
 
@@ -152,4 +154,76 @@ def loadLeadsunDataManual(req: func.HttpRequest) -> func.HttpResponse:
 
     return func.HttpResponse(
         "loadPoleModels + loadPoleTelemetry + loadPoleVitals run complete.", status_code=200
+    )
+
+
+# --------------------------------------------------------------------------
+# getCustomers -- read-only API endpoint, NOT part of the Airtable/Leadsun
+# ETL pipeline. Meant to be imported into Azure API Management and called
+# by a website, not run on a schedule -- so unlike everything else in this
+# file, it has no timer trigger, no SP_Execution tracking (it doesn't load
+# or sync anything, just serves what's already been loaded), and no
+# Dev-environment skip.
+#
+# SECURITY NOTE: this endpoint does NOT enforce any row-level access
+# control -- e.g. it will NOT automatically restrict a "Customer Admin"
+# caller to only their own customer just because the Users table has that
+# relationship. It returns whatever customerId is asked for. If per-user
+# scoping is needed, it has to happen either in an API Management policy
+# (e.g. validating a JWT and rewriting/restricting the customerId param
+# before it reaches this function) or in the calling website -- this
+# function has no visibility into who's actually calling it beyond
+# whether they have a valid function key.
+#
+# auth_level=FUNCTION (not ANONYMOUS): API Management would call this with
+# the function key attached (as a named value / backend credential in its
+# policy), so the Function App itself still isn't reachable by anyone who
+# doesn't go through APIM (or doesn't have the key). ANONYMOUS would only
+# be safe here if the Function App were also network-isolated so APIM is
+# the sole path to it (e.g. via Private Endpoint) -- absent that, FUNCTION
+# is the safer default.
+@app.route(route="getCustomers", methods=["GET"], auth_level=func.AuthLevel.FUNCTION)
+def getCustomers(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Query params:
+      customerId -- optional. If given, returns a single customer object
+        (404 if not found) instead of an array.
+      limit -- optional, default 100, capped at 1000. Ignored if
+        customerId is given.
+    """
+    customer_id = req.params.get("customerId")
+    limit_param = req.params.get("limit")
+
+    if limit_param is not None and not limit_param.isdigit():
+        return func.HttpResponse(
+            json.dumps({"error": "limit must be a positive integer"}),
+            status_code=400,
+            mimetype="application/json",
+        )
+
+    try:
+        customers = get_customers(
+            customer_id=customer_id, limit=int(limit_param) if limit_param else None
+        )
+    except Exception as ex:
+        logging.error("getCustomers: query failed: %s", ex)
+        return func.HttpResponse(
+            json.dumps({"error": "internal error"}),
+            status_code=500,
+            mimetype="application/json",
+        )
+
+    if customer_id:
+        if not customers:
+            return func.HttpResponse(
+                json.dumps({"error": "customer not found"}),
+                status_code=404,
+                mimetype="application/json",
+            )
+        return func.HttpResponse(
+            json.dumps(customers[0]), status_code=200, mimetype="application/json"
+        )
+
+    return func.HttpResponse(
+        json.dumps(customers), status_code=200, mimetype="application/json"
     )
