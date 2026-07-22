@@ -148,14 +148,14 @@ Backend/
 
 ## Running the tests
 
-436 tests, fully mocked — no real Airtable, Leadsun, or Azure SQL calls,
+444 tests, fully mocked — no real Airtable, Leadsun, or Azure SQL calls,
 no credentials needed for the default run.
 
 | File | Focus |
 |---|---|
 | `tests/test_airtable_client.py` | Pagination (single/multi-page), offset handling, adaptive rate-limit pacing (sleeps only the remaining gap, skips it entirely when a request was already slow), optional `fields[]` payload restriction, auth header, HTTP error propagation |
 | `tests/test_leadsun_client.py` | Cert materialized to a temp file with the right content, temp file cleaned up on both success and failure, correct URL/timeout, HTTP error propagation, `verify=` resolution (default/pinned CA/skip-verify precedence), the hostname-check-bypass adapter — including a real (non-mocked) check that `assert_hostname=False` actually reaches urllib3's pool config, not just the `SSLContext` — `fetch_models()` hitting the `/models` endpoint via the same shared `_get()`, and the fail-fast PEM validation (missing certificate/private-key blocks raise a clear error instead of a deep OpenSSL failure) |
-| `tests/test_sql_client.py` | Connection string from env, missing env var, pyodbc error passthrough |
+| `tests/test_sql_client.py` | Connection string from env, missing env var, pyodbc error passthrough, `_decode_datetimeoffset()` (round-trip against hand-built wire-format bytes, positive/negative offsets, fraction-to-microsecond truncation), and that `get_connection()` actually registers it on the connection instance it returns |
 | `tests/test_datetime_utils.py` | `to_dto_string` offset formatting, `airtable_created_time_to_eastern` (winter/summer DST) |
 | `tests/test_customers_loader.py` | `_map_record_to_customer` field mapping, full `load_customers()` flow (success, partial row failure, top-level failure + `ErrorMessage` update, cleanup-on-error), MERGE SQL structural checks, `ntext`-cast regression check, fetch/upsert phase-timing logs |
 | `tests/test_projects_loader.py` | Same shape as `test_customers_loader.py`, for `load_projects()` — including the linked-Customer-id mapping, the NULL-safe `INTERSECT` diff check, the `ntext`-cast fix regression check, and fetch/upsert phase-timing logs |
@@ -827,6 +827,35 @@ reference for a from-scratch project, not as the LightsApp deploy runbook.
   2026-2030 one) is always safe and won't create duplicates or error on
   a second run, unlike a plain `INSERT` would against the `(Year, Week)`
   primary key.
+
+- **`shared/sql_client.py`'s `get_connection()` registers a `DATETIMEOFFSET`
+  output converter on every connection it returns.** Discovered via a real
+  error from `getCustomers`'s first production run:
+  `('ODBC SQL type -155 is not yet supported.  column-index=9  type=-155', 'HY106')`.
+  ODBC type `-155` is `SQL_SS_TIMESTAMPOFFSET`, SQL Server's wire type for
+  `DATETIMEOFFSET` — pyodbc has no built-in decoder for it, so any query
+  that reads a `DATETIMEOFFSET` column back via `fetchall()`/`fetchone()`
+  fails outright, unless a converter function is explicitly registered.
+  This hadn't come up before `getCustomers` because every other loader in
+  this project only ever *writes* `DATETIMEOFFSET` values (as bound `?`
+  parameters going into `INSERT`/`MERGE`) — `getCustomers` was the first
+  plain `SELECT` that actually reads one back into Python. It also
+  couldn't have been caught by this project's test suite as it stood,
+  since every test mocks the cursor entirely — this specific real-pyodbc
+  decoding behavior was never actually exercised until it hit a live SQL
+  Server. `tests/test_sql_client.py`'s decoder tests build the exact wire
+  bytes by hand (round-tripped through the same struct format SQL
+  Server's ODBC driver uses) specifically to close that gap without
+  needing a real database.
+
+  **One easy mistake worth flagging explicitly, since I made it myself
+  while building this fix**: `add_output_converter` is a **method on the
+  `Connection` object** (`conn.add_output_converter(-155, fn)`), not a
+  module-level `pyodbc.add_output_converter(...)` setting — the latter
+  doesn't exist and raises `AttributeError` immediately on import if
+  called that way. Because it's per-connection, it has to be registered
+  inside `get_connection()` on the connection object being returned, not
+  once somewhere at module import time.
 
 - **`getCustomers` — a read-only HTTP API endpoint, not part of the
   Airtable/Leadsun ETL pipeline at all.** Meant to be imported into Azure
