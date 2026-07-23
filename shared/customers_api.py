@@ -1,7 +1,14 @@
 from shared.sql_client import get_connection
 
-DEFAULT_LIMIT = 100
 MAX_LIMIT = 1000
+
+# No-limit-specified means "everything, up to MAX_LIMIT" -- a business's
+# customer roster is very unlikely to need pagination at all, so an
+# arbitrarily low default (this used to be 100) just meant the endpoint
+# silently truncated real results for anyone who didn't know to pass
+# ?limit= explicitly. DEFAULT_LIMIT intentionally equals MAX_LIMIT now,
+# rather than being some smaller number.
+DEFAULT_LIMIT = MAX_LIMIT
 
 # Columns returned to API consumers, mapped to camelCase JSON keys
 # (typical REST/JS convention, not the PascalCase SQL column names

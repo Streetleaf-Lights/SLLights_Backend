@@ -41,6 +41,16 @@ class TestJsonSafe:
 
 
 class TestClampLimit:
+    def test_default_limit_equals_max_limit(self):
+        """
+        No limit specified should mean "everything, up to the ceiling",
+        not some arbitrarily lower default -- a business's customer
+        roster is very unlikely to need pagination, so silently
+        truncating to a low default just loses real results for anyone
+        who doesn't know to pass ?limit= explicitly.
+        """
+        assert customers_api.DEFAULT_LIMIT == customers_api.MAX_LIMIT
+
     def test_none_returns_default(self):
         assert customers_api._clamp_limit(None) == customers_api.DEFAULT_LIMIT
 

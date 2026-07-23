@@ -148,7 +148,7 @@ Backend/
 
 ## Running the tests
 
-444 tests, fully mocked — no real Airtable, Leadsun, or Azure SQL calls,
+445 tests, fully mocked — no real Airtable, Leadsun, or Azure SQL calls,
 no credentials needed for the default run.
 
 | File | Focus |
@@ -899,7 +899,10 @@ reference for a from-scratch project, not as the LightsApp deploy runbook.
   deliberately excluded from the response — internal ETL batch-tracking
   metadata that a consuming website has no reason to see.
   - No `customerId` param → returns a JSON **array** of up to `limit`
-    customers (default 100, capped at 1000 regardless of what's
+    customers (default 1000 — i.e. everything up to the ceiling, not an
+    arbitrarily lower default; discovered this was too conservative when
+    a real customer roster over 100 rows got silently truncated on the
+    first production use — capped at 1000 regardless of what's
     requested), ordered by name.
   - `?customerId=X` → returns a single JSON **object** (not wrapped in an
     array), or `404` with a JSON error body if that Id doesn't exist.
