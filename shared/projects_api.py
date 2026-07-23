@@ -35,8 +35,14 @@ def get_projects(project_id: str = None, customer_id: str = None, limit: int = N
     by Id alone.
     customer_id: if given without project_id, filters to all projects for
     that customer -- a genuine list query (0, many, or all of that
-    customer's projects), ordered by name and still subject to limit,
-    NOT single-object-or-404 semantics like project_id.
+    customer's projects), ordered by EffectiveDate descending (newest
+    first) and still subject to limit. NOT single-object-or-404 semantics
+    like project_id. This is a deliberately different sort from the
+    unfiltered case below (by Name) -- only the customer_id-filtered list
+    was asked to sort by EffectiveDate. SQL Server's default NULL
+    handling sorts NULLs last for DESC, so a project with no
+    EffectiveDate set yet appears at the bottom rather than mixed in
+    ahead of ones with a known date.
     limit: max rows returned when project_id isn't given. Defaults to
     DEFAULT_LIMIT, capped at MAX_LIMIT regardless of what's requested
     (see shared/api_utils.py). Ignored when project_id is given (a
@@ -60,7 +66,7 @@ def get_projects(project_id: str = None, customer_id: str = None, limit: int = N
             )
         elif customer_id:
             cursor.execute(
-                f"SELECT TOP (?) {columns_sql} FROM Projects WHERE CustomerId = ? ORDER BY Name",
+                f"SELECT TOP (?) {columns_sql} FROM Projects WHERE CustomerId = ? ORDER BY EffectiveDate DESC",
                 clamp_limit(limit),
                 customer_id,
             )

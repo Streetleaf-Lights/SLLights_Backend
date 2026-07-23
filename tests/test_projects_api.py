@@ -53,7 +53,7 @@ class TestGetProjects:
         assert "TOP" not in sql
         assert pid == "rec456"
 
-    def test_customer_id_alone_filters_by_customer_as_a_list_query(
+    def test_customer_id_alone_filters_by_customer_sorted_by_effective_date_desc(
         self, patch_get_connection_projects_api, mock_cursor
     ):
         mock_cursor.fetchall.return_value = []
@@ -63,9 +63,31 @@ class TestGetProjects:
         sql, limit, cid = mock_cursor.execute.call_args.args
         assert "SELECT TOP (?)" in sql
         assert "WHERE CustomerId = ?" in sql
-        assert "ORDER BY Name" in sql
+        assert "ORDER BY EffectiveDate DESC" in sql
         assert limit == api_utils.DEFAULT_LIMIT
         assert cid == "recwx649JfiRmWqxF"
+
+    def test_customer_id_filtered_sort_is_deliberately_different_from_unfiltered_sort(
+        self, patch_get_connection_projects_api, mock_cursor
+    ):
+        """
+        Locks in that only the customer_id-filtered list was asked to
+        sort by EffectiveDate -- the unfiltered ("all projects") list
+        still sorts by Name. Guards against a future edit accidentally
+        applying one sort order to both paths.
+        """
+        mock_cursor.fetchall.return_value = []
+
+        projects_api.get_projects(customer_id="recwx649JfiRmWqxF")
+        customer_filtered_sql = mock_cursor.execute.call_args.args[0]
+
+        projects_api.get_projects()
+        unfiltered_sql = mock_cursor.execute.call_args.args[0]
+
+        assert "ORDER BY EffectiveDate DESC" in customer_filtered_sql
+        assert "ORDER BY Name" not in customer_filtered_sql
+        assert "ORDER BY Name" in unfiltered_sql
+        assert "ORDER BY EffectiveDate" not in unfiltered_sql
 
     def test_customer_id_alone_respects_limit(
         self, patch_get_connection_projects_api, mock_cursor

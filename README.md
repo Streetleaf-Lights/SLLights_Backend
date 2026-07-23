@@ -150,7 +150,7 @@ Backend/
 
 ## Running the tests
 
-470 tests, fully mocked — no real Airtable, Leadsun, or Azure SQL calls,
+471 tests, fully mocked — no real Airtable, Leadsun, or Azure SQL calls,
 no credentials needed for the default run.
 
 | File | Focus |
@@ -964,6 +964,23 @@ reference for a from-scratch project, not as the LightsApp deploy runbook.
   combination, `projectId`'s single-object-or-404 semantics take over
   (a project that exists but belongs to a *different* customer still
   correctly comes back as `404`, same as a genuinely nonexistent Id).
+
+  **Sort order also deliberately differs here**: the `customerId`-filtered
+  list sorts by `EffectiveDate` **descending** (newest first) — this is a
+  genuinely different `ORDER BY` from the unfiltered "all projects" list,
+  which still sorts by `Name` (`tests/test_projects_api.py` locks in that
+  distinction explicitly, so a future edit can't accidentally apply one
+  sort to both paths without a test failing). `EffectiveDate` is
+  nullable, and the direction affects where those land: SQL Server's
+  default `NULL` handling sorts `NULL`s *last* for `DESC` (it was *first*
+  when this was briefly `ASC`), so a project with no `EffectiveDate` set
+  yet now appears at the bottom of the list, behind every project with a
+  known date, rather than ahead of them.
+
+  This filter also benefits from an existing index —
+  `IX_Projects_CustomerId` was already there, so `WHERE CustomerId = ?`
+  gets an index seek rather than a table scan, independent of anything
+  added for this endpoint.
 
   **Extending this pattern to another table** later (e.g. `getPoles`) is
   mechanical: a new `shared/<table>_api.py` importing `json_safe`/
