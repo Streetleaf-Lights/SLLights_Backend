@@ -6,9 +6,9 @@ lamp telemetry from the Leadsun API, into Azure SQL Database on a
 schedule, running on a Flex Consumption (Linux) plan. Also derives rolling
 Hour/Day/Week/Month health-metric averages (`PoleVitals`) from that
 telemetry, includes a standalone `Workweek` calendar reference table
-(static, not synced from any external source), and exposes a read-only
-`getCustomers` HTTP API endpoint (meant for API Management + a website,
-not part of the ETL pipeline).
+(static, not synced from any external source), and exposes read-only
+`getCustomers`/`getProjects` HTTP API endpoints (meant for API Management
++ a website, not part of the ETL pipeline).
 
 ## Project structure
 
@@ -24,10 +24,10 @@ Backend/
 │                            #     loadPoleRawData before it covered more than one loader)
 │                            #   - loadLeadsunDataManual: manual HTTP trigger, blocked in Prod
 │                            #   - Both timer triggers skip entirely when ENVIRONMENT == "Dev"
-│                            #   - getCustomers: read-only HTTP GET endpoint, NOT part of the ETL
-│                            #     pipeline -- meant for API Management + a website. No timer, no
-│                            #     SP_Execution tracking, no Dev-skip -- see the Notes section below
-│                            #     for what it does (and deliberately doesn't) enforce
+│                            #   - getCustomers / getProjects: read-only HTTP GET endpoints, NOT part
+│                            #     of the ETL pipeline -- meant for API Management + a website. No
+│                            #     timer, no SP_Execution tracking, no Dev-skip -- see the Notes
+│                            #     section below for what they do (and deliberately don't) enforce
 ├── shared/
 │   ├── airtable_client.py       # Paginated Airtable fetch (fetch_all_records)
 │   ├── leadsun_client.py        # Mutual-TLS fetch from the Leadsun API (fetch_lamps, fetch_models)
@@ -39,7 +39,9 @@ Backend/
 │   ├── pole_models_loader.py    # Leadsun → PoleModels upsert logic (load_pole_models)
 │   ├── pole_telemetry_loader.py # Leadsun → PoleTelemetry upsert + retention (load_pole_telemetry)
 │   ├── pole_vitals_loader.py    # PoleTelemetry+PoleModels(+Workweek) → PoleVitals (load_pole_vitals)
-│   └── customers_api.py         # Read-only Customers query logic for getCustomers (get_customers)
+│   ├── api_utils.py             # Shared helpers for the read-only query APIs (json_safe, clamp_limit)
+│   ├── customers_api.py         # Read-only Customers query logic for getCustomers (get_customers)
+│   └── projects_api.py          # Read-only Projects query logic for getProjects (get_projects)
 ├── scripts/
 │   ├── generate_workweek_sql.py # Standalone (no Azure Functions runtime needed) generator
 │   │                             # for Workweek's populate script -- see below
@@ -148,7 +150,7 @@ Backend/
 
 ## Running the tests
 
-445 tests, fully mocked — no real Airtable, Leadsun, or Azure SQL calls,
+470 tests, fully mocked — no real Airtable, Leadsun, or Azure SQL calls,
 no credentials needed for the default run.
 
 | File | Focus |
@@ -163,10 +165,12 @@ no credentials needed for the default run.
 | `tests/test_pole_models_loader.py` | `_capitalize_key`, `_parse_numeric_string` (int vs. float vs. non-numeric passthrough) against the real confirmed `/models` sample, the deliberate `LampsUsing` exception (bitmask string, not converted), `ModelId` needing no rename/conversion (native int, and *is* the real PK here unlike PoleTelemetry's `id`→`LeadsunId`), staging-table bulk MERGE + fallback |
 | `tests/test_pole_telemetry_loader.py` | `_capitalize_key` (PascalCase, not `str.capitalize()`'s behavior), `_parse_iso_datetime`, `_map_lamp_record` against the real confirmed sample (productName→LocationId, id→LeadsunId, projectId/projectName→LeadsunProjectId/Name renames, string trimming, `ExtraFieldsJson` capture for unexpected fields), the missing-`LastUpload` sentinel (stable across calls, never eligible for retention purge, distinct from a genuine parse failure), staging-table bulk MERGE + fallback, retention purge logging |
 | `tests/test_pole_vitals_loader.py` | `_compute_cutoff()`'s lookback-window math (per period type, and the wider `backfill=True` window) — pure and unit-tested since the aggregation SQL itself can't be executed in this sandbox; structural checks on all four period types' `MERGE` SQL (formulas, `NULLIF` guards, join conditions, bucketing expressions, `Week`'s `Workweek` join specifically, the `_MISSING_LAST_UPLOAD_SENTINEL` exclusion); `_is_benign_null_aggregate_warning()` (SQLSTATE `01003` treated as success, `22007` and other genuine errors still treated as failures); full-flow tests (`SP_Execution` open/close, per-period-type failure isolation, rowcount aggregation) |
-| `tests/test_function_app.py` | Timer trigger fires only at 6 AM/6 PM Eastern (verified across the DST boundary with freezegun), `past_due` handling, manual HTTP trigger's `Prod` block, synchronous (non-threaded) execution, **Poles runs before Projects runs before Customers** in both triggers, a failure in an earlier loader blocks the later ones, **`loadLeadsunData` runs unconditionally** (no hour-gating) otherwise, runs **Models → Telemetry → Vitals in order** (a failure in an earlier one blocks the later ones here too), and never touches the Airtable loaders — and **both timer triggers skip entirely when `ENVIRONMENT == "Dev"`**, before even checking `past_due`, while both manual triggers are unaffected by that guard; separately, **`getCustomers`**'s array-vs-single-object-vs-404 response shaping, non-numeric `limit` → `400` without querying the DB at all, and a query failure surfacing as `500` with a JSON error body rather than a raw exception |
+| `tests/test_function_app.py` | Timer trigger fires only at 6 AM/6 PM Eastern (verified across the DST boundary with freezegun), `past_due` handling, manual HTTP trigger's `Prod` block, synchronous (non-threaded) execution, **Poles runs before Projects runs before Customers** in both triggers, a failure in an earlier loader blocks the later ones, **`loadLeadsunData` runs unconditionally** (no hour-gating) otherwise, runs **Models → Telemetry → Vitals in order** (a failure in an earlier one blocks the later ones here too), and never touches the Airtable loaders — and **both timer triggers skip entirely when `ENVIRONMENT == "Dev"`**, before even checking `past_due`, while both manual triggers are unaffected by that guard; separately, **`getCustomers`** and **`getProjects`**'s array-vs-single-object-vs-404 response shaping, non-numeric `limit` → `400` without querying the DB at all, a query failure surfacing as `500` with a JSON error body rather than a raw exception, and **`getProjects?customerId=X`**'s distinct list-query semantics (empty array + `200`, not `404`, when a customer has no projects) vs. `projectId`'s single-object-or-404, including when both params are combined |
 | `tests/test_generate_workweek_sql.py` | `sunday_on_or_before()`, full validation of the generated rows (260 for 2026-2030: no duplicates, every week exactly 7 days Sun-Sat, no gaps/overlaps within a year, Jan 1 always in that year's Week 1, leap-day coverage), and that the emitted SQL is a `MERGE` (idempotent), not a plain `INSERT` |
 | `tests/test_run_pole_vitals_backfill.py` | `refuse_if_prod()` (blocks `"Prod"`, allows everything else), `load_local_settings_into_env()` (missing file, missing `Values` key, doesn't clobber an already-set env var) |
-| `tests/test_customers_api.py` | `_json_safe()` (datetime/unknown-type coercion), `_clamp_limit()` (default, cap, negative), `get_customers()` query shape (by-id vs. `TOP (?)`, `SP_ExecId` never selected, camelCase key mapping, connection cleanup on success and failure) |
+| `tests/test_api_utils.py` | `json_safe()` (datetime/date/unknown-type coercion), `clamp_limit()` (default equals max, cap, negative) — extracted from `test_customers_api.py` once `getProjects` needed the exact same logic |
+| `tests/test_customers_api.py` | `get_customers()` query shape (by-id vs. `TOP (?)`, `SP_ExecId` never selected, camelCase key mapping, connection cleanup on success and failure) |
+| `tests/test_projects_api.py` | Same shape as `test_customers_api.py`, for `get_projects()` — including that a plain `DATE` column (`EffectiveDate`, not just `DATETIMEOFFSET`) also gets the `json_safe()` treatment — plus the `customerId` filter: alone (list query, `WHERE CustomerId = ?`, still respects `limit`, can return multiple rows) and combined with `projectId` (`WHERE Id = ? AND CustomerId = ?`) |
 | `tests/test_schema_integration.py` | Column-name consistency between the code's SQL and a documented expected schema (all six loader-backed tables, plus a lighter DDL-vs-generator check for `Workweek`); two opt-in **real** end-to-end tests (Airtable+SQL, and separately Leadsun+SQL, the latter now covering Models → Telemetry → Vitals) |
 
 ```bash
@@ -857,72 +861,114 @@ reference for a from-scratch project, not as the LightsApp deploy runbook.
   inside `get_connection()` on the connection object being returned, not
   once somewhere at module import time.
 
-- **`getCustomers` — a read-only HTTP API endpoint, not part of the
-  Airtable/Leadsun ETL pipeline at all.** Meant to be imported into Azure
-  API Management and called by a website, not run on a schedule — so
-  unlike every other function in this project, it has no timer trigger,
-  no `SP_Execution` tracking (it doesn't load or sync anything, just
-  serves what's already been loaded), and no `ENVIRONMENT == "Dev"` skip.
+- **`getCustomers` / `getProjects` — read-only HTTP API endpoints, not
+  part of the Airtable/Leadsun ETL pipeline at all.** Meant to be
+  imported into Azure API Management and called by a website, not run on
+  a schedule — so unlike every other function in this project, neither
+  has a timer trigger, `SP_Execution` tracking (they don't load or sync
+  anything, just serve what's already been loaded), or an
+  `ENVIRONMENT == "Dev"` skip. `getProjects` is built identically to
+  `getCustomers` in every respect below — everything said about one
+  applies equally to the other unless noted.
 
-  **Security boundary, worth understanding before wiring this up**: this
-  endpoint does **not** enforce any row-level access control. It will not
-  automatically restrict a caller to one customer's data just because
-  (if you're using the `Users` table from elsewhere in this project) a
+  **`shared/api_utils.py`** holds the logic genuinely shared between
+  them (`json_safe()`, `clamp_limit()`, `DEFAULT_LIMIT`/`MAX_LIMIT`) —
+  extracted out once `getProjects` needed the exact same behavior
+  `getCustomers` already had, rather than duplicating it a second time.
+  `shared/customers_api.py` and `shared/projects_api.py` each keep only
+  what's genuinely table-specific: their own `_COLUMN_TO_JSON_KEY`
+  mapping and their own `get_<table>()` query function.
+
+  **Security boundary, worth understanding before wiring either up**:
+  neither endpoint enforces any row-level access control. Neither will
+  automatically restrict a caller to one customer's data just because (if
+  you're using the `Users` table from elsewhere in this project) a
   `Customer Admin`'s `Role`/`CustomerId` implies they should only see
-  their own customer — it returns whatever `customerId` is asked for, no
-  questions asked. If per-user scoping is needed, it has to happen
-  **either**:
+  their own customer's data — each returns whatever `customerId`/
+  `projectId` is asked for, no questions asked. If per-user scoping is
+  needed, it has to happen **either**:
   - in an **API Management policy** — e.g. validate a JWT, extract the
-    caller's `CustomerId` claim, and rewrite/restrict the `customerId`
-    query param before the request ever reaches this function, or
+    caller's `CustomerId` claim, and rewrite/restrict the
+    `customerId`/`projectId` query param before the request ever reaches
+    the function, or
   - in the **calling website** itself, before it ever sends the request.
 
-  This function has no visibility into who's actually calling it beyond
-  whether they have a valid function key. I built the filtering
-  *mechanism* (a `customerId` param) since scoping needs *something* to
-  filter on, but deliberately didn't guess at *who's allowed to use it*,
-  since that's a real security decision I don't have enough context to
-  make silently.
+  Neither function has any visibility into who's actually calling it
+  beyond whether they have a valid function key. I built the filtering
+  *mechanism* (an `Id` param) since scoping needs *something* to filter
+  on, but deliberately didn't guess at *who's allowed to use it*, since
+  that's a real security decision I don't have enough context to make
+  silently.
 
   **`auth_level=FUNCTION`, not `ANONYMOUS`**: API Management would call
-  this with the function key attached (as a named value / backend
+  these with the function key attached (as a named value / backend
   credential in its policy), so the Function App itself still isn't
   reachable by anyone who doesn't go through APIM or doesn't have the
   key. `ANONYMOUS` would only be safe here if the Function App were also
   network-isolated so APIM is the sole path to it (e.g. via a Private
   Endpoint) — absent that, `FUNCTION` is the safer default.
 
-  **Response shape**: JSON, camelCase keys (`id`, `name`, `projectNames`,
-  `address`, `city`, `state`, `zip`, `phone`, `createdAt`) rather than the
-  PascalCase SQL column names directly — typical REST/JS API convention,
-  since this is meant for a website to consume. `SP_ExecId` is
-  deliberately excluded from the response — internal ETL batch-tracking
-  metadata that a consuming website has no reason to see.
-  - No `customerId` param → returns a JSON **array** of up to `limit`
-    customers (default 1000 — i.e. everything up to the ceiling, not an
-    arbitrarily lower default; discovered this was too conservative when
-    a real customer roster over 100 rows got silently truncated on the
-    first production use — capped at 1000 regardless of what's
-    requested), ordered by name.
-  - `?customerId=X` → returns a single JSON **object** (not wrapped in an
-    array), or `404` with a JSON error body if that Id doesn't exist.
+  **Response shape**: JSON, camelCase keys rather than the PascalCase SQL
+  column names directly — typical REST/JS API convention, since these
+  are meant for a website to consume.
+  - `getCustomers`: `id`, `name`, `projectNames`, `address`, `city`,
+    `state`, `zip`, `phone`, `createdAt`.
+  - `getProjects`: `id`, `name`, `poleNumbers`, `poleIds`, `customerId`,
+    `polesUnderContract`, `effectiveDate`, `installDates`, `createdAt`.
+    `effectiveDate` is a plain `DATE` column, not `DATETIMEOFFSET` like
+    the others — `json_safe()` handles both the same way (neither is
+    natively JSON-serializable via `json.dumps()`), so this needed no
+    special-casing.
+
+  `SP_ExecId` is deliberately excluded from both responses — internal
+  ETL batch-tracking metadata that a consuming website has no reason to
+  see.
+  - No filter param given → returns a JSON **array** of up to `limit`
+    rows (default 1000 — i.e. everything up to the ceiling, not an
+    arbitrarily lower default; `getCustomers` originally defaulted to
+    100 and that turned out to be too conservative the moment a real
+    customer roster exceeded it in production — fixed once, in
+    `api_utils.py`, so `getProjects` starts from the corrected default
+    rather than repeating that mistake), ordered by name.
+  - `getCustomers?customerId=X` and `getProjects?projectId=X` → single
+    JSON **object** (not wrapped in an array), or `404` with a JSON
+    error body if that Id doesn't exist.
+  - `getProjects?customerId=X` (without `projectId`) is the one
+    exception to that — see the dedicated note further down. It's a
+    list query (array, `200`, possibly empty), not single-object-or-404.
   - A non-numeric `limit` → `400`, without touching the database at all.
   - A query failure → `500` with a JSON error body, not a raw stack
     trace or an unhandled exception.
 
-  **Getting this into API Management** (brief, since it's a standard
+  **Getting these into API Management** (brief, since it's a standard
   Azure Portal flow, not something this project's code handles): in the
   API Management instance, **APIs → Add API → Function App**, pick this
-  Function App, and it'll offer to import `getCustomers` (and every other
-  HTTP-triggered function here) as an operation automatically, wiring up
-  the function key as a backend credential. From there, APIM policies
-  (rate limiting, JWT validation, CORS, request/response transformation)
-  layer on top without touching this code at all — CORS in particular is
-  usually handled at the APIM layer for exactly this kind of
-  website-calls-an-API setup, not in the Function itself.
+  Function App, and it'll offer to import `getCustomers`/`getProjects`
+  (and every other HTTP-triggered function here) as operations
+  automatically, wiring up the function key as a backend credential.
+  From there, APIM policies (rate limiting, JWT validation, CORS,
+  request/response transformation) layer on top without touching this
+  code at all — CORS in particular is usually handled at the APIM layer
+  for exactly this kind of website-calls-an-API setup, not in the
+  Function itself.
 
-  **Extending this pattern to another table** later (e.g. `getProjects`,
-  `getPoles`) is mechanical: a new `shared/<table>_api.py` with a
-  `get_<table>()` following `customers_api.py`'s shape, plus a matching
-  `@app.route(...)` wrapper in `function_app.py` — no need to ask for
-  this again if the need comes up.
+  **`getProjects?customerId=X`** — filters to every project belonging to
+  that customer, a genuine list query (0, some, or all of that customer's
+  projects, still subject to `limit`), **not** single-object-or-404
+  semantics — an empty array (`200`) means "this customer has no
+  projects", which is a valid state, not an error. This is the one place
+  `getProjects` isn't a pure mirror of `getCustomers`: it's the only
+  cross-table filter currently in either endpoint. `customerId` can also
+  be combined *with* `projectId` (`?projectId=X&customerId=Y`) to verify
+  a specific project actually belongs to a given customer — in that
+  combination, `projectId`'s single-object-or-404 semantics take over
+  (a project that exists but belongs to a *different* customer still
+  correctly comes back as `404`, same as a genuinely nonexistent Id).
+
+  **Extending this pattern to another table** later (e.g. `getPoles`) is
+  mechanical: a new `shared/<table>_api.py` importing `json_safe`/
+  `clamp_limit` from `shared/api_utils.py`, with its own
+  `_COLUMN_TO_JSON_KEY` and `get_<table>()` following
+  `projects_api.py`'s shape, plus a matching `@app.route(...)` wrapper in
+  `function_app.py` — no need to ask for this again if the need comes
+  up.

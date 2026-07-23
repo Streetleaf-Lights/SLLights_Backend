@@ -13,6 +13,7 @@ from shared.pole_models_loader import load_pole_models
 from shared.pole_telemetry_loader import load_pole_telemetry
 from shared.pole_vitals_loader import load_pole_vitals
 from shared.customers_api import get_customers
+from shared.projects_api import get_projects
 
 app = func.FunctionApp()
 
@@ -188,8 +189,8 @@ def getCustomers(req: func.HttpRequest) -> func.HttpResponse:
     Query params:
       customerId -- optional. If given, returns a single customer object
         (404 if not found) instead of an array.
-      limit -- optional, default 100, capped at 1000. Ignored if
-        customerId is given.
+      limit -- optional, default/max 1000 (see shared/api_utils.py).
+        Ignored if customerId is given.
     """
     customer_id = req.params.get("customerId")
     limit_param = req.params.get("limit")
@@ -226,4 +227,73 @@ def getCustomers(req: func.HttpRequest) -> func.HttpResponse:
 
     return func.HttpResponse(
         json.dumps(customers), status_code=200, mimetype="application/json"
+    )
+
+
+# --------------------------------------------------------------------------
+# getProjects -- same pattern as getCustomers exactly (read-only, not part
+# of the ETL pipeline, no SP_Execution tracking, no Dev-skip). See
+# getCustomers's comment block above for the full reasoning -- repeated
+# briefly here rather than cross-referenced, so this function is
+# self-contained to read on its own.
+#
+# SECURITY NOTE: same as getCustomers -- no row-level access control
+# enforced here either. Returns whatever projectId/customerId is asked for.
+#
+# auth_level=FUNCTION, same reasoning as getCustomers: API Management
+# calls this with the function key attached; ANONYMOUS would only be safe
+# with network isolation ensuring APIM is the sole path to the Function
+# App.
+@app.route(route="getProjects", methods=["GET"], auth_level=func.AuthLevel.FUNCTION)
+def getProjects(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Query params:
+      projectId -- optional. If given, returns a single project object
+        (404 if not found) instead of an array. Can be combined with
+        customerId to also verify the project belongs to that customer.
+      customerId -- optional. If given WITHOUT projectId, returns an
+        array of every project for that customer -- a collection filter,
+        not a single-resource lookup, so an empty array (200) means "this
+        customer has no projects", not "not found" (no 404 here).
+      limit -- optional, default/max 1000 (see shared/api_utils.py).
+        Ignored if projectId is given.
+    """
+    project_id = req.params.get("projectId")
+    customer_id = req.params.get("customerId")
+    limit_param = req.params.get("limit")
+
+    if limit_param is not None and not limit_param.isdigit():
+        return func.HttpResponse(
+            json.dumps({"error": "limit must be a positive integer"}),
+            status_code=400,
+            mimetype="application/json",
+        )
+
+    try:
+        projects = get_projects(
+            project_id=project_id,
+            customer_id=customer_id,
+            limit=int(limit_param) if limit_param else None,
+        )
+    except Exception as ex:
+        logging.error("getProjects: query failed: %s", ex)
+        return func.HttpResponse(
+            json.dumps({"error": "internal error"}),
+            status_code=500,
+            mimetype="application/json",
+        )
+
+    if project_id:
+        if not projects:
+            return func.HttpResponse(
+                json.dumps({"error": "project not found"}),
+                status_code=404,
+                mimetype="application/json",
+            )
+        return func.HttpResponse(
+            json.dumps(projects[0]), status_code=200, mimetype="application/json"
+        )
+
+    return func.HttpResponse(
+        json.dumps(projects), status_code=200, mimetype="application/json"
     )

@@ -581,3 +581,151 @@ class TestGetCustomers:
 
         assert response.status_code == 200
         assert json.loads(response.get_body()) == []
+
+
+# --------------------------------------------------------------------------
+# getProjects -- same pattern as getCustomers exactly.
+# --------------------------------------------------------------------------
+
+
+def make_get_projects_http_request(project_id=None, customer_id=None, limit=None):
+    params = {}
+    if project_id is not None:
+        params["projectId"] = project_id
+    if customer_id is not None:
+        params["customerId"] = customer_id
+    if limit is not None:
+        params["limit"] = limit
+    return func.HttpRequest(
+        method="GET",
+        url="/api/getProjects",
+        headers={},
+        params=params,
+        body=b"",
+    )
+
+
+class TestGetProjects:
+    def test_no_project_id_returns_array_with_200(self, mocker):
+        mocker.patch(
+            "function_app.get_projects",
+            return_value=[{"id": "rec1", "name": "Chaparral Ph3"}, {"id": "rec2", "name": "Elm St"}],
+        )
+
+        response = function_app.getProjects(make_get_projects_http_request())
+
+        assert response.status_code == 200
+        assert response.mimetype == "application/json"
+        body = json.loads(response.get_body())
+        assert body == [{"id": "rec1", "name": "Chaparral Ph3"}, {"id": "rec2", "name": "Elm St"}]
+
+    def test_project_id_returns_single_object_with_200(self, mocker):
+        mock_get = mocker.patch(
+            "function_app.get_projects", return_value=[{"id": "rec1", "name": "Chaparral Ph3"}]
+        )
+
+        response = function_app.getProjects(make_get_projects_http_request(project_id="rec1"))
+
+        assert response.status_code == 200
+        body = json.loads(response.get_body())
+        assert body == {"id": "rec1", "name": "Chaparral Ph3"}
+        mock_get.assert_called_once_with(project_id="rec1", customer_id=None, limit=None)
+
+    def test_project_id_not_found_returns_404(self, mocker):
+        mocker.patch("function_app.get_projects", return_value=[])
+
+        response = function_app.getProjects(make_get_projects_http_request(project_id="rec999"))
+
+        assert response.status_code == 404
+        body = json.loads(response.get_body())
+        assert "error" in body
+
+    def test_customer_id_alone_returns_array_with_200(self, mocker):
+        mock_get = mocker.patch(
+            "function_app.get_projects",
+            return_value=[{"id": "rec1", "name": "Chaparral Ph3"}, {"id": "rec2", "name": "Elm St"}],
+        )
+
+        response = function_app.getProjects(
+            make_get_projects_http_request(customer_id="recwx649JfiRmWqxF")
+        )
+
+        assert response.status_code == 200
+        body = json.loads(response.get_body())
+        assert body == [{"id": "rec1", "name": "Chaparral Ph3"}, {"id": "rec2", "name": "Elm St"}]
+        mock_get.assert_called_once_with(
+            project_id=None, customer_id="recwx649JfiRmWqxF", limit=None
+        )
+
+    def test_customer_id_alone_with_no_matches_returns_empty_array_not_404(self, mocker):
+        """
+        Key distinction from projectId: customerId is a collection filter,
+        not a single-resource lookup -- a customer with zero projects is a
+        valid state (empty array, 200), not a "not found" error.
+        """
+        mocker.patch("function_app.get_projects", return_value=[])
+
+        response = function_app.getProjects(
+            make_get_projects_http_request(customer_id="rec-with-no-projects")
+        )
+
+        assert response.status_code == 200
+        assert json.loads(response.get_body()) == []
+
+    def test_project_id_and_customer_id_both_passed_through(self, mocker):
+        mock_get = mocker.patch(
+            "function_app.get_projects", return_value=[{"id": "rec1", "name": "Chaparral Ph3"}]
+        )
+
+        response = function_app.getProjects(
+            make_get_projects_http_request(project_id="rec1", customer_id="recwx649JfiRmWqxF")
+        )
+
+        assert response.status_code == 200
+        mock_get.assert_called_once_with(
+            project_id="rec1", customer_id="recwx649JfiRmWqxF", limit=None
+        )
+
+    def test_project_id_and_customer_id_combined_not_found_returns_404(self, mocker):
+        """projectId presence still drives 404-vs-empty-array semantics,
+        even when customerId is also given -- e.g. a real project Id that
+        belongs to a DIFFERENT customer than the one specified."""
+        mocker.patch("function_app.get_projects", return_value=[])
+
+        response = function_app.getProjects(
+            make_get_projects_http_request(project_id="rec1", customer_id="rec-wrong-customer")
+        )
+
+        assert response.status_code == 404
+
+    def test_limit_is_parsed_and_passed_through(self, mocker):
+        mock_get = mocker.patch("function_app.get_projects", return_value=[])
+
+        function_app.getProjects(make_get_projects_http_request(limit="5"))
+
+        mock_get.assert_called_once_with(project_id=None, customer_id=None, limit=5)
+
+    def test_non_numeric_limit_returns_400_without_querying(self, mocker):
+        mock_get = mocker.patch("function_app.get_projects")
+
+        response = function_app.getProjects(make_get_projects_http_request(limit="abc"))
+
+        assert response.status_code == 400
+        mock_get.assert_not_called()
+
+    def test_query_failure_returns_500_not_a_raw_exception(self, mocker):
+        mocker.patch("function_app.get_projects", side_effect=RuntimeError("db down"))
+
+        response = function_app.getProjects(make_get_projects_http_request())
+
+        assert response.status_code == 500
+        body = json.loads(response.get_body())
+        assert "error" in body
+
+    def test_response_is_valid_json_even_for_empty_list(self, mocker):
+        mocker.patch("function_app.get_projects", return_value=[])
+
+        response = function_app.getProjects(make_get_projects_http_request())
+
+        assert response.status_code == 200
+        assert json.loads(response.get_body()) == []
