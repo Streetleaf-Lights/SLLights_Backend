@@ -150,6 +150,30 @@ def patch_get_connection_projects_api(mocker, mock_conn):
 
 
 @pytest.fixture
+def patch_get_connection_pole_vitals_api(mocker, mock_conn):
+    """Patches shared.pole_vitals_api.get_connection to return mock_conn."""
+    return mocker.patch(
+        "shared.pole_vitals_api.get_connection", return_value=mock_conn
+    )
+
+
+@pytest.fixture
+def patch_get_connection_poles_api(mocker, mock_conn):
+    """Patches shared.poles_api.get_connection to return mock_conn."""
+    return mocker.patch(
+        "shared.poles_api.get_connection", return_value=mock_conn
+    )
+
+
+@pytest.fixture
+def patch_get_connection_users_api(mocker, mock_conn):
+    """Patches shared.users_api.get_connection to return mock_conn."""
+    return mocker.patch(
+        "shared.users_api.get_connection", return_value=mock_conn
+    )
+
+
+@pytest.fixture
 def patch_fetch_all_records(mocker):
     """Patches shared.customers_loader.fetch_all_records (already imported by name)."""
     return mocker.patch("shared.customers_loader.fetch_all_records")
@@ -237,6 +261,22 @@ def patch_get_connection_pole_vitals(mocker, mock_conn):
     """Patches shared.pole_vitals_loader.get_connection to return mock_conn."""
     return mocker.patch(
         "shared.pole_vitals_loader.get_connection", return_value=mock_conn
+    )
+
+
+@pytest.fixture
+def patch_get_connection_pole_timezones(mocker, mock_conn):
+    """Patches shared.pole_timezones_loader.get_connection to return mock_conn."""
+    return mocker.patch(
+        "shared.pole_timezones_loader.get_connection", return_value=mock_conn
+    )
+
+
+@pytest.fixture
+def patch_get_connection_pole_daylight_flags(mocker, mock_conn):
+    """Patches shared.pole_daylight_flags_loader.get_connection to return mock_conn."""
+    return mocker.patch(
+        "shared.pole_daylight_flags_loader.get_connection", return_value=mock_conn
     )
 
 

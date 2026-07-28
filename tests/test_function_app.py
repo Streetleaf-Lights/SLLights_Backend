@@ -285,8 +285,8 @@ class TestLoadAirTableDataManual:
 # loadLeadsunData / loadLeadsunDataManual (Leadsun, separate from
 # loadAirTableData -- different source, different cadence, no dependency
 # between the two pipelines). Renamed from loadPoleRawData now that it
-# orchestrates three loaders (load_pole_models -> load_pole_telemetry ->
-# load_pole_vitals), not one.
+# orchestrates four loaders (load_pole_models -> load_pole_telemetry ->
+# load_pole_timezones -> load_pole_vitals), not one.
 # --------------------------------------------------------------------------
 
 
@@ -302,9 +302,10 @@ def make_leadsun_http_request():
 
 def patch_leadsun_loaders(mocker):
     """
-    Patches load_pole_models, load_pole_telemetry, and load_pole_vitals,
-    tracking call order via a shared list so tests can assert
-    Models -> Telemetry -> Vitals.
+    Patches load_pole_models, load_pole_telemetry, load_pole_timezones,
+    load_pole_daylight_flags, and load_pole_vitals, tracking call order
+    via a shared list so tests can assert
+    Models -> Telemetry -> TimeZones -> DaylightFlags -> Vitals.
     """
     call_order = []
     mock_model = mocker.patch(
@@ -313,10 +314,17 @@ def patch_leadsun_loaders(mocker):
     mock_raw_data = mocker.patch(
         "function_app.load_pole_telemetry", side_effect=lambda: call_order.append("raw_data")
     )
+    mock_timezones = mocker.patch(
+        "function_app.load_pole_timezones", side_effect=lambda: call_order.append("timezones")
+    )
+    mock_daylight_flags = mocker.patch(
+        "function_app.load_pole_daylight_flags",
+        side_effect=lambda: call_order.append("daylight_flags"),
+    )
     mock_vitals = mocker.patch(
         "function_app.load_pole_vitals", side_effect=lambda: call_order.append("vitals")
     )
-    return mock_model, mock_raw_data, mock_vitals, call_order
+    return mock_model, mock_raw_data, mock_timezones, mock_daylight_flags, mock_vitals, call_order
 
 
 class TestLoadLeadsunDataTimer:
@@ -330,56 +338,104 @@ class TestLoadLeadsunDataTimer:
 
     def test_runs_unconditionally(self, mocker):
         """Unlike loadAirTableData, there's no hour-gating -- every timer
-        fire (every 10 minutes) should call all three loaders."""
-        mock_model, mock_raw_data, mock_vitals, _ = patch_leadsun_loaders(mocker)
+        fire (every 10 minutes) should call all five loaders."""
+        mock_model, mock_raw_data, mock_timezones, mock_daylight_flags, mock_vitals, _ = (
+            patch_leadsun_loaders(mocker)
+        )
         function_app.loadLeadsunData(make_timer_request())
         mock_model.assert_called_once()
         mock_raw_data.assert_called_once()
+        mock_timezones.assert_called_once()
+        mock_daylight_flags.assert_called_once()
         mock_vitals.assert_called_once()
 
-    def test_models_then_telemetry_then_vitals(self, mocker):
-        _, _, _, call_order = patch_leadsun_loaders(mocker)
+    def test_models_then_telemetry_then_timezones_then_daylight_flags_then_vitals(self, mocker):
+        _, _, _, _, _, call_order = patch_leadsun_loaders(mocker)
         function_app.loadLeadsunData(make_timer_request())
-        assert call_order == ["model", "raw_data", "vitals"]
+        assert call_order == ["model", "raw_data", "timezones", "daylight_flags", "vitals"]
 
     def test_past_due_still_runs_and_logs_warning(self, mocker, caplog):
-        mock_model, mock_raw_data, mock_vitals, _ = patch_leadsun_loaders(mocker)
+        mock_model, mock_raw_data, mock_timezones, mock_daylight_flags, mock_vitals, _ = (
+            patch_leadsun_loaders(mocker)
+        )
         with caplog.at_level("WARNING"):
             function_app.loadLeadsunData(make_timer_request(past_due=True))
         mock_model.assert_called_once()
         mock_raw_data.assert_called_once()
+        mock_timezones.assert_called_once()
+        mock_daylight_flags.assert_called_once()
         mock_vitals.assert_called_once()
         assert any("past due" in rec.message for rec in caplog.records)
 
     def test_propagates_exception(self, mocker):
         mocker.patch("function_app.load_pole_models")
         mocker.patch("function_app.load_pole_telemetry")
+        mocker.patch("function_app.load_pole_timezones")
+        mocker.patch("function_app.load_pole_daylight_flags")
         mocker.patch("function_app.load_pole_vitals", side_effect=RuntimeError("leadsun down"))
         with pytest.raises(RuntimeError, match="leadsun down"):
             function_app.loadLeadsunData(make_timer_request())
 
     def test_telemetry_not_called_if_model_fails(self, mocker):
         """Model runs first with no exception handling around it, so a
-        failure there prevents Telemetry (and Vitals) from running at all
+        failure there prevents everything after it from running at all
         in this invocation."""
         mocker.patch("function_app.load_pole_models", side_effect=RuntimeError("model failed"))
         mock_raw_data = mocker.patch("function_app.load_pole_telemetry")
+        mock_timezones = mocker.patch("function_app.load_pole_timezones")
+        mock_daylight_flags = mocker.patch("function_app.load_pole_daylight_flags")
         mock_vitals = mocker.patch("function_app.load_pole_vitals")
 
         with pytest.raises(RuntimeError, match="model failed"):
             function_app.loadLeadsunData(make_timer_request())
 
         mock_raw_data.assert_not_called()
+        mock_timezones.assert_not_called()
+        mock_daylight_flags.assert_not_called()
         mock_vitals.assert_not_called()
 
-    def test_vitals_not_called_if_telemetry_fails(self, mocker):
+    def test_downstream_not_called_if_telemetry_fails(self, mocker):
         mocker.patch("function_app.load_pole_models")
         mocker.patch(
             "function_app.load_pole_telemetry", side_effect=RuntimeError("telemetry failed")
         )
+        mock_timezones = mocker.patch("function_app.load_pole_timezones")
+        mock_daylight_flags = mocker.patch("function_app.load_pole_daylight_flags")
         mock_vitals = mocker.patch("function_app.load_pole_vitals")
 
         with pytest.raises(RuntimeError, match="telemetry failed"):
+            function_app.loadLeadsunData(make_timer_request())
+
+        mock_timezones.assert_not_called()
+        mock_daylight_flags.assert_not_called()
+        mock_vitals.assert_not_called()
+
+    def test_downstream_not_called_if_timezones_fails(self, mocker):
+        mocker.patch("function_app.load_pole_models")
+        mocker.patch("function_app.load_pole_telemetry")
+        mocker.patch(
+            "function_app.load_pole_timezones", side_effect=RuntimeError("timezones failed")
+        )
+        mock_daylight_flags = mocker.patch("function_app.load_pole_daylight_flags")
+        mock_vitals = mocker.patch("function_app.load_pole_vitals")
+
+        with pytest.raises(RuntimeError, match="timezones failed"):
+            function_app.loadLeadsunData(make_timer_request())
+
+        mock_daylight_flags.assert_not_called()
+        mock_vitals.assert_not_called()
+
+    def test_vitals_not_called_if_daylight_flags_fails(self, mocker):
+        mocker.patch("function_app.load_pole_models")
+        mocker.patch("function_app.load_pole_telemetry")
+        mocker.patch("function_app.load_pole_timezones")
+        mocker.patch(
+            "function_app.load_pole_daylight_flags",
+            side_effect=RuntimeError("daylight flags failed"),
+        )
+        mock_vitals = mocker.patch("function_app.load_pole_vitals")
+
+        with pytest.raises(RuntimeError, match="daylight flags failed"):
             function_app.loadLeadsunData(make_timer_request())
 
         mock_vitals.assert_not_called()
@@ -387,13 +443,17 @@ class TestLoadLeadsunDataTimer:
     def test_does_not_touch_airtable_loaders(self, mocker):
         """loadLeadsunData is a separate function -- it must not call any
         of the Airtable-sourced loaders."""
-        mock_model, mock_raw_data, mock_vitals, _ = patch_leadsun_loaders(mocker)
+        mock_model, mock_raw_data, mock_timezones, mock_daylight_flags, mock_vitals, _ = (
+            patch_leadsun_loaders(mocker)
+        )
         mock_poles, mock_projects, mock_customers, _ = patch_all_loaders(mocker)
 
         function_app.loadLeadsunData(make_timer_request())
 
         mock_model.assert_called_once()
         mock_raw_data.assert_called_once()
+        mock_timezones.assert_called_once()
+        mock_daylight_flags.assert_called_once()
         mock_vitals.assert_called_once()
         mock_poles.assert_not_called()
         mock_projects.assert_not_called()
@@ -401,12 +461,16 @@ class TestLoadLeadsunDataTimer:
 
     def test_skips_entirely_when_environment_is_dev(self, mocker, monkeypatch):
         monkeypatch.setattr(function_app, "ENVIRONMENT", "Dev")
-        mock_model, mock_raw_data, mock_vitals, _ = patch_leadsun_loaders(mocker)
+        mock_model, mock_raw_data, mock_timezones, mock_daylight_flags, mock_vitals, _ = (
+            patch_leadsun_loaders(mocker)
+        )
 
         function_app.loadLeadsunData(make_timer_request())
 
         mock_model.assert_not_called()
         mock_raw_data.assert_not_called()
+        mock_timezones.assert_not_called()
+        mock_daylight_flags.assert_not_called()
         mock_vitals.assert_not_called()
 
     def test_dev_skip_logs_and_does_not_check_past_due(self, mocker, monkeypatch, caplog):
@@ -415,6 +479,8 @@ class TestLoadLeadsunDataTimer:
         monkeypatch.setattr(function_app, "ENVIRONMENT", "Dev")
         mocker.patch("function_app.load_pole_models")
         mocker.patch("function_app.load_pole_telemetry")
+        mocker.patch("function_app.load_pole_timezones")
+        mocker.patch("function_app.load_pole_daylight_flags")
         mocker.patch("function_app.load_pole_vitals")
 
         with caplog.at_level("INFO"):
@@ -429,41 +495,54 @@ class TestLoadLeadsunDataTimer:
 class TestLoadLeadsunDataManual:
     def test_blocked_in_prod(self, mocker, monkeypatch):
         monkeypatch.setattr(function_app, "ENVIRONMENT", "Prod")
-        mock_model, mock_raw_data, mock_vitals, _ = patch_leadsun_loaders(mocker)
+        mock_model, mock_raw_data, mock_timezones, mock_daylight_flags, mock_vitals, _ = (
+            patch_leadsun_loaders(mocker)
+        )
 
         response = function_app.loadLeadsunDataManual(make_leadsun_http_request())
 
         assert response.status_code == 403
         mock_model.assert_not_called()
         mock_raw_data.assert_not_called()
+        mock_timezones.assert_not_called()
+        mock_daylight_flags.assert_not_called()
         mock_vitals.assert_not_called()
 
     def test_runs_when_not_prod(self, mocker, monkeypatch):
         monkeypatch.setattr(function_app, "ENVIRONMENT", "Dev")
-        mock_model, mock_raw_data, mock_vitals, _ = patch_leadsun_loaders(mocker)
+        mock_model, mock_raw_data, mock_timezones, mock_daylight_flags, mock_vitals, _ = (
+            patch_leadsun_loaders(mocker)
+        )
 
         response = function_app.loadLeadsunDataManual(make_leadsun_http_request())
 
         assert response.status_code == 200
         assert response.get_body() == (
-            b"loadPoleModels + loadPoleTelemetry + loadPoleVitals run complete."
+            b"loadPoleModels + loadPoleTelemetry + loadPoleTimeZones + loadPoleDaylightFlags + "
+            b"loadPoleVitals run complete."
         )
         mock_model.assert_called_once()
         mock_raw_data.assert_called_once()
+        mock_timezones.assert_called_once()
+        mock_daylight_flags.assert_called_once()
         mock_vitals.assert_called_once()
 
-    def test_models_then_telemetry_then_vitals(self, mocker, monkeypatch):
+    def test_models_then_telemetry_then_timezones_then_daylight_flags_then_vitals(
+        self, mocker, monkeypatch
+    ):
         monkeypatch.setattr(function_app, "ENVIRONMENT", "Dev")
-        _, _, _, call_order = patch_leadsun_loaders(mocker)
+        _, _, _, _, _, call_order = patch_leadsun_loaders(mocker)
 
         function_app.loadLeadsunDataManual(make_leadsun_http_request())
 
-        assert call_order == ["model", "raw_data", "vitals"]
+        assert call_order == ["model", "raw_data", "timezones", "daylight_flags", "vitals"]
 
     def test_is_synchronous_exception_propagates_to_caller(self, mocker, monkeypatch):
         monkeypatch.setattr(function_app, "ENVIRONMENT", "Dev")
         mocker.patch("function_app.load_pole_models")
         mocker.patch("function_app.load_pole_telemetry")
+        mocker.patch("function_app.load_pole_timezones")
+        mocker.patch("function_app.load_pole_daylight_flags")
         mocker.patch("function_app.load_pole_vitals", side_effect=RuntimeError("leadsun down"))
 
         with pytest.raises(RuntimeError, match="leadsun down"):
@@ -473,12 +552,14 @@ class TestLoadLeadsunDataManual:
         monkeypatch.setattr(function_app, "ENVIRONMENT", "Dev")
         mocker.patch("function_app.load_pole_models", side_effect=RuntimeError("model failed"))
         mock_raw_data = mocker.patch("function_app.load_pole_telemetry")
+        mock_daylight_flags = mocker.patch("function_app.load_pole_daylight_flags")
         mock_vitals = mocker.patch("function_app.load_pole_vitals")
 
         with pytest.raises(RuntimeError, match="model failed"):
             function_app.loadLeadsunDataManual(make_leadsun_http_request())
 
         mock_raw_data.assert_not_called()
+        mock_daylight_flags.assert_not_called()
         mock_vitals.assert_not_called()
 
     def test_vitals_not_called_if_telemetry_fails(self, mocker, monkeypatch):
@@ -487,11 +568,13 @@ class TestLoadLeadsunDataManual:
         mocker.patch(
             "function_app.load_pole_telemetry", side_effect=RuntimeError("telemetry failed")
         )
+        mock_daylight_flags = mocker.patch("function_app.load_pole_daylight_flags")
         mock_vitals = mocker.patch("function_app.load_pole_vitals")
 
         with pytest.raises(RuntimeError, match="telemetry failed"):
             function_app.loadLeadsunDataManual(make_leadsun_http_request())
 
+        mock_daylight_flags.assert_not_called()
         mock_vitals.assert_not_called()
 
 
@@ -599,6 +682,46 @@ def make_get_projects_http_request(project_id=None, customer_id=None, limit=None
     return func.HttpRequest(
         method="GET",
         url="/api/getProjects",
+        headers={},
+        params=params,
+        body=b"",
+    )
+
+
+def make_get_pole_vitals_http_request(project_id=None, customer_id=None, limit=None):
+    params = {}
+    if project_id is not None:
+        params["projectId"] = project_id
+    if customer_id is not None:
+        params["customerId"] = customer_id
+    if limit is not None:
+        params["limit"] = limit
+    return func.HttpRequest(
+        method="GET",
+        url="/api/getPoleVitals",
+        headers={},
+        params=params,
+        body=b"",
+    )
+
+
+def make_get_poles_http_request(
+    pole_id=None, project_id=None, customer_id=None, limit=None, summary=None
+):
+    params = {}
+    if pole_id is not None:
+        params["poleId"] = pole_id
+    if project_id is not None:
+        params["projectId"] = project_id
+    if customer_id is not None:
+        params["customerId"] = customer_id
+    if limit is not None:
+        params["limit"] = limit
+    if summary is not None:
+        params["summary"] = summary
+    return func.HttpRequest(
+        method="GET",
+        url="/api/getPoles",
         headers={},
         params=params,
         body=b"",
@@ -726,6 +849,462 @@ class TestGetProjects:
         mocker.patch("function_app.get_projects", return_value=[])
 
         response = function_app.getProjects(make_get_projects_http_request())
+
+        assert response.status_code == 200
+        assert json.loads(response.get_body()) == []
+
+
+class TestGetPoleVitals:
+    """
+    Unlike getProjects, BOTH projectId and customerId are single-entity
+    lookups here (getPoleVitals's underlying get_pole_vitals() returns
+    None, not an empty list, for "not found" in either case) -- so both
+    get 404-on-not-found treatment, not the customerId-is-a-collection-
+    filter/empty-array-not-404 distinction getProjects has.
+    """
+
+    def test_no_params_returns_array_with_200(self, mocker):
+        mocker.patch(
+            "function_app.get_pole_vitals",
+            return_value=[
+                {"id": "cust1", "name": "Acme", "projects": [{"id": "proj1", "name": "Downtown"}]}
+            ],
+        )
+
+        response = function_app.getPoleVitals(make_get_pole_vitals_http_request())
+
+        assert response.status_code == 200
+        assert response.mimetype == "application/json"
+        body = json.loads(response.get_body())
+        assert body == [
+            {"id": "cust1", "name": "Acme", "projects": [{"id": "proj1", "name": "Downtown"}]}
+        ]
+
+    def test_project_id_returns_flat_object_with_200(self, mocker):
+        mock_get = mocker.patch(
+            "function_app.get_pole_vitals",
+            return_value={
+                "id": "proj1",
+                "name": "Downtown",
+                "totalLights": 10,
+                "workingPercentage": 80.0,
+                "totalFaults": 1,
+                "customerId": "cust1",
+                "customerName": "Acme",
+            },
+        )
+
+        response = function_app.getPoleVitals(
+            make_get_pole_vitals_http_request(project_id="proj1")
+        )
+
+        assert response.status_code == 200
+        body = json.loads(response.get_body())
+        assert body["id"] == "proj1"
+        assert body["customerId"] == "cust1"
+        mock_get.assert_called_once_with(project_id="proj1", customer_id=None, limit=None)
+
+    def test_project_id_not_found_returns_404(self, mocker):
+        mocker.patch("function_app.get_pole_vitals", return_value=None)
+
+        response = function_app.getPoleVitals(
+            make_get_pole_vitals_http_request(project_id="does-not-exist")
+        )
+
+        assert response.status_code == 404
+        body = json.loads(response.get_body())
+        assert "error" in body
+
+    def test_customer_id_alone_returns_flat_customer_object_with_200(self, mocker):
+        mock_get = mocker.patch(
+            "function_app.get_pole_vitals",
+            return_value={"id": "cust1", "name": "Acme", "projects": []},
+        )
+
+        response = function_app.getPoleVitals(
+            make_get_pole_vitals_http_request(customer_id="cust1")
+        )
+
+        assert response.status_code == 200
+        body = json.loads(response.get_body())
+        assert body == {"id": "cust1", "name": "Acme", "projects": []}
+        mock_get.assert_called_once_with(project_id=None, customer_id="cust1", limit=None)
+
+    def test_customer_id_not_found_returns_404_not_empty_array(self, mocker):
+        """
+        Key distinction from getProjects: customerId here identifies a
+        SINGLE customer (with nested projects), not a collection of
+        projects -- a nonexistent customer is a genuine 404, unlike
+        getProjects?customerId=X, where "no matches" is a valid empty
+        array. A customer with zero PROJECTS (a different, valid state)
+        is handled entirely inside get_pole_vitals() -- it returns
+        {"projects": []} for that case, not None, so this 404 path is
+        specifically "the customer itself doesn't exist".
+        """
+        mocker.patch("function_app.get_pole_vitals", return_value=None)
+
+        response = function_app.getPoleVitals(
+            make_get_pole_vitals_http_request(customer_id="does-not-exist")
+        )
+
+        assert response.status_code == 404
+        body = json.loads(response.get_body())
+        assert "error" in body
+
+    def test_project_id_and_customer_id_both_passed_through(self, mocker):
+        mock_get = mocker.patch(
+            "function_app.get_pole_vitals",
+            return_value={"id": "proj1", "customerId": "cust1"},
+        )
+
+        response = function_app.getPoleVitals(
+            make_get_pole_vitals_http_request(project_id="proj1", customer_id="cust1")
+        )
+
+        assert response.status_code == 200
+        mock_get.assert_called_once_with(project_id="proj1", customer_id="cust1", limit=None)
+
+    def test_project_id_and_customer_id_combined_not_found_returns_404(self, mocker):
+        """e.g. a real project Id that belongs to a DIFFERENT customer
+        than the one specified."""
+        mocker.patch("function_app.get_pole_vitals", return_value=None)
+
+        response = function_app.getPoleVitals(
+            make_get_pole_vitals_http_request(project_id="proj1", customer_id="wrong-customer")
+        )
+
+        assert response.status_code == 404
+
+    def test_limit_is_parsed_and_passed_through(self, mocker):
+        mock_get = mocker.patch("function_app.get_pole_vitals", return_value=[])
+
+        function_app.getPoleVitals(make_get_pole_vitals_http_request(limit="5"))
+
+        mock_get.assert_called_once_with(project_id=None, customer_id=None, limit=5)
+
+    def test_non_numeric_limit_returns_400_without_querying(self, mocker):
+        mock_get = mocker.patch("function_app.get_pole_vitals")
+
+        response = function_app.getPoleVitals(make_get_pole_vitals_http_request(limit="abc"))
+
+        assert response.status_code == 400
+        mock_get.assert_not_called()
+
+    def test_query_failure_returns_500_not_a_raw_exception(self, mocker):
+        mocker.patch(
+            "function_app.get_pole_vitals", side_effect=RuntimeError("db down")
+        )
+
+        response = function_app.getPoleVitals(make_get_pole_vitals_http_request())
+
+        assert response.status_code == 500
+        body = json.loads(response.get_body())
+        assert "error" in body
+
+    def test_response_is_valid_json_even_for_empty_list(self, mocker):
+        mocker.patch("function_app.get_pole_vitals", return_value=[])
+
+        response = function_app.getPoleVitals(make_get_pole_vitals_http_request())
+
+        assert response.status_code == 200
+        assert json.loads(response.get_body()) == []
+
+
+class TestGetPoles:
+    """
+    poleId is a single-entity lookup (404-on-not-found), matching
+    getCustomers/getProjects/getPoleVitals's convention for a specific-
+    entity id param. projectId/customerId (without poleId) are
+    collection filters (empty array, not 404), matching
+    getProjects?customerId=X's convention.
+    """
+
+    def test_no_params_returns_array_with_200(self, mocker):
+        mocker.patch(
+            "function_app.get_poles",
+            return_value=[{"id": "pole1", "poleNumber": "PN-001", "projectId": "proj1"}],
+        )
+
+        response = function_app.getPoles(make_get_poles_http_request())
+
+        assert response.status_code == 200
+        assert response.mimetype == "application/json"
+        body = json.loads(response.get_body())
+        assert body == [{"id": "pole1", "poleNumber": "PN-001", "projectId": "proj1"}]
+
+    def test_pole_id_returns_single_object_with_200(self, mocker):
+        mock_get = mocker.patch(
+            "function_app.get_poles",
+            return_value={"id": "pole1", "poleNumber": "PN-001", "projectId": "proj1"},
+        )
+
+        response = function_app.getPoles(make_get_poles_http_request(pole_id="pole1"))
+
+        assert response.status_code == 200
+        body = json.loads(response.get_body())
+        assert body["id"] == "pole1"
+        mock_get.assert_called_once_with(
+            pole_id="pole1", project_id=None, customer_id=None, limit=None, summary=False
+        )
+
+    def test_pole_id_not_found_returns_404(self, mocker):
+        mocker.patch("function_app.get_poles", return_value=None)
+
+        response = function_app.getPoles(make_get_poles_http_request(pole_id="does-not-exist"))
+
+        assert response.status_code == 404
+        body = json.loads(response.get_body())
+        assert "error" in body
+
+    def test_project_id_alone_returns_array_with_200_not_404_when_empty(self, mocker):
+        mock_get = mocker.patch("function_app.get_poles", return_value=[])
+
+        response = function_app.getPoles(make_get_poles_http_request(project_id="proj-empty"))
+
+        assert response.status_code == 200
+        assert json.loads(response.get_body()) == []
+        mock_get.assert_called_once_with(
+            pole_id=None, project_id="proj-empty", customer_id=None, limit=None, summary=False
+        )
+
+    def test_customer_id_alone_returns_array_with_200(self, mocker):
+        mock_get = mocker.patch(
+            "function_app.get_poles",
+            return_value=[{"id": "pole1", "poleNumber": "PN-001", "projectId": "proj1"}],
+        )
+
+        response = function_app.getPoles(make_get_poles_http_request(customer_id="cust1"))
+
+        assert response.status_code == 200
+        mock_get.assert_called_once_with(
+            pole_id=None, project_id=None, customer_id="cust1", limit=None, summary=False
+        )
+
+    def test_pole_id_and_project_id_both_passed_through(self, mocker):
+        mock_get = mocker.patch(
+            "function_app.get_poles",
+            return_value={"id": "pole1", "projectId": "proj1"},
+        )
+
+        response = function_app.getPoles(
+            make_get_poles_http_request(pole_id="pole1", project_id="proj1")
+        )
+
+        assert response.status_code == 200
+        mock_get.assert_called_once_with(
+            pole_id="pole1", project_id="proj1", customer_id=None, limit=None, summary=False
+        )
+
+    def test_pole_id_belonging_to_different_project_returns_404(self, mocker):
+        mocker.patch("function_app.get_poles", return_value=None)
+
+        response = function_app.getPoles(
+            make_get_poles_http_request(pole_id="pole1", project_id="wrong-project")
+        )
+
+        assert response.status_code == 404
+
+    def test_limit_is_parsed_and_passed_through(self, mocker):
+        mock_get = mocker.patch("function_app.get_poles", return_value=[])
+
+        function_app.getPoles(make_get_poles_http_request(limit="5"))
+
+        mock_get.assert_called_once_with(
+            pole_id=None, project_id=None, customer_id=None, limit=5, summary=False
+        )
+
+    def test_non_numeric_limit_returns_400_without_querying(self, mocker):
+        mock_get = mocker.patch("function_app.get_poles")
+
+        response = function_app.getPoles(make_get_poles_http_request(limit="abc"))
+
+        assert response.status_code == 400
+        mock_get.assert_not_called()
+
+    def test_query_failure_returns_500_not_a_raw_exception(self, mocker):
+        mocker.patch("function_app.get_poles", side_effect=RuntimeError("db down"))
+
+        response = function_app.getPoles(make_get_poles_http_request())
+
+        assert response.status_code == 500
+        body = json.loads(response.get_body())
+        assert "error" in body
+
+    def test_response_is_valid_json_even_for_empty_list(self, mocker):
+        mocker.patch("function_app.get_poles", return_value=[])
+
+        response = function_app.getPoles(make_get_poles_http_request())
+
+        assert response.status_code == 200
+        assert json.loads(response.get_body()) == []
+
+    def test_summary_true_is_parsed_and_passed_through(self, mocker):
+        mock_get = mocker.patch("function_app.get_poles", return_value=[])
+
+        function_app.getPoles(make_get_poles_http_request(summary="true"))
+
+        mock_get.assert_called_once_with(
+            pole_id=None, project_id=None, customer_id=None, limit=None, summary=True
+        )
+
+    def test_summary_is_case_insensitive(self, mocker):
+        mock_get = mocker.patch("function_app.get_poles", return_value=[])
+
+        function_app.getPoles(make_get_poles_http_request(summary="TRUE"))
+
+        mock_get.assert_called_once_with(
+            pole_id=None, project_id=None, customer_id=None, limit=None, summary=True
+        )
+
+    def test_summary_1_is_also_treated_as_true(self, mocker):
+        mock_get = mocker.patch("function_app.get_poles", return_value=[])
+
+        function_app.getPoles(make_get_poles_http_request(summary="1"))
+
+        mock_get.assert_called_once_with(
+            pole_id=None, project_id=None, customer_id=None, limit=None, summary=True
+        )
+
+    def test_summary_absent_defaults_to_false(self, mocker):
+        mock_get = mocker.patch("function_app.get_poles", return_value=[])
+
+        function_app.getPoles(make_get_poles_http_request())
+
+        mock_get.assert_called_once_with(
+            pole_id=None, project_id=None, customer_id=None, limit=None, summary=False
+        )
+
+    def test_summary_false_string_is_treated_as_false(self, mocker):
+        mock_get = mocker.patch("function_app.get_poles", return_value=[])
+
+        function_app.getPoles(make_get_poles_http_request(summary="false"))
+
+        mock_get.assert_called_once_with(
+            pole_id=None, project_id=None, customer_id=None, limit=None, summary=False
+        )
+
+
+
+def make_get_users_http_request(user_id=None, customer_id=None, limit=None):
+    params = {}
+    if user_id is not None:
+        params["userId"] = user_id
+    if customer_id is not None:
+        params["customerId"] = customer_id
+    if limit is not None:
+        params["limit"] = limit
+    return func.HttpRequest(
+        method="GET",
+        url="/api/getUsers",
+        headers={},
+        params=params,
+        body=b"",
+    )
+
+
+class TestGetUsers:
+    """
+    userId is the single-entity lookup (404-on-not-found), matching
+    getCustomers/getProjects/getPoleVitals/getPoles's convention for a
+    specific-entity id param. customerId (without userId) is a
+    collection filter (empty array, not 404), matching
+    getProjects/getPoles' customerId convention.
+    """
+
+    def test_no_ids_returns_array_with_200(self, mocker):
+        mocker.patch(
+            "function_app.get_users",
+            return_value=[{"id": "user1", "name": "Jane Doe", "customerName": "Acme"}],
+        )
+
+        response = function_app.getUsers(make_get_users_http_request())
+
+        assert response.status_code == 200
+        assert response.mimetype == "application/json"
+        body = json.loads(response.get_body())
+        assert body == [{"id": "user1", "name": "Jane Doe", "customerName": "Acme"}]
+
+    def test_user_id_returns_single_object_with_200(self, mocker):
+        mock_get = mocker.patch(
+            "function_app.get_users",
+            return_value=[{"id": "user1", "name": "Jane Doe"}],
+        )
+
+        response = function_app.getUsers(make_get_users_http_request(user_id="user1"))
+
+        assert response.status_code == 200
+        body = json.loads(response.get_body())
+        assert body == {"id": "user1", "name": "Jane Doe"}
+        mock_get.assert_called_once_with(user_id="user1", customer_id=None, limit=None)
+
+    def test_user_id_not_found_returns_404(self, mocker):
+        mocker.patch("function_app.get_users", return_value=[])
+
+        response = function_app.getUsers(make_get_users_http_request(user_id="does-not-exist"))
+
+        assert response.status_code == 404
+        body = json.loads(response.get_body())
+        assert "error" in body
+
+    def test_customer_id_alone_returns_array_with_200_not_404_when_empty(self, mocker):
+        mock_get = mocker.patch("function_app.get_users", return_value=[])
+
+        response = function_app.getUsers(make_get_users_http_request(customer_id="cust-empty"))
+
+        assert response.status_code == 200
+        assert json.loads(response.get_body()) == []
+        mock_get.assert_called_once_with(user_id=None, customer_id="cust-empty", limit=None)
+
+    def test_user_id_and_customer_id_both_passed_through(self, mocker):
+        mock_get = mocker.patch(
+            "function_app.get_users",
+            return_value=[{"id": "user1", "customerId": "cust1"}],
+        )
+
+        response = function_app.getUsers(
+            make_get_users_http_request(user_id="user1", customer_id="cust1")
+        )
+
+        assert response.status_code == 200
+        mock_get.assert_called_once_with(user_id="user1", customer_id="cust1", limit=None)
+
+    def test_user_belonging_to_different_customer_returns_404(self, mocker):
+        mocker.patch("function_app.get_users", return_value=[])
+
+        response = function_app.getUsers(
+            make_get_users_http_request(user_id="user1", customer_id="wrong-customer")
+        )
+
+        assert response.status_code == 404
+
+    def test_limit_is_parsed_and_passed_through(self, mocker):
+        mock_get = mocker.patch("function_app.get_users", return_value=[])
+
+        function_app.getUsers(make_get_users_http_request(limit="5"))
+
+        mock_get.assert_called_once_with(user_id=None, customer_id=None, limit=5)
+
+    def test_non_numeric_limit_returns_400_without_querying(self, mocker):
+        mock_get = mocker.patch("function_app.get_users")
+
+        response = function_app.getUsers(make_get_users_http_request(limit="abc"))
+
+        assert response.status_code == 400
+        mock_get.assert_not_called()
+
+    def test_query_failure_returns_500_not_a_raw_exception(self, mocker):
+        mocker.patch("function_app.get_users", side_effect=RuntimeError("db down"))
+
+        response = function_app.getUsers(make_get_users_http_request())
+
+        assert response.status_code == 500
+        body = json.loads(response.get_body())
+        assert "error" in body
+
+    def test_response_is_valid_json_even_for_empty_list(self, mocker):
+        mocker.patch("function_app.get_users", return_value=[])
+
+        response = function_app.getUsers(make_get_users_http_request())
 
         assert response.status_code == 200
         assert json.loads(response.get_body()) == []

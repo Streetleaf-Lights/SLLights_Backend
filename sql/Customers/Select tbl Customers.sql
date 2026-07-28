@@ -12,4 +12,5 @@ SELECT TOP (1000) [Id]
   FROM [dbo].[Customers]
   WHERE 1 = 1
   -- AND [Id] = 'recwx649JfiRmWqxF'
+  and name = 'Streetleaf'
   ORDER BY [AirTableCreatedDateTime] DESC

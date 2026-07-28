@@ -34,7 +34,7 @@ import re
 
 import pytest
 
-from shared import customers_loader, projects_loader, poles_loader, pole_telemetry_loader, pole_models_loader, pole_vitals_loader
+from shared import customers_loader, projects_loader, poles_loader, pole_telemetry_loader, pole_models_loader, pole_vitals_loader, pole_timezones_loader, pole_daylight_flags_loader
 
 
 # --------------------------------------------------------------------------
@@ -327,6 +327,8 @@ class TestPoleVitalsSchemaConsistency:
         "AvgBatteryPercentage",
         "AvgPanelPercentage",
         "AvgLightPercentage",
+        "IsOnline",
+        "LightStatus",
         "RecordCount",
         "Source",
         "SP_ExecId",
@@ -346,6 +348,38 @@ class TestPoleVitalsSchemaConsistency:
         assignments = match.group(1).strip().rstrip(",").split(",")
         cols = {a.split("=")[0].strip() for a in assignments}
         assert cols == self._EXPECTED_COLUMNS - {"LocationId", "PeriodType", "PeriodStart"}
+
+
+class TestPoleTimeZonesSchemaConsistency:
+    """
+    PoleTimeZones has no _ALL_COLUMNS source of truth like the ETL
+    loaders (it's a single hand-written MERGE, not a generic
+    fetch-map-upsert pipeline), so this hardcodes the expected column set
+    from the DDL and cross-checks the upsert SQL against it directly.
+    """
+
+    _EXPECTED_COLUMNS = {
+        "LocationId",
+        "Longitude",
+        "Latitude",
+        "IanaTimeZone",
+        "WindowsTimeZone",
+        "Source",
+        "SP_ExecId",
+    }
+
+    def test_insert_column_list_matches_expected_schema(self):
+        sql = pole_timezones_loader._UPSERT_TIMEZONE_SQL
+        match = re.search(r"INSERT \(([^)]+)\)", sql)
+        cols = {c.strip() for c in match.group(1).split(",")}
+        assert cols == self._EXPECTED_COLUMNS
+
+    def test_update_set_columns_never_touch_the_match_key(self):
+        sql = pole_timezones_loader._UPSERT_TIMEZONE_SQL
+        match = re.search(r"THEN UPDATE SET\s*(.+?)\s*WHEN NOT MATCHED", sql, re.DOTALL)
+        assignments = match.group(1).strip().rstrip(",").split(",")
+        cols = {a.split("=")[0].strip() for a in assignments}
+        assert cols == self._EXPECTED_COLUMNS - {"LocationId"}
 
 
 class TestWorkweekSchemaConsistency:
@@ -435,7 +469,7 @@ _LEADSUN_LIVE_TESTS_ENABLED = os.environ.get("RUN_LIVE_LEADSUN_INTEGRATION_TEST"
     ),
 )
 class TestLeadsunLiveIntegration:
-    def test_load_pole_models_then_telemetry_then_vitals_against_real_leadsun_api_and_sql(self):
+    def test_load_pole_models_then_telemetry_then_timezones_then_daylight_flags_then_vitals_against_real_leadsun_api_and_sql(self):
         assert os.environ.get("ENVIRONMENT", "Dev") != "Prod", (
             "Refusing to run the live integration test with ENVIRONMENT=Prod. "
             "Point this at a Dev/Staging environment."
@@ -444,9 +478,14 @@ class TestLeadsunLiveIntegration:
 
         importlib.reload(pole_models_loader)
         importlib.reload(pole_telemetry_loader)
+        importlib.reload(pole_timezones_loader)
+        importlib.reload(pole_daylight_flags_loader)
         importlib.reload(pole_vitals_loader)
 
-        # Same order as function_app.py's loadLeadsunData: Models -> Telemetry -> Vitals.
+        # Same order as function_app.py's loadLeadsunData:
+        # Models -> Telemetry -> TimeZones -> DaylightFlags -> Vitals.
         pole_models_loader.load_pole_models()  # will raise on failure -- that's the assertion
         pole_telemetry_loader.load_pole_telemetry()
+        pole_timezones_loader.load_pole_timezones()
+        pole_daylight_flags_loader.load_pole_daylight_flags()
         pole_vitals_loader.load_pole_vitals()

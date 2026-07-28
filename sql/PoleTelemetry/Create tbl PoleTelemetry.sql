@@ -81,6 +81,10 @@ BEGIN
         ControlModelCode       VARCHAR(50)       NULL,
         ControlModelName       NVARCHAR(100)     NULL,
         ExtraFieldsJson        NVARCHAR(MAX)     NULL,  -- safety net for any field not listed above
+        IsDaylight             BIT               NULL,  -- computed once by pole_daylight_flags_loader.py,
+                                                          -- from PoleTimeZones' Lat/Long (NOT this table's
+                                                          -- own Longitude/Latitude) -- see that loader's
+                                                          -- module docstring for why
         PRIMARY KEY (LocationId, LastUpload)
     );
 
@@ -89,4 +93,11 @@ BEGIN
 
     CREATE NONCLUSTERED INDEX IX_PoleTelemetry_SP_ExecId
         ON PoleTelemetry (SP_ExecId);
+
+    CREATE NONCLUSTERED INDEX IX_PoleTelemetry_IsDaylight
+        ON PoleTelemetry (IsDaylight)
+        WHERE IsDaylight IS NULL;  -- filtered index -- this is exactly what
+                                   -- pole_daylight_flags_loader.py's find-unflagged
+                                   -- query filters on, and NULL rows are a small,
+                                   -- shrinking subset of the table, not most of it
 END

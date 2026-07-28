@@ -42,4 +42,6 @@ BEGIN
 
     CREATE NONCLUSTERED INDEX IX_Workweek_StartDate
         ON Workweek (StartDate);  -- for "which week does date X fall in" lookups
+
+        CREATE NONCLUSTERED INDEX IX_Workweek_StartDate_EndDate ON Workweek (StartDate, EndDate);
 END
