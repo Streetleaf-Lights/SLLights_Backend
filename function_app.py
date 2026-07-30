@@ -16,9 +16,19 @@ from shared.pole_daylight_flags_loader import load_pole_daylight_flags
 from shared.pole_vitals_loader import load_pole_vitals
 from shared.customers_api import get_customers
 from shared.projects_api import get_projects
-from shared.pole_vitals_api import get_pole_vitals
+from shared.pole_vitals_api import get_pole_vitals, get_pole_vitals_by_period
 from shared.poles_api import get_poles
 from shared.users_api import get_users
+from shared.auth_utils import AuthError, require_auth
+from shared.users_management_api import (
+    delete_user,
+    forgot_password,
+    invite_user,
+    register_user,
+    reset_password,
+    sign_in,
+    sign_out,
+)
 
 app = func.FunctionApp()
 
@@ -101,11 +111,13 @@ def loadAirTableDataManual(req: func.HttpRequest) -> func.HttpResponse:
     load_customers()
     logging.info("loadAirTableDataManual: run complete.")
 
-    return func.HttpResponse("loadPoles + loadProjects + loadCustomers run complete.", status_code=200)
+    return func.HttpResponse(
+        "loadPoles + loadProjects + loadCustomers run complete.", status_code=200
+    )
 
 
 # Separate from loadAirTableData on purpose -- different source (Leadsun,
-# not Airtable), different cadence (every 10 minutes, not twice a day), and
+# not Airtable), different cadence (every 30 minutes, not twice a day), and
 # no dependency between the two: this pipeline doesn't join against
 # Poles/Projects/Customers, so there's no load-order concern with the
 # Airtable pipeline either way.
@@ -126,14 +138,15 @@ def loadAirTableDataManual(req: func.HttpRequest) -> func.HttpResponse:
 # for why this can't just be inline SQL), and PoleVitals depends on all
 # four already being current for this cycle.
 #
-# schedule: reverted from every 30 minutes back to every 10, now that
-# Week/Month have been removed from loadPoleVitals entirely (see that
-# loader's module docstring and the README for the full history) -- Week
-# alone was the dominant cost of every run, ~15+ minutes out of a
-# ~20-25 minute total, which is what originally motivated widening this
-# to 30 minutes in the first place (a 10-minute schedule can't keep up
-# with a 20-25 minute run). With Week/Month gone, a normal cycle should
-# comfortably fit back within 10 minutes.
+# schedule history, for anyone wondering why this keeps moving: 10
+# minutes originally -> widened to 30 when Week/Month (since removed
+# entirely from loadPoleVitals) made a normal run take ~20-25 minutes,
+# too long for a 10-minute schedule to keep up with -> reverted back to
+# 10 once Week/Month were gone and runs got fast again -> now back to 30
+# again. This latest change wasn't accompanied by a specific new reason
+# recorded here -- if a future run-time regression is what prompted it,
+# it's worth writing that down here when it's known, the same way the
+# earlier changes above are documented.
 #
 # use_monitor stays False regardless of the schedule interval -- this
 # isn't specific to the 10-vs-30-minute question. "Catching up" on a
@@ -149,7 +162,7 @@ def loadAirTableDataManual(req: func.HttpRequest) -> func.HttpResponse:
 # Singleton Lock still separately guarantees no actual overlapping runs,
 # regardless of this setting.
 @app.timer_trigger(
-    schedule="0 */10 * * * *",
+    schedule="0 */30 * * * *",
     arg_name="myTimer",
     run_on_startup=False,
     use_monitor=False,
@@ -174,7 +187,7 @@ def loadLeadsunData(myTimer: func.TimerRequest) -> None:
     logging.info("loadLeadsunData: run complete.")
 
 
-# Manual trigger for testing outside the 10-minute schedule -- same
+# Manual trigger for testing outside the 30-minute schedule -- same
 # Prod-blocking convention as loadAirTableDataManual, and unaffected by
 # loadLeadsunData's Dev-skip above -- in Dev, this is the only way to
 # trigger a run at all.
@@ -576,3 +589,301 @@ def getUsers(req: func.HttpRequest) -> func.HttpResponse:
     return func.HttpResponse(
         json.dumps(users), status_code=200, mimetype="application/json"
     )
+
+
+# --------------------------------------------------------------------------
+# User management -- invite/register/sign-in/sign-out/forgot-reset-password/
+# delete. Genuinely different in kind from every other endpoint above: these
+# manage real user accounts and credentials, not read-only reporting data,
+# and (unlike every getX endpoint here) most of them enforce their own
+# application-level authentication/authorization on top of the Azure
+# Function key every route already sits behind -- the function key alone
+# only proves "this caller is the website's own backend", not "this caller
+# is a specific, signed-in human with a specific role".
+#
+# FOLLOW-UP, not done as part of this change: getCustomers/getProjects/
+# getPoles/getPoleVitals/getUsers above don't call require_auth() at all
+# yet, so a Customer Admin's requests aren't actually scoped to their own
+# CustomerId yet -- they can currently see every customer's data, same as a
+# Streetleaf Admin would. Retrofitting that is a separate, contained change:
+# call require_auth() at the top of each of those, then (when
+# ctx.role != "Streetleaf Admin") filter/verify against ctx.customer_id the
+# same way invite_user()/delete_user() already enforce their own
+# Streetleaf-Admin-only restriction. Worth doing before this goes live for
+# real Customer Admin users.
+
+
+def _auth_error_response(ex: AuthError) -> func.HttpResponse:
+    return func.HttpResponse(
+        json.dumps({"error": str(ex)}),
+        status_code=ex.status_code,
+        mimetype="application/json",
+    )
+
+
+@app.route(route="inviteUser", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def inviteUser(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Streetleaf-Admin-only: creates a Pending user and emails them an
+    invite link. Body: {"name": ..., "email": ..., "role": "Customer
+    Admin" | "Streetleaf Admin", "customerId": ... (required iff role is
+    "Customer Admin")}.
+    """
+    try:
+        ctx = require_auth(req)
+        body = req.get_json()
+        result = invite_user(
+            ctx,
+            name=body.get("name"),
+            email=body.get("email"),
+            role=body.get("role"),
+            customer_id=body.get("customerId"),
+        )
+    except AuthError as ex:
+        return _auth_error_response(ex)
+    except Exception as ex:
+        logging.error("inviteUser: failed: %s", ex)
+        return func.HttpResponse(
+            json.dumps({"error": "internal error"}),
+            status_code=500,
+            mimetype="application/json",
+        )
+
+    return func.HttpResponse(
+        json.dumps(result), status_code=201, mimetype="application/json"
+    )
+
+
+@app.route(route="registerUser", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def registerUser(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Public (no signed-in caller yet -- the invite token itself is the
+    authorization for this one-time action). Body: {"token": ...,
+    "password": ...}. Completes account setup and signs the new user in
+    (returns a session token), same shape as signIn's response.
+    """
+    try:
+        body = req.get_json()
+        result = register_user(token=body.get("token"), password=body.get("password"))
+    except AuthError as ex:
+        return _auth_error_response(ex)
+    except Exception as ex:
+        logging.error("registerUser: failed: %s", ex)
+        return func.HttpResponse(
+            json.dumps({"error": "internal error"}),
+            status_code=500,
+            mimetype="application/json",
+        )
+
+    return func.HttpResponse(
+        json.dumps(result), status_code=200, mimetype="application/json"
+    )
+
+
+@app.route(route="signIn", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def signIn(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Public. Body: {"email": ..., "password": ...}. Deliberately generic
+    401 for every failure reason (wrong password, no such email, account
+    not Active yet) -- see users_management_api.py's own docstring for
+    why this isn't a bug.
+    """
+    try:
+        body = req.get_json()
+        result = sign_in(email=body.get("email"), password=body.get("password"))
+    except AuthError as ex:
+        return _auth_error_response(ex)
+    except Exception as ex:
+        logging.error("signIn: failed: %s", ex)
+        return func.HttpResponse(
+            json.dumps({"error": "internal error"}),
+            status_code=500,
+            mimetype="application/json",
+        )
+
+    return func.HttpResponse(
+        json.dumps(result), status_code=200, mimetype="application/json"
+    )
+
+
+@app.route(route="signOut", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def signOut(req: func.HttpRequest) -> func.HttpResponse:
+    """Requires Authorization: Bearer <token>. Revokes the caller's own
+    current session -- immediately, not just client-side token disposal."""
+    try:
+        ctx = require_auth(req)
+        sign_out(ctx)
+    except AuthError as ex:
+        return _auth_error_response(ex)
+    except Exception as ex:
+        logging.error("signOut: failed: %s", ex)
+        return func.HttpResponse(
+            json.dumps({"error": "internal error"}),
+            status_code=500,
+            mimetype="application/json",
+        )
+
+    return func.HttpResponse(
+        json.dumps({"success": True}), status_code=200, mimetype="application/json"
+    )
+
+
+@app.route(route="forgotPassword", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def forgotPassword(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Public. Body: {"email": ...}. ALWAYS returns the same generic
+    success message regardless of whether that email actually exists in
+    the system -- do not change this to report failure differently for
+    an unrecognized email; that would defeat the whole anti-enumeration
+    point of this endpoint.
+    """
+    try:
+        body = req.get_json()
+        forgot_password(email=body.get("email"))
+    except Exception as ex:
+        # Deliberately not distinguishing AuthError from anything else
+        # here, and deliberately not letting ANY failure mode change
+        # this response -- forgot_password() itself never raises for a
+        # normal "no such email" case (see its own docstring), so
+        # reaching this except block at all means something genuinely
+        # unexpected happened. Still logged, but the response to the
+        # caller stays identical either way.
+        logging.error("forgotPassword: unexpected error: %s", ex)
+
+    return func.HttpResponse(
+        json.dumps({"message": "If that email exists, a reset link has been sent."}),
+        status_code=200,
+        mimetype="application/json",
+    )
+
+
+@app.route(route="resetPassword", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def resetPassword(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Public (the reset token itself is the authorization). Body:
+    {"token": ..., "newPassword": ...}. Also revokes every one of that
+    user's currently-active sessions -- see reset_password()'s own
+    docstring for why.
+    """
+    try:
+        body = req.get_json()
+        reset_password(token=body.get("token"), new_password=body.get("newPassword"))
+    except AuthError as ex:
+        return _auth_error_response(ex)
+    except Exception as ex:
+        logging.error("resetPassword: failed: %s", ex)
+        return func.HttpResponse(
+            json.dumps({"error": "internal error"}),
+            status_code=500,
+            mimetype="application/json",
+        )
+
+    return func.HttpResponse(
+        json.dumps({"success": True}), status_code=200, mimetype="application/json"
+    )
+
+
+@app.route(route="deleteUser", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def deleteUser(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Streetleaf-Admin-only: deactivates a user (soft delete -- see
+    delete_user()'s own docstring) and revokes their active sessions.
+    Query param: ?userId=X.
+    """
+    try:
+        ctx = require_auth(req)
+        target_user_id = req.params.get("userId")
+        delete_user(ctx, target_user_id)
+    except AuthError as ex:
+        return _auth_error_response(ex)
+    except Exception as ex:
+        logging.error("deleteUser: failed: %s", ex)
+        return func.HttpResponse(
+            json.dumps({"error": "internal error"}),
+            status_code=500,
+            mimetype="application/json",
+        )
+
+    return func.HttpResponse(
+        json.dumps({"success": True}), status_code=200, mimetype="application/json"
+    )
+
+
+# --------------------------------------------------------------------------
+# getPoleVitalsByPeriod -- a different shape from getPoleVitals: a single
+# pole's FULL HISTORY of PoleVitals rows for a SPECIFIC, caller-chosen
+# period type, each read directly -- no 6-hour rollup, no averaging across
+# rows, no priority-based LightStatus aggregation across a window.
+# batteryVoltage1/batteryVoltage2 are not included (dropped per explicit
+# request, along with the PoleTelemetry join that would otherwise be
+# needed for them). Use this to see every one of this pole's own Hour
+# buckets (or Day buckets) as-is; use getPoleVitals/getPoles for a
+# steadier current-status signal.
+@app.route(route="getPoleVitalsByPeriod", methods=["GET"], auth_level=func.AuthLevel.FUNCTION)
+def getPoleVitalsByPeriod(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Query params:
+      poleId -- required.
+      periodType -- required. 'Hour' or 'Day' (Week/Month were removed
+        from PoleVitals entirely -- see pole_vitals_loader.py's own
+        module docstring and the README for that history).
+      limit -- optional, default/max per shared/api_utils.py. Max number
+        of history entries returned, most-recent-first. PoleVitals has
+        no retention/cleanup of its own, so this is never truly
+        "everything that has ever existed" with no bound at all.
+
+    Returns the pole's static info (id, poleNumber, locationId,
+    installDate, lat, long, lastUpdate) plus a "vitals" list, one entry
+    per PoleVitals row (periodStart, periodEnd, lightStatus, isOnline,
+    avgBatteryPercentage, avgPanelPercentage, avgLightPercentage).
+
+    404 only if no pole exists with that id. If the pole exists but has
+    no PoleVitals rows of the requested periodType yet, "vitals" comes
+    back as an empty list, not a 404 -- the pole itself was found, it
+    just has no history yet for that period type.
+    """
+    pole_id = req.params.get("poleId")
+    period_type = req.params.get("periodType")
+    limit_param = req.params.get("limit")
+
+    if not pole_id:
+        return func.HttpResponse(
+            json.dumps({"error": "poleId is required"}),
+            status_code=400,
+            mimetype="application/json",
+        )
+    if not period_type:
+        return func.HttpResponse(
+            json.dumps({"error": "periodType is required"}),
+            status_code=400,
+            mimetype="application/json",
+        )
+    if limit_param is not None and not limit_param.isdigit():
+        return func.HttpResponse(
+            json.dumps({"error": "limit must be a positive integer"}),
+            status_code=400,
+            mimetype="application/json",
+        )
+
+    try:
+        result = get_pole_vitals_by_period(
+            pole_id=pole_id,
+            period_type=period_type,
+            limit=int(limit_param) if limit_param else None,
+        )
+    except ValueError as ex:
+        return func.HttpResponse(
+            json.dumps({"error": str(ex)}), status_code=400, mimetype="application/json"
+        )
+    except Exception as ex:
+        logging.error("getPoleVitalsByPeriod: query failed: %s", ex)
+        return func.HttpResponse(
+            json.dumps({"error": "internal error"}), status_code=500, mimetype="application/json"
+        )
+
+    if result is None:
+        return func.HttpResponse(
+            json.dumps({"error": "pole not found"}), status_code=404, mimetype="application/json"
+        )
+
+    return func.HttpResponse(json.dumps(result), status_code=200, mimetype="application/json")

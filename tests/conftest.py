@@ -15,11 +15,12 @@ os.environ.setdefault("AIRTABLE_API_KEY", "test-airtable-key")
 os.environ.setdefault("AIRTABLE_BASE_ID", "test-base-id")
 os.environ.setdefault("SQL_CONNECTION_STRING", "test-connection-string")
 os.environ.setdefault("ENVIRONMENT", "Dev")
-os.environ.setdefault(
-    "LEADSUN_CLIENT_CERT_PEM",
-    "-----BEGIN CERTIFICATE-----\ntest-cert\n-----END CERTIFICATE-----\n"
-    "-----BEGIN PRIVATE KEY-----\ntest-key\n-----END PRIVATE KEY-----\n",
-)
+os.environ.setdefault("AUTH_JWT_SECRET", "test-jwt-secret")
+os.environ.setdefault("MS365_TENANT_ID", "test-tenant-id")
+os.environ.setdefault("MS365_CLIENT_ID", "test-client-id")
+os.environ.setdefault("MS365_CLIENT_SECRET", "test-client-secret")
+os.environ.setdefault("MS365_SENDER_EMAIL", "noreply@test.streetleaf.com")
+os.environ.setdefault("APP_BASE_URL", "https://app.test.streetleaf.com")
 
 import json
 from unittest.mock import MagicMock
@@ -134,46 +135,6 @@ def patch_get_connection(mocker, mock_conn):
 
 
 @pytest.fixture
-def patch_get_connection_customers_api(mocker, mock_conn):
-    """Patches shared.customers_api.get_connection to return mock_conn."""
-    return mocker.patch(
-        "shared.customers_api.get_connection", return_value=mock_conn
-    )
-
-
-@pytest.fixture
-def patch_get_connection_projects_api(mocker, mock_conn):
-    """Patches shared.projects_api.get_connection to return mock_conn."""
-    return mocker.patch(
-        "shared.projects_api.get_connection", return_value=mock_conn
-    )
-
-
-@pytest.fixture
-def patch_get_connection_pole_vitals_api(mocker, mock_conn):
-    """Patches shared.pole_vitals_api.get_connection to return mock_conn."""
-    return mocker.patch(
-        "shared.pole_vitals_api.get_connection", return_value=mock_conn
-    )
-
-
-@pytest.fixture
-def patch_get_connection_poles_api(mocker, mock_conn):
-    """Patches shared.poles_api.get_connection to return mock_conn."""
-    return mocker.patch(
-        "shared.poles_api.get_connection", return_value=mock_conn
-    )
-
-
-@pytest.fixture
-def patch_get_connection_users_api(mocker, mock_conn):
-    """Patches shared.users_api.get_connection to return mock_conn."""
-    return mocker.patch(
-        "shared.users_api.get_connection", return_value=mock_conn
-    )
-
-
-@pytest.fixture
 def patch_fetch_all_records(mocker):
     """Patches shared.customers_loader.fetch_all_records (already imported by name)."""
     return mocker.patch("shared.customers_loader.fetch_all_records")
@@ -184,6 +145,22 @@ def patch_get_connection_projects(mocker, mock_conn):
     """Patches shared.projects_loader.get_connection to return mock_conn."""
     return mocker.patch(
         "shared.projects_loader.get_connection", return_value=mock_conn
+    )
+
+
+@pytest.fixture
+def patch_get_connection_auth_utils(mocker, mock_conn):
+    """Patches shared.auth_utils.get_connection to return mock_conn."""
+    return mocker.patch(
+        "shared.auth_utils.get_connection", return_value=mock_conn
+    )
+
+
+@pytest.fixture
+def patch_get_connection_users_management(mocker, mock_conn):
+    """Patches shared.users_management_api.get_connection to return mock_conn."""
+    return mocker.patch(
+        "shared.users_management_api.get_connection", return_value=mock_conn
     )
 
 
@@ -241,169 +218,6 @@ def make_pole_record():
             "createdTime": created_time,
             "fields": fields,
         }
-
-    return _make
-
-
-# --------------------------------------------------------------------------
-# Leadsun / PoleRawData fixtures
-# --------------------------------------------------------------------------
-
-
-@pytest.fixture
-def mock_requests_get_leadsun(mocker):
-    """Patches requests.get inside shared.leadsun_client and returns the mock."""
-    return mocker.patch("shared.leadsun_client.requests.get")
-
-
-@pytest.fixture
-def patch_get_connection_pole_vitals(mocker, mock_conn):
-    """Patches shared.pole_vitals_loader.get_connection to return mock_conn."""
-    return mocker.patch(
-        "shared.pole_vitals_loader.get_connection", return_value=mock_conn
-    )
-
-
-@pytest.fixture
-def patch_get_connection_pole_timezones(mocker, mock_conn):
-    """Patches shared.pole_timezones_loader.get_connection to return mock_conn."""
-    return mocker.patch(
-        "shared.pole_timezones_loader.get_connection", return_value=mock_conn
-    )
-
-
-@pytest.fixture
-def patch_get_connection_pole_daylight_flags(mocker, mock_conn):
-    """Patches shared.pole_daylight_flags_loader.get_connection to return mock_conn."""
-    return mocker.patch(
-        "shared.pole_daylight_flags_loader.get_connection", return_value=mock_conn
-    )
-
-
-@pytest.fixture
-def patch_get_connection_pole_telemetry(mocker, mock_conn):
-    """Patches shared.pole_telemetry_loader.get_connection to return mock_conn."""
-    return mocker.patch(
-        "shared.pole_telemetry_loader.get_connection", return_value=mock_conn
-    )
-
-
-@pytest.fixture
-def patch_fetch_lamps(mocker):
-    """Patches shared.pole_telemetry_loader.fetch_lamps (already imported by name)."""
-    return mocker.patch("shared.pole_telemetry_loader.fetch_lamps")
-
-
-@pytest.fixture
-def patch_get_connection_pole_models(mocker, mock_conn):
-    """Patches shared.pole_models_loader.get_connection to return mock_conn."""
-    return mocker.patch(
-        "shared.pole_models_loader.get_connection", return_value=mock_conn
-    )
-
-
-@pytest.fixture
-def patch_fetch_models(mocker):
-    """Patches shared.pole_models_loader.fetch_models (already imported by name)."""
-    return mocker.patch("shared.pole_models_loader.fetch_models")
-
-
-@pytest.fixture
-def make_model_record():
-    """
-    Factory for building a raw Leadsun model record dict, matching a real
-    confirmed /models API response exactly (field names, string-encoded
-    numbers, and the "" / null fields).
-    """
-
-    def _make(model_id=82, extra_fields=None):
-        record = {
-            "modelId": model_id,
-            "modelName": "RS30-C",
-            "sunboardPower": "80",
-            "lightPower": "30",
-            "battery": "460",
-            "systemVoltage": "12.8",
-            "commType": "Lora",
-            "lightDisType": "",
-            "iconUrl": None,
-            "lampsUsing": "00000001",
-            "batteryVoltage": None,
-            "isAc": False,
-            "isDcOut": False,
-            "modelSeries": None,
-            "batteryCapacity1": "230",
-            "batteryCapacity2": "230",
-            "solarBoardVoltage": "18",
-        }
-        if extra_fields:
-            record.update(extra_fields)
-        return record
-
-    return _make
-
-
-@pytest.fixture
-def make_lamp_record():
-    """
-    Factory for building a raw Leadsun lamp record dict, matching a real
-    confirmed /lamps API response exactly (field names, nesting, and even
-    the stray trailing space on lightingState).
-    """
-
-    def _make(
-        product_name="12009-1000",
-        last_upload="2026-07-15T12:35:30.000+00:00",
-        extra_fields=None,
-    ):
-        record = {
-            "batteryVoltage1": 13.52,
-            "batteryVoltage2": 13.527,
-            "batteryElecCurrent1": 100,
-            "batteryElecCurrent2": 100,
-            "lampPower1": 0,
-            "lampPower2": 0,
-            "solarBoardVoltage": 20.875,
-            "solarBoardElecCurrent": 0.0,
-            "dcInVoltage": 0.089,
-            "batteryOutElecCurrent": 0.0,
-            "batteryTemperature1": 0,
-            "batteryTemperature2": 0,
-            "mcuTemperature": 32.0,
-            "envTemperature": 31.0,
-            "lightingState": "lighting-off ",
-            "dcInState": 3,
-            "dcOutState": 1,
-            "solarBoardState": 0,
-            "battery1State": 2,
-            "battery2State": 0,
-            "lamp1State": 0,
-            "lamp2State": 0,
-            "controllerCode": "A3P70LA323110598",
-            "productId": "AE3SAP7323113143",
-            "createTime": None,
-            "solarBoardDcStatus": "00000111",
-            "lampBatteryStatus": "00000010",
-            "userName": "12009-brevard",
-            "id": 10358,
-            "groupId": 1149,
-            "groupName": "Chaparral Ph3 12009-1030",
-            "gatewayCode": "GT18L94A25082883",
-            "projectId": 482,
-            "projectName": "Chaparral",
-            "productName": product_name,
-            "modelId": 135,
-            "isOnline": True,
-            "lastUpload": last_upload,
-            "timeoutFlag": 3780,
-            "longitude": -80.7236,
-            "latitude": 27.99507,
-            "controlModelCode": "55f50f5a48504b6aab6c7e4c709633cd",
-            "controlModelName": "Storwatch 3",
-        }
-        if extra_fields:
-            record.update(extra_fields)
-        return record
 
     return _make
 

@@ -542,3 +542,178 @@ def get_pole_vitals(customer_id: str = None, project_id: str = None, limit: int 
         }
         for cid in customer_order
     ]
+
+
+# --------------------------------------------------------------------------
+# get_pole_vitals_by_period() -- a genuinely different kind of query from
+# get_pole_vitals() above: that one rolls up the last _RECENT_HOURS_WINDOW
+# hours of 'Hour'-period PoleVitals rows into one steady current-status
+# signal. This one returns a pole's FULL history of PoleVitals rows for a
+# CALLER-CHOSEN period type, each read directly -- no rollup, no averaging
+# across rows, no priority-based LightStatus aggregation across a window.
+# Different use case: "show me every one of this pole's own Hour buckets
+# (or Day buckets), as-is", not "give me a steadier, less noise-prone
+# current-status summary".
+
+# Valid PoleVitals period types -- Week/Month were removed from
+# load_pole_vitals() entirely (see that loader's own module docstring and
+# the README for that history), so only these two remain.
+_VALID_PERIOD_TYPES = ("Hour", "Day")
+
+# How many history rows to return by default/at most when a caller
+# doesn't specify limit -- PoleVitals has no retention/cleanup of its
+# own (unlike PoleTelemetry), so it grows by one row per pole per Hour
+# (or Day) forever; "all of it, no bound at all" would eventually mean
+# thousands of rows for a pole with a long install history. Reuses
+# api_utils.clamp_limit()'s existing DEFAULT_LIMIT/MAX_LIMIT, same as
+# every other list-returning endpoint in this project, rather than
+# inventing a separate cap just for this one.
+
+# A pole's static facts -- id, poleNumber, locationId, installDate, lat,
+# long, lastUpdate -- are properties of the POLE, not of any individual
+# PoleVitals bucket, so they're fetched once here rather than repeated
+# on every history entry (which would be wasteful once this can return
+# many rows). Only ONE OUTER APPLY now (PoleTelemetry, for lastUpdate) --
+# batteryVoltage1/batteryVoltage2 were dropped from this endpoint
+# entirely per explicit request, so there's nothing else needing that
+# join. OUTER, not CROSS: a pole with no PoleTelemetry row yet must
+# still be returned (with lastUpdate null), not dropped.
+_POLE_INFO_FOR_HISTORY_SQL_TEMPLATE = """
+SELECT
+    p.Id AS PoleId,
+    p.PoleNumber AS PoleNumber,
+    p.LocationId AS LocationId,
+    p.InstallDate AS InstallDate,
+    p.Lat AS Lat,
+    p.Long AS Long,
+    latest_pt.LastUpload AS LastUpload
+FROM Poles p
+OUTER APPLY (
+    SELECT TOP 1 pt.LastUpload
+    FROM PoleTelemetry pt
+    WHERE pt.LocationId = p.LocationId
+    ORDER BY pt.LastUpload DESC
+) AS latest_pt
+WHERE p.Id = ?
+"""
+
+# The actual history: every PoleVitals row for this pole's LocationId and
+# the caller-specified period type, each returned exactly as stored --
+# no CTE/aggregation machinery (unlike _RECENT_POLE_STATS_CTE, built for
+# rolling multiple rows into one). PeriodStart/PeriodEnd are included
+# specifically so each entry can actually be told apart from the others
+# -- without them, an array of otherwise-identical-shaped percentage
+# values would have no way to say which hour/day each one belongs to.
+# Ordered most-recent-first, matching every other "give me a list"
+# endpoint in this project, so a TOP(?)-bounded result still returns the
+# most current data rather than an arbitrary/oldest slice.
+_POLE_VITALS_HISTORY_SQL_TEMPLATE = """
+SELECT TOP (?)
+    pv.PeriodStart AS PeriodStart,
+    pv.PeriodEnd AS PeriodEnd,
+    pv.LightStatus AS LightStatus,
+    pv.IsOnline AS IsOnline,
+    pv.AvgBatteryPercentage AS AvgBatteryPercentage,
+    pv.AvgPanelPercentage AS AvgPanelPercentage,
+    pv.AvgLightPercentage AS AvgLightPercentage
+FROM PoleVitals pv
+JOIN Poles p ON p.LocationId = pv.LocationId
+WHERE p.Id = ? AND pv.PeriodType = ?
+ORDER BY pv.PeriodStart DESC
+"""
+
+
+def _pole_vitals_history_row_to_dict(row) -> dict:
+    """Converts one row from _POLE_VITALS_HISTORY_SQL_TEMPLATE -- one
+    entry in the "vitals" array. Same null-handling convention as the
+    rest of this module: null (never a fabricated value) for anything a
+    given bucket doesn't have -- though in practice every PoleVitals row
+    that exists at all already has every one of these columns populated
+    by load_pole_vitals(); null here would mean something upstream
+    changed, not an expected/normal case the way it is for a pole with
+    no PoleVitals rows at all yet."""
+    (
+        period_start,
+        period_end,
+        light_status,
+        is_online,
+        battery_percentage,
+        panel_percentage,
+        light_percentage,
+    ) = row
+    return {
+        "periodStart": json_safe(period_start),
+        "periodEnd": json_safe(period_end),
+        "lightStatus": json_safe(light_status),
+        "isOnline": json_safe(is_online),
+        "avgBatteryPercentage": json_safe(battery_percentage),
+        "avgPanelPercentage": json_safe(panel_percentage),
+        "avgLightPercentage": json_safe(light_percentage),
+    }
+
+
+def get_pole_vitals_by_period(pole_id: str, period_type: str, limit: int = None):
+    """
+    Returns a single pole's static info (id, poleNumber, locationId,
+    installDate, lat, long, lastUpdate) plus its full history of
+    PoleVitals rows for the given period_type, each entry as its own
+    dict in a "vitals" list (periodStart, periodEnd, lightStatus,
+    isOnline, avgBatteryPercentage, avgPanelPercentage,
+    avgLightPercentage). Deliberately NO rollup/aggregation across
+    entries -- each one is a direct read of one PoleVitals row, unlike
+    get_pole_vitals()'s 6-hour-window rollup (which uses the same
+    priority logic PoleVitals' own bucket-level aggregation does).
+    batteryVoltage1/batteryVoltage2 are not included at all -- dropped
+    per explicit request, along with the PoleTelemetry join that would
+    otherwise be needed to get them.
+
+    period_type: must be 'Hour' or 'Day' -- Week/Month were removed from
+    PoleVitals entirely (see pole_vitals_loader.py's own module docstring
+    and the README for that history). Raises ValueError for anything
+    else; the HTTP layer maps that to a 400.
+
+    limit: max number of history entries returned, most-recent-first.
+    Defaults to DEFAULT_LIMIT, capped at MAX_LIMIT (see
+    shared/api_utils.py) -- PoleVitals has no retention/cleanup of its
+    own, so an actually-unbounded "every row that has ever existed"
+    isn't offered here.
+
+    Returns None if no Pole exists with that id. If the pole exists but
+    has no PoleTelemetry row yet, lastUpdate comes back null. If it has
+    no PoleVitals rows of the requested period_type yet, "vitals" comes
+    back as an empty list -- not an error, and not a 404 (the pole
+    itself was found; it just has no history yet for this period type).
+    """
+    if period_type not in _VALID_PERIOD_TYPES:
+        raise ValueError(f"periodType must be one of: {', '.join(_VALID_PERIOD_TYPES)}")
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(_POLE_INFO_FOR_HISTORY_SQL_TEMPLATE, pole_id)
+        pole_row = cursor.fetchone()
+        if pole_row is None:
+            return None
+
+        cursor.execute(
+            _POLE_VITALS_HISTORY_SQL_TEMPLATE,
+            clamp_limit(limit),
+            pole_id,
+            period_type,
+        )
+        vitals_rows = cursor.fetchall()
+    finally:
+        cursor.close()
+        conn.close()
+
+    pole_id_, pole_number, location_id, install_date, lat, long_, last_update = pole_row
+    return {
+        "id": json_safe(pole_id_),
+        "poleNumber": json_safe(pole_number),
+        "locationId": json_safe(location_id),
+        "installDate": json_safe(install_date),
+        "lat": json_safe(lat),
+        "long": json_safe(long_),
+        "lastUpdate": json_safe(last_update),
+        "vitals": [_pole_vitals_history_row_to_dict(row) for row in vitals_rows],
+    }

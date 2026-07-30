@@ -4,8 +4,9 @@
 SELECT TOP 1000
     LocationId,
     LastUpload,
-    Source,
-    SP_ExecId,
+    IsOnline,
+    -- Source,
+    -- SP_ExecId,
     BatteryVoltage1,
     BatteryVoltage2,
     BatteryElecCurrent1,
@@ -41,7 +42,6 @@ SELECT TOP 1000
     LeadsunProjectId,
     LeadsunProjectName,
     ModelId,
-    IsOnline,
     TimeoutFlag,
     Longitude,
     Latitude,
@@ -51,15 +51,20 @@ SELECT TOP 1000
     IsDaylight
 FROM PoleTelemetry
 WHERE 1 = 1
-AND LocationId = '12069-1058'
+AND LocationId = '12111-1128'
 -- AND SP_ExecId = 442
 -- AND IsDaylight IS NOT NULL
 ORDER BY LastUpload DESC;
 
-select
-    (SELECT COUNT(*) FROM PoleTelemetry WHERE IsDaylight = 0) as CountDaylight0,
-    (SELECT COUNT(*) FROM PoleTelemetry WHERE IsDaylight = 1) as CountDaylight1,
-    (SELECT COUNT(*) FROM PoleTelemetry WHERE IsDaylight IS NULL) as CountDaylightNull,
-    (SELECT COUNT(*) FROM PoleTelemetry WHERE IsDaylight IS NOT NULL) as CountDaylightNotNull,
-    (SELECT COUNT(*) FROM PoleTelemetry) as CountTotal
+-- select
+--     (SELECT COUNT(*) FROM PoleTelemetry WHERE IsDaylight = 0) as CountDaylight0,
+--     (SELECT COUNT(*) FROM PoleTelemetry WHERE IsDaylight = 1) as CountDaylight1,
+--     (SELECT COUNT(*) FROM PoleTelemetry WHERE IsDaylight IS NULL) as CountDaylightNull,
+--     (SELECT COUNT(*) FROM PoleTelemetry WHERE IsDaylight IS NOT NULL) as CountDaylightNotNull,
+--     (SELECT COUNT(*) FROM PoleTelemetry) as CountTotal
+
+--     1874997	2755001	9630392	4629998	14260390
+--     1875149	2774849	9628505	4649998	14278503
+--     152     19848   -1887   20000   18113
+
 

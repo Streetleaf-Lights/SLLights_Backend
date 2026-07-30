@@ -1,0 +1,6 @@
+SELECT TOP (1000) [Id]
+      ,[UserId]
+      ,[CreatedAt]
+      ,[ExpiresAt]
+      ,[RevokedAt]
+  FROM [dbo].[UserSessions]
