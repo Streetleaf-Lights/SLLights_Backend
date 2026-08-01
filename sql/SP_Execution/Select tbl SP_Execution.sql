@@ -11,7 +11,7 @@ SELECT TOP (1000) [Id]
       ,[ErrorMessage]
   FROM [dbo].[SP_Execution]
   WHERE 1 = 1
---   AND [Name] = 'loadPoleVitals'
+--   AND [Name] = 'loadPoles'
 --   and environment = 'Prod'
   ORDER BY [StartDateTime] DESC
 

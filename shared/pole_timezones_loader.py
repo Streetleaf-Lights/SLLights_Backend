@@ -6,22 +6,51 @@ from shared.datetime_utils import now_eastern as _now_eastern, to_dto_string as 
 from shared.timezone_utils import resolve_windows_timezone
 
 ENVIRONMENT = os.environ.get("ENVIRONMENT", "Dev")
-SOURCE_NAME = "Leadsun"
 
-# One representative reading's coordinates per not-yet-resolved
-# LocationId. MIN() is just a deterministic way to pick ANY single
-# reading per LocationId -- a stationary pole's coordinates shouldn't
-# meaningfully vary between readings, so which specific reading gets
-# picked doesn't matter for timezone-resolution purposes (GPS jitter of a
-# few hundred meters practically never crosses a timezone boundary).
+# Two distinct meanings that used to share one SOURCE_NAME constant, now
+# split apart since they've diverged: EXECUTION_SOURCE tracks which
+# pipeline this loader's own run belongs to (SP_Execution.Source) --
+# still "Leadsun", since this loader still runs as part of that
+# pipeline's Models -> Telemetry -> TimeZones -> DaylightFlags -> Vitals
+# load order, regardless of where the coordinates it resolves come from.
+# COORDINATE_SOURCE tracks where each row's own Longitude/Latitude
+# actually came from (PoleTimeZones.Source) -- now "Airtable" (via
+# Poles.Long/Poles.Lat), not "Leadsun" (PoleTelemetry's raw GPS) --
+# see _FIND_UNRESOLVED_LOCATIONS_SQL's own comment for why this changed.
+EXECUTION_SOURCE = "Leadsun"
+COORDINATE_SOURCE = "Airtable"
+
+# One row per not-yet-resolved LocationId, sourced from Poles (Airtable),
+# not PoleTelemetry (Leadsun's raw device GPS) -- changed because
+# PoleTelemetry's own Latitude/Longitude are the ones documented
+# elsewhere in this codebase as occasionally corrupted/placeholder values
+# (see pole_daylight_flags_loader.py's own comments on preferring
+# PoleTimeZones' cached coordinates over PoleTelemetry's raw ones for
+# exactly this reason). Poles.Lat/Poles.Long, coming from Airtable, are
+# the more reliable source.
+#
+# No GROUP BY/MIN() needed here (unlike the PoleTelemetry-based version
+# this replaced, which had to pick one representative reading out of
+# many time-series rows per LocationId) -- Poles is a reference table,
+# one row per pole, so there's exactly one Lat/Long to read per
+# LocationId already.
+#
+# p.LocationId IS NOT NULL matters here specifically: a pole can exist
+# in Poles before it's linked to a real Leadsun device (LocationId not
+# yet assigned). The old PoleTelemetry-driven query never had to guard
+# against this, since a pole with no LocationId could never have
+# appeared in PoleTelemetry in the first place -- reading directly from
+# Poles now needs this filter explicit, or a NULL LocationId would
+# satisfy "ptz.LocationId IS NULL" via the LEFT JOIN and attempt to
+# resolve/insert a timezone row for a pole with no real location at all.
 _FIND_UNRESOLVED_LOCATIONS_SQL = """
-SELECT t.LocationId, MIN(t.Longitude) AS Longitude, MIN(t.Latitude) AS Latitude
-FROM PoleTelemetry t
-LEFT JOIN PoleTimeZones ptz ON t.LocationId = ptz.LocationId
+SELECT p.LocationId, p.Long AS Longitude, p.Lat AS Latitude
+FROM Poles p
+LEFT JOIN PoleTimeZones ptz ON p.LocationId = ptz.LocationId
 WHERE ptz.LocationId IS NULL
-  AND t.Longitude IS NOT NULL
-  AND t.Latitude IS NOT NULL
-GROUP BY t.LocationId
+  AND p.LocationId IS NOT NULL
+  AND p.Long IS NOT NULL
+  AND p.Lat IS NOT NULL
 """
 
 _UPSERT_TIMEZONE_SQL = """
@@ -47,9 +76,12 @@ WHEN NOT MATCHED THEN
 
 def load_pole_timezones() -> None:
     """
-    Resolves and caches each not-yet-seen LocationId's timezone (from its
-    PoleTelemetry Longitude/Latitude) into PoleTimeZones, for
-    pole_vitals_loader.py's per-pole Hour/Day/Month/Week bucketing.
+    Resolves and caches each not-yet-seen LocationId's timezone (from
+    Poles' own Lat/Long, i.e. Airtable's coordinates for that pole -- not
+    PoleTelemetry's raw device GPS, which is the known-occasionally-bad
+    source; see _FIND_UNRESOLVED_LOCATIONS_SQL's own comment) into
+    PoleTimeZones, for pole_vitals_loader.py's per-pole Hour/Day/Month/Week
+    bucketing.
 
     Only resolves LocationIds NOT ALREADY in PoleTimeZones -- poles are
     stationary, so a location's timezone never changes once resolved,
@@ -78,13 +110,12 @@ def load_pole_timezones() -> None:
             "loadPoleTimeZones",
             ENVIRONMENT,
             start_time,
-            SOURCE_NAME,
+            EXECUTION_SOURCE,
         )
         sp_exec_id = cursor.fetchone()[0]
         conn.commit()
 
-        # 2. Find LocationIds seen in PoleTelemetry that PoleTimeZones
-        # doesn't have yet
+        # 2. Find LocationIds in Poles that PoleTimeZones doesn't have yet
         cursor.execute(_FIND_UNRESOLVED_LOCATIONS_SQL)
         unresolved = cursor.fetchall()
         logging.info(
@@ -105,7 +136,7 @@ def load_pole_timezones() -> None:
                     latitude,
                     iana_name,
                     windows_name,
-                    SOURCE_NAME,
+                    COORDINATE_SOURCE,
                     sp_exec_id,
                 )
                 total_success += 1

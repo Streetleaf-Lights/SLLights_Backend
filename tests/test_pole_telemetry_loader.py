@@ -202,17 +202,18 @@ class TestMapLampRecord:
 class TestBuildRow:
     def test_row_length_matches_all_columns(self, make_lamp_record):
         mapped = pole_telemetry_loader._map_lamp_record(make_lamp_record())
-        row = pole_telemetry_loader._build_row(mapped, sp_exec_id=42)
+        row = pole_telemetry_loader._build_row(mapped, sp_exec_id=42, is_open_issue_fault=False)
         assert len(row) == len(pole_telemetry_loader._ALL_COLUMNS)
 
     def test_row_order_matches_all_columns(self, make_lamp_record):
         mapped = pole_telemetry_loader._map_lamp_record(make_lamp_record(product_name="LOC-X"))
-        row = pole_telemetry_loader._build_row(mapped, sp_exec_id=99)
+        row = pole_telemetry_loader._build_row(mapped, sp_exec_id=99, is_open_issue_fault=True)
 
         as_dict = dict(zip(pole_telemetry_loader._ALL_COLUMNS, row))
         assert as_dict["LocationId"] == "LOC-X"
         assert as_dict["Source"] == "Leadsun"
         assert as_dict["SP_ExecId"] == 99
+        assert as_dict["IsOpenIssueFault"] is True
 
 
 # --------------------------------------------------------------------------
@@ -305,19 +306,20 @@ class TestLoadPoleTelemetrySuccessFlow:
         pole_telemetry_loader.load_pole_telemetry()
 
         calls = mock_cursor.execute.call_args_list
-        # insert SP_Execution, staging create, merge-from-staging, truncate,
-        # retention purge, final update
-        assert len(calls) == 6
+        # insert SP_Execution, open-issues lookup, staging create,
+        # merge-from-staging, truncate, retention purge, final update
+        assert len(calls) == 7
 
         insert_sql, name, env, start_time, source = calls[0].args
         assert "INSERT INTO SP_Execution" in insert_sql
         assert (name, env, source) == ("loadPoleTelemetry", "Dev", "Leadsun")
         assert DTO_PATTERN.match(start_time)
 
-        assert "CREATE TABLE #PoleTelemetryStaging" in calls[1].args[0]
-        assert "MERGE PoleTelemetry" in calls[2].args[0]
-        assert calls[3].args[0] == "TRUNCATE TABLE #PoleTelemetryStaging"
-        assert "DELETE FROM PoleTelemetry" in calls[4].args[0]
+        assert "JOIN PoleOpenIssues" in calls[1].args[0]
+        assert "CREATE TABLE #PoleTelemetryStaging" in calls[2].args[0]
+        assert "MERGE PoleTelemetry" in calls[3].args[0]
+        assert calls[4].args[0] == "TRUNCATE TABLE #PoleTelemetryStaging"
+        assert "DELETE FROM PoleTelemetry" in calls[5].args[0]
 
         assert mock_cursor.executemany.call_count == 1
         staging_sql, batch = mock_cursor.executemany.call_args.args
@@ -327,7 +329,7 @@ class TestLoadPoleTelemetrySuccessFlow:
         assert batch[0][3] == 11  # SP_ExecId position
         assert batch[1][0] == "POLE-2"
 
-        update_sql, end_time, success, errors, batch_count, sp_exec_id = calls[5].args
+        update_sql, end_time, success, errors, batch_count, sp_exec_id = calls[6].args
         assert "UPDATE SP_Execution" in update_sql
         assert (success, errors, batch_count, sp_exec_id) == (2, 0, 1, 11)
         assert DTO_PATTERN.match(end_time)
@@ -339,14 +341,17 @@ class TestLoadPoleTelemetrySuccessFlow:
         self, patch_get_connection_pole_telemetry, patch_fetch_lamps, mock_cursor
     ):
         patch_fetch_lamps.return_value = []
+        mock_cursor.fetchall.return_value = []  # no LocationIds with open issues
 
         pole_telemetry_loader.load_pole_telemetry()
 
         calls = mock_cursor.execute.call_args_list
-        # insert, retention purge, final update -- no staging table needed
-        assert len(calls) == 3
-        assert "DELETE FROM PoleTelemetry" in calls[1].args[0]
-        _, _end_time, success, errors, batch_count, _sp_exec_id = calls[2].args
+        # insert, open-issues lookup, retention purge, final update -- no
+        # staging table needed
+        assert len(calls) == 4
+        assert "JOIN PoleOpenIssues" in calls[1].args[0]
+        assert "DELETE FROM PoleTelemetry" in calls[2].args[0]
+        _, _end_time, success, errors, batch_count, _sp_exec_id = calls[3].args
         assert (success, errors, batch_count) == (0, 0, 1)
         mock_cursor.executemany.assert_not_called()
 
@@ -410,10 +415,10 @@ class TestLoadPoleTelemetryPartialFailure:
             make_lamp_record(product_name="POLE-2"),
         ]
         mock_cursor.executemany.side_effect = RuntimeError("chunk failed")
-        # insert, staging create, truncate-after-failure, row1, row2 (fails),
-        # retention purge, final update
+        # insert, open-issues lookup, staging create, truncate-after-failure,
+        # row1, row2 (fails), retention purge, final update
         mock_cursor.execute.side_effect = [
-            None, None, None, None, RuntimeError("bad row"), None, None,
+            None, None, None, None, None, RuntimeError("bad row"), None, None,
         ]
 
         pole_telemetry_loader.load_pole_telemetry()  # must not raise

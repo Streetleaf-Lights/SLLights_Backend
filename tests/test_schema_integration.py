@@ -34,7 +34,7 @@ import re
 
 import pytest
 
-from shared import customers_loader, projects_loader, poles_loader, pole_telemetry_loader, pole_models_loader, pole_vitals_loader, pole_timezones_loader, pole_daylight_flags_loader
+from shared import customers_loader, projects_loader, poles_loader, pole_telemetry_loader, pole_models_loader, pole_vitals_loader, pole_timezones_loader
 
 
 # --------------------------------------------------------------------------
@@ -313,7 +313,7 @@ class TestPoleModelsSchemaConsistency:
 class TestPoleVitalsSchemaConsistency:
     """
     PoleVitals has no single _ALL_COLUMNS source of truth like the other
-    loaders (it's four hand-written MERGE statements, not a generic
+    loaders (it's three hand-written MERGE statements, not a generic
     fetch-map-upsert pipeline), so this hardcodes the expected column set
     from the DDL and cross-checks each period type's INSERT column list
     against it directly.
@@ -328,7 +328,11 @@ class TestPoleVitalsSchemaConsistency:
         "AvgPanelPercentage",
         "AvgLightPercentage",
         "IsOnline",
-        "LightStatus",
+        "IsLedFault",
+        "IsBatteryFault",
+        "IsPanelFault",
+        "IsOpenIssueFault",
+        "IsPoleFault",
         "RecordCount",
         "Source",
         "SP_ExecId",
@@ -341,13 +345,28 @@ class TestPoleVitalsSchemaConsistency:
         cols = {c.strip() for c in match.group(1).split(",")}
         assert cols == self._EXPECTED_COLUMNS
 
-    @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
+    @pytest.mark.parametrize("period_type", ("Hour", "Day"))
     def test_update_set_columns_never_touch_the_match_key(self, period_type):
+        """Hour/Day match on (LocationId, PeriodType, PeriodStart), so
+        none of those three should appear in the UPDATE SET list.
+        Last48Hours is different -- see the test below."""
         sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE[period_type]
         match = re.search(r"THEN UPDATE SET\s*(.+?)\s*WHEN NOT MATCHED", sql, re.DOTALL)
         assignments = match.group(1).strip().rstrip(",").split(",")
         cols = {a.split("=")[0].strip() for a in assignments}
         assert cols == self._EXPECTED_COLUMNS - {"LocationId", "PeriodType", "PeriodStart"}
+
+    def test_last_48_hours_update_set_touches_period_start_but_not_location_or_type(self):
+        """Last48Hours matches on (LocationId, PeriodType) ALONE -- so
+        PeriodStart (and PeriodEnd) MUST be in the UPDATE SET list, since
+        it's not part of the match key and needs refreshing every run
+        (see _LAST_48_HOURS_MERGE_SQL's own comment for why)."""
+        sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE["Last48Hours"]
+        match = re.search(r"THEN UPDATE SET\s*(.+?)\s*WHEN NOT MATCHED", sql, re.DOTALL)
+        assignments = match.group(1).strip().rstrip(",").split(",")
+        cols = {a.split("=")[0].strip() for a in assignments}
+        assert cols == self._EXPECTED_COLUMNS - {"LocationId", "PeriodType"}
+        assert "PeriodStart" in cols
 
 
 class TestPoleTimeZonesSchemaConsistency:
@@ -469,7 +488,7 @@ _LEADSUN_LIVE_TESTS_ENABLED = os.environ.get("RUN_LIVE_LEADSUN_INTEGRATION_TEST"
     ),
 )
 class TestLeadsunLiveIntegration:
-    def test_load_pole_models_then_telemetry_then_timezones_then_daylight_flags_then_vitals_against_real_leadsun_api_and_sql(self):
+    def test_load_pole_models_then_telemetry_then_timezones_then_vitals_against_real_leadsun_api_and_sql(self):
         assert os.environ.get("ENVIRONMENT", "Dev") != "Prod", (
             "Refusing to run the live integration test with ENVIRONMENT=Prod. "
             "Point this at a Dev/Staging environment."
@@ -479,13 +498,11 @@ class TestLeadsunLiveIntegration:
         importlib.reload(pole_models_loader)
         importlib.reload(pole_telemetry_loader)
         importlib.reload(pole_timezones_loader)
-        importlib.reload(pole_daylight_flags_loader)
         importlib.reload(pole_vitals_loader)
 
         # Same order as function_app.py's loadLeadsunData:
-        # Models -> Telemetry -> TimeZones -> DaylightFlags -> Vitals.
+        # Models -> Telemetry -> TimeZones -> Vitals.
         pole_models_loader.load_pole_models()  # will raise on failure -- that's the assertion
         pole_telemetry_loader.load_pole_telemetry()
         pole_timezones_loader.load_pole_timezones()
-        pole_daylight_flags_loader.load_pole_daylight_flags()
         pole_vitals_loader.load_pole_vitals()

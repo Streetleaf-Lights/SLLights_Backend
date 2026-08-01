@@ -122,6 +122,7 @@ _ALL_COLUMNS = [
     "LeadsunProjectName",
     "ModelId",
     "IsOnline",
+    "IsOpenIssueFault",  # NOT from Leadsun -- see _fetch_location_ids_with_open_issues()
     "TimeoutFlag",
     "Longitude",
     "Latitude",
@@ -140,7 +141,7 @@ _DIFF_CHECK_COLUMNS = [c for c in _NON_KEY_COLUMNS if c != "SP_ExecId"]
 
 # Fields Leadsun sends that aren't part of PoleTelemetry's stored columns at
 # all (they're added by this loader, not read from the API).
-_LOADER_OWNED_FIELDS = {"Source", "SP_ExecId"}
+_LOADER_OWNED_FIELDS = {"Source", "SP_ExecId", "IsOpenIssueFault"}
 
 _API_DATA_COLUMNS = [
     c for c in _ALL_COLUMNS if c not in _LOADER_OWNED_FIELDS and c != "ExtraFieldsJson"
@@ -211,12 +212,34 @@ def _map_lamp_record(record: dict) -> dict:
     return result
 
 
-def _build_row(mapped: dict, sp_exec_id) -> tuple:
+def _build_row(mapped: dict, sp_exec_id, is_open_issue_fault: bool) -> tuple:
     """Assembles the final param tuple in _ALL_COLUMNS order."""
     values = dict(mapped)
     values["Source"] = SOURCE_NAME
     values["SP_ExecId"] = sp_exec_id
+    values["IsOpenIssueFault"] = is_open_issue_fault
     return tuple(values.get(col) for col in _ALL_COLUMNS)
+
+
+def _fetch_location_ids_with_open_issues(cursor) -> set:
+    """
+    Every LocationId whose pole has at least one row in PoleOpenIssues --
+    PoleOpenIssues.PoleId matches Poles.Id, not LocationId directly, so
+    this needs the join through Poles. Fetched once per
+    load_pole_telemetry() run (a single, cheap query -- PoleOpenIssues
+    only ever holds currently-open issues, not the full issue history,
+    so this stays small) rather than a per-row lookup, then checked via
+    simple set membership when mapping each lamp record below.
+    """
+    cursor.execute(
+        """
+        SELECT DISTINCT p.LocationId
+        FROM Poles p
+        JOIN PoleOpenIssues poi ON poi.PoleId = p.Id
+        WHERE p.LocationId IS NOT NULL
+        """
+    )
+    return {row[0] for row in cursor.fetchall()}
 
 
 def _sql_column_list(columns: list) -> str:
@@ -297,6 +320,7 @@ CREATE TABLE #PoleTelemetryStaging (
     LeadsunProjectName     NVARCHAR(200) NULL,
     ModelId                INT NULL,
     IsOnline               BIT NULL,
+    IsOpenIssueFault       BIT NULL,
     TimeoutFlag            INT NULL,
     Longitude              FLOAT NULL,
     Latitude               FLOAT NULL,
@@ -399,6 +423,7 @@ def load_pole_telemetry() -> None:
         # LastUpload are counted as row-level errors and skipped -- both
         # are part of PoleTelemetry's primary key, so neither can be NULL.
         upsert_start = time.perf_counter()
+        open_issue_location_ids = _fetch_location_ids_with_open_issues(cursor)
         param_rows = []
         for lamp in lamps:
             mapped = _map_lamp_record(lamp)
@@ -409,7 +434,8 @@ def load_pole_telemetry() -> None:
                     mapped,
                 )
                 continue
-            param_rows.append(_build_row(mapped, sp_exec_id))
+            is_open_issue_fault = mapped["LocationId"] in open_issue_location_ids
+            param_rows.append(_build_row(mapped, sp_exec_id, is_open_issue_fault))
 
         if param_rows:
             cursor.execute(_STAGING_TABLE_SQL)

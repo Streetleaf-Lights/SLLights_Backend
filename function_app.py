@@ -9,10 +9,10 @@ import azure.functions as func
 from shared.customers_loader import load_customers
 from shared.projects_loader import load_projects
 from shared.poles_loader import load_poles
+from shared.pole_open_issues_loader import load_pole_open_issues
 from shared.pole_models_loader import load_pole_models
 from shared.pole_telemetry_loader import load_pole_telemetry
 from shared.pole_timezones_loader import load_pole_timezones
-from shared.pole_daylight_flags_loader import load_pole_daylight_flags
 from shared.pole_vitals_loader import load_pole_vitals
 from shared.customers_api import get_customers
 from shared.projects_api import get_projects
@@ -88,6 +88,14 @@ def loadAirTableData(myTimer: func.TimerRequest) -> None:
     load_customers()
     # load_pole_statuses()
 
+    # PoleOpenIssues comes from a genuinely separate Airtable base (see
+    # shared/pole_open_issues_loader.py's own AIRTABLE_POLE_ISSUES_BASE_ID
+    # notes) with no load-order dependency on the three above (no FK,
+    # enforced or otherwise, from Poles/Projects/Customers pointing at it)
+    # -- placed last here since PoleOpenIssues.PoleId is logically meant to
+    # line up with Poles.Id, even though that's not FK-enforced either.
+    load_pole_open_issues()
+
     logging.info("loadAirTableData: run complete.")
 
 
@@ -109,10 +117,11 @@ def loadAirTableDataManual(req: func.HttpRequest) -> func.HttpResponse:
     load_poles()
     load_projects()
     load_customers()
+    load_pole_open_issues()
     logging.info("loadAirTableDataManual: run complete.")
 
     return func.HttpResponse(
-        "loadPoles + loadProjects + loadCustomers run complete.", status_code=200
+        "loadPoles + loadProjects + loadCustomers + loadPoleOpenIssues run complete.", status_code=200
     )
 
 
@@ -125,18 +134,16 @@ def loadAirTableDataManual(req: func.HttpRequest) -> func.HttpResponse:
 # Renamed from loadPoleRawData now that it orchestrates two loaders, not
 # one -- mirrors loadAirTableData's naming (source name + "Data" as the
 # umbrella, individual load_<x>() functions underneath). Load order is
-# Models -> Telemetry -> TimeZones -> DaylightFlags -> Vitals: PoleModels
-# is a device-model reference table needed by PoleVitals' Panel/Light
-# percentage formulas (SunboardPower/LightPower), PoleTelemetry is the raw
-# readings PoleVitals aggregates, PoleTimeZones resolves each pole's own
-# timezone (from that same fresh telemetry's Longitude/Latitude) so
-# PoleVitals can bucket in each pole's local time instead of assuming
-# Eastern for every pole regardless of where it actually is,
-# DaylightFlags computes/caches whether each not-yet-flagged reading
-# happened during daylight (needed for PoleVitals' LightStatus column,
-# using PoleTimeZones' coordinates -- see that loader's module docstring
-# for why this can't just be inline SQL), and PoleVitals depends on all
-# four already being current for this cycle.
+# Models -> Telemetry -> TimeZones -> Vitals: PoleModels is a device-model
+# reference table needed by PoleVitals' Panel/Light percentage formulas
+# (SunboardPower/LightPower), PoleTelemetry is the raw readings PoleVitals
+# aggregates (now also computing IsOpenIssueFault per reading, joining
+# against PoleOpenIssues/Poles -- see pole_telemetry_loader.py), PoleTimeZones
+# resolves each pole's own timezone (from that same fresh telemetry's
+# Longitude/Latitude) so PoleVitals can bucket in each pole's local time
+# instead of assuming Eastern for every pole regardless of where it
+# actually is, and PoleVitals depends on all three already being current
+# for this cycle.
 #
 # schedule history, for anyone wondering why this keeps moving: 10
 # minutes originally -> widened to 30 when Week/Month (since removed
@@ -182,7 +189,6 @@ def loadLeadsunData(myTimer: func.TimerRequest) -> None:
     load_pole_models()
     load_pole_telemetry()
     load_pole_timezones()
-    load_pole_daylight_flags()
     load_pole_vitals()
     logging.info("loadLeadsunData: run complete.")
 
@@ -202,12 +208,11 @@ def loadLeadsunDataManual(req: func.HttpRequest) -> func.HttpResponse:
     load_pole_models()
     load_pole_telemetry()
     load_pole_timezones()
-    load_pole_daylight_flags()
     load_pole_vitals()
     logging.info("loadLeadsunDataManual: run complete.")
 
     return func.HttpResponse(
-        "loadPoleModels + loadPoleTelemetry + loadPoleTimeZones + loadPoleDaylightFlags + "
+        "loadPoleModels + loadPoleTelemetry + loadPoleTimeZones + "
         "loadPoleVitals run complete.",
         status_code=200,
     )
@@ -359,9 +364,9 @@ def getProjects(req: func.HttpRequest) -> func.HttpResponse:
 # and getProjects, but a genuinely different SHAPE: not a straight table
 # read, a Customer->Project rollup of pole health stats computed from
 # Poles + PoleVitals. See shared/pole_vitals_api.py's module docstring
-# for the full business-rule reasoning (which LightStatus values count
-# as "working", which PoleVitals period type drives this, how an
-# unclassified pole is handled).
+# for the full business-rule reasoning (the population/connected/faults/
+# percentWorking rollup design, which PoleVitals period type drives it,
+# how a pole with no recent data is handled).
 #
 # SECURITY NOTE: same as getCustomers/getProjects -- no row-level access
 # control enforced here either.
@@ -812,29 +817,31 @@ def deleteUser(req: func.HttpRequest) -> func.HttpResponse:
 # --------------------------------------------------------------------------
 # getPoleVitalsByPeriod -- a different shape from getPoleVitals: a single
 # pole's FULL HISTORY of PoleVitals rows for a SPECIFIC, caller-chosen
-# period type, each read directly -- no 6-hour rollup, no averaging across
-# rows, no priority-based LightStatus aggregation across a window.
-# batteryVoltage1/batteryVoltage2 are not included (dropped per explicit
-# request, along with the PoleTelemetry join that would otherwise be
-# needed for them). Use this to see every one of this pole's own Hour
-# buckets (or Day buckets) as-is; use getPoleVitals/getPoles for a
-# steadier current-status signal.
+# period type, each read directly -- no rollup, no averaging across rows,
+# no aggregation across a window at all. batteryVoltage1/batteryVoltage2
+# are not included (dropped per explicit request, along with the
+# PoleTelemetry join that would otherwise be needed for them). Use this
+# to see every one of this pole's own Hour buckets (or Day buckets) as-is;
+# use getPoleVitals/getPoles for a steadier current-status signal (which
+# reads each pole's single Last48Hours row instead).
 @app.route(route="getPoleVitalsByPeriod", methods=["GET"], auth_level=func.AuthLevel.FUNCTION)
 def getPoleVitalsByPeriod(req: func.HttpRequest) -> func.HttpResponse:
     """
     Query params:
       poleId -- required.
-      periodType -- required. 'Hour' or 'Day' (Week/Month were removed
-        from PoleVitals entirely -- see pole_vitals_loader.py's own
-        module docstring and the README for that history).
+      periodType -- required. 'Hour' or 'Day' only -- Last48Hours is
+        excluded (it's a single current-state row per pole, not a history
+        to page through; see pole_vitals_api.py's own module docstring).
       limit -- optional, default/max per shared/api_utils.py. Max number
-        of history entries returned, most-recent-first. PoleVitals has
-        no retention/cleanup of its own, so this is never truly
-        "everything that has ever existed" with no bound at all.
+        of history entries returned, most-recent-first. Hour keeps at
+        most 168 rows per pole and Day keeps 7 (see
+        pole_vitals_loader.py's own retention pruning), so this is
+        already implicitly bounded even without a limit.
 
     Returns the pole's static info (id, poleNumber, locationId,
     installDate, lat, long, lastUpdate) plus a "vitals" list, one entry
-    per PoleVitals row (periodStart, periodEnd, lightStatus, isOnline,
+    per PoleVitals row (periodStart, periodEnd, isOnline, isLedFault,
+    isBatteryFault, isPanelFault, isOpenIssueFault, isPoleFault,
     avgBatteryPercentage, avgPanelPercentage, avgLightPercentage).
 
     404 only if no pole exists with that id. If the pole exists but has

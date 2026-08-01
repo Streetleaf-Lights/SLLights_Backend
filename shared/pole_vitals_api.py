@@ -1,88 +1,77 @@
 from shared.api_utils import clamp_limit, json_safe
 from shared.sql_client import get_connection
 
-# LightStatus values counted as "working" for this rollup, per an
-# explicit business rule: DayLight means "not expected to be lit right
-# now, nothing wrong", Working means "confirmed lit correctly at night"
-# -- both are "the light is fine" states. Only 'Not Working' (online,
-# night, both lamps dark) is the genuine fault. See
-# pole_vitals_loader.py's module docstring for the full per-reading
-# classification this is built on.
-_WORKING_LIGHT_STATUSES = ("Working", "DayLight")
-
 # Which PoleVitals period type drives this rollup's classification --
-# Hour, not Day/Week/Month, since this is meant to answer "what's each
-# pole's status right now", the finest-grained/most-current signal
-# available. Deliberately a single named constant, not buried in the SQL
-# string, so this choice is easy to find and change later if a different
-# period type turns out to be wanted instead.
-_STATUS_PERIOD_TYPE = "Hour"
-
-# How far back to roll up each pole's Hour-period PoleVitals rows when
-# computing its current status -- not just the single most recent Hour
-# row, but every Hour row within this window, averaged/aggregated
-# together. A longer, steadier signal than any one Hour bucket alone,
-# less prone to a single noisy or transient reading swinging the result.
-# Interpolated directly into both SQL templates below (not just left as
-# documentation) so the constant and the SQL can't drift apart.
-_RECENT_HOURS_WINDOW = 6
+# Last48Hours specifically, not Hour/Day: it's a single, continuously
+# updated row per pole (see pole_vitals_loader.py's own module docstring
+# for why that period type is structured that way), so reading it
+# directly IS "what's each pole's status right now" -- no window
+# aggregation needed here at all, unlike the Hour-based rolling-window
+# design this replaced.
+_STATUS_PERIOD_TYPE = "Last48Hours"
 
 # One row per Project (with its Customer attached), aggregating over
-# every Pole belonging to that project and each pole's own rolled-up
-# LightStatus across the last _RECENT_HOURS_WINDOW hours of Hour-period
-# PoleVitals rows.
+# every Pole belonging to that project and each pole's own Last48Hours
+# PoleVitals row.
 #
-# RecentPoleStats aggregates PoleVitals rows within the window using the
-# SAME priority-based logic PoleVitals' own bucket-level aggregation
-# uses (see pole_vitals_loader.py's module docstring): if ANY row in the
-# window is 'Not Working', the whole window is 'Not Working'; else if
-# ANY row is 'Working', the window is 'Working'; only if neither ever
-# occurred does it fall back to 'DayLight'. A row with LightStatus IS
-# NULL (unresolved daylight status for that specific hour) doesn't count
-# toward either MAX() check, matching the same "excluded, not guessed"
-# treatment used at the single-bucket level.
+# Population/rollup design (replaces the earlier LightStatus-based
+# workingPercentage/optimisticWorkingPercentage/totalNonTelemetryAvailable
+# entirely):
+#   totalLights (population) = poles that are IsOnline, PLUS poles that
+#     are NOT online but DO have an open issue (IsOpenIssueFault) -- a
+#     pole that's neither online nor known to have an issue is excluded
+#     from the population entirely, not counted as "not working". This
+#     is a deliberate redefinition: such a pole (never reported, or gone
+#     silent with nothing filed against it) is treated as outside the
+#     currently-relevant fleet, not as a broken one.
+#   connectedLights = poles that are IsOnline (a strict subset of
+#     totalLights above).
+#   totalFaults = poles WITHIN the population above whose IsPoleFault is
+#     true -- a pole excluded from the population can't be a "fault"
+#     either, by construction.
+#   percentWorking = (totalLights - totalFaults) / totalLights * 100 --
+#     computed in Python (_percent_working()), not SQL, same reasoning
+#     as everywhere else numeric rollups are computed here.
 #
-# LEFT JOIN Poles->RecentPoleStats (not INNER): a pole with zero Hour
-# PoleVitals rows in the window (installed, but no telemetry processed
-# for it yet, or none recent enough) must still count toward
-# TotalLights -- COUNT(*) in PoleWithStatus counts every pole
-# regardless, while the SUM(CASE...) expressions only count LightStatus
-# values that are actually present, so an unclassified pole contributes
-# to neither WorkingCount nor TotalFaults -- it's counted separately, as
-# NoTelemetryCount.
+# "IsOnline = 1 OR IsOpenIssueFault = 1" needs no explicit NULL-handling:
+# a pole with no Last48Hours row at all gets NULL for both columns via
+# the LEFT JOIN below, and "NULL = 1" is UNKNOWN (not TRUE) in T-SQL, so
+# it naturally falls through to "not in the population" without an
+# ISNULL() guard.
+#
+# LEFT JOIN Poles->RecentPoleStats (not INNER): a pole with no
+# Last48Hours row yet (installed, but no telemetry processed for it, or
+# none recent enough to be in the rolling window) must still be
+# considered -- it just won't satisfy the population condition above
+# unless it has an open issue.
 #
 # LEFT JOIN Projects->ProjectAgg (not INNER): a project with zero poles
 # must still appear, with every count column at 0, rather than being
 # silently dropped from the result entirely.
 _FETCH_SQL_TEMPLATE = """
 ;WITH RecentPoleStats AS (
-    SELECT
-        LocationId,
-        CASE
-            WHEN MAX(CASE WHEN LightStatus = 'Not Working' THEN 1 ELSE 0 END) = 1 THEN 'Not Working'
-            WHEN MAX(CASE WHEN LightStatus = 'Working' THEN 1 ELSE 0 END) = 1 THEN 'Working'
-            ELSE 'DayLight'
-        END AS LightStatus
+    SELECT LocationId, IsOnline, IsOpenIssueFault, IsPoleFault
     FROM PoleVitals
     WHERE PeriodType = ?
-      AND PeriodStart >= DATEADD(HOUR, -{hours_window}, SYSDATETIMEOFFSET())
-    GROUP BY LocationId
 ),
 PoleWithStatus AS (
     SELECT
         p.Id AS PoleId,
         p.ProjectId,
-        rps.LightStatus
+        rps.IsOnline,
+        rps.IsOpenIssueFault,
+        rps.IsPoleFault
     FROM Poles p
     LEFT JOIN RecentPoleStats rps ON p.LocationId = rps.LocationId
 ),
 ProjectAgg AS (
     SELECT
         ProjectId,
-        COUNT(*) AS TotalLights,
-        SUM(CASE WHEN LightStatus IN ('Working', 'DayLight') THEN 1 ELSE 0 END) AS WorkingCount,
-        SUM(CASE WHEN LightStatus = 'Not Working' THEN 1 ELSE 0 END) AS TotalFaults,
-        SUM(CASE WHEN LightStatus IS NULL THEN 1 ELSE 0 END) AS NoTelemetryCount
+        SUM(CASE WHEN IsOnline = 1 OR IsOpenIssueFault = 1 THEN 1 ELSE 0 END) AS TotalLights,
+        SUM(CASE WHEN IsOnline = 1 THEN 1 ELSE 0 END) AS ConnectedLights,
+        SUM(
+            CASE WHEN (IsOnline = 1 OR IsOpenIssueFault = 1) AND IsPoleFault = 1 THEN 1 ELSE 0 END
+        ) AS TotalFaults
     FROM PoleWithStatus
     GROUP BY ProjectId
 )
@@ -92,9 +81,8 @@ SELECT
     proj.Id AS ProjectId,
     proj.Name AS ProjectName,
     ISNULL(pa.TotalLights, 0) AS TotalLights,
-    ISNULL(pa.WorkingCount, 0) AS WorkingCount,
-    ISNULL(pa.TotalFaults, 0) AS TotalFaults,
-    ISNULL(pa.NoTelemetryCount, 0) AS NoTelemetryCount
+    ISNULL(pa.ConnectedLights, 0) AS ConnectedLights,
+    ISNULL(pa.TotalFaults, 0) AS TotalFaults
 FROM Customers c
 LEFT JOIN Projects proj ON proj.CustomerId = c.Id
 LEFT JOIN ProjectAgg pa ON pa.ProjectId = proj.Id
@@ -105,86 +93,44 @@ ORDER BY c.Name, proj.Name
 # A SEPARATE query from _FETCH_SQL_TEMPLATE above, purely additive: one
 # row per individual Pole, for attaching a "poles" list to each project
 # dict. Deliberately NOT merged into the same query as the aggregates --
-# mixing detail rows and aggregate rows in one T-SQL result set is
-# awkward without FOR JSON/STRING_AGG tricks that would complicate the
-# already-tested aggregation query for no real benefit. Reuses the exact
-# same {where_clause} text as the aggregate query (both alias Projects as
-# "proj" and Customers as "c"), so both queries stay scoped identically
-# to the same customer(s)/project without duplicating the filter logic.
+# see this module's earlier history for why (mixing detail rows and
+# aggregate rows in one T-SQL result set is awkward without FOR JSON/
+# STRING_AGG tricks). Reuses the exact same {where_clause} text as the
+# aggregate query, so both queries stay scoped identically.
 #
-# RecentPoleStats here computes MORE than the aggregate query's version
-# above: alongside the same priority-based LightStatus rollup, it also
-# averages the three per-reading percentage metrics (Battery/Panel/Light)
-# and rolls up IsOnline as "was any reading in the window online" (MAX),
-# matching PoleVitals' own bucket-level IsOnline semantics. CAST(...AS
-# BIT) on IsOnline matters, not decorative: MAX(CASE WHEN...) produces a
-# plain INT (0/1), and without the cast pyodbc would hand that back as a
-# Python int, so isOnline would serialize as 1/0 in the JSON output
-# instead of true/false -- the CAST keeps pyodbc's native BIT->bool
-# conversion in play, same as reading a real BIT column directly would.
+# RecentPoleStats here is now a plain, unaggregated SELECT (no GROUP BY
+# at all) -- Last48Hours is structurally always 0-or-1 rows per
+# LocationId (see pole_vitals_loader.py's _LAST_48_HOURS_MERGE_SQL), so
+# there's nothing to aggregate across the way the old Hour-window design
+# needed to.
+#
+# CAST(...AS BIT) on every fault/IsOnline column matters, not decorative:
+# PoleVitals.IsOnline/IsLedFault/etc. are already BIT columns, so
+# pyodbc's normal BIT->bool conversion already applies without an
+# explicit cast here -- unlike the old design's MAX(CASE WHEN...)
+# aggregation, which produced a plain INT and needed the cast. Kept
+# implicit (no CAST at all) for exactly that reason: there's no
+# aggregation happening anymore to strip the native BIT type away.
+#
+# lastUpdate is converted to the POLE'S OWN local time (via PoleTimeZones,
+# falling back to Eastern for an unresolved location) -- not left as
+# UTC. AT TIME ZONE on an already-DATETIMEOFFSET value converts its
+# displayed offset while preserving the same absolute instant, the same
+# operation pole_vitals_loader.py uses extensively for bucketing.
 #
 # OUTER APPLY (not a JOIN/CTE) for each pole's single most recent
 # PoleTelemetry row (LastUpload, BatteryVoltage1, BatteryVoltage2) --
-# genuinely different access pattern than RecentPoleStats above (a
-# window aggregation over PoleVitals, a comparatively small, precomputed
-# table), and different again from pole_vitals_loader.py's own PoleTelemetry
-# queries (which scan a multi-day lookback window across ALL poles at
-# once). Here we want exactly one raw row per pole, and PoleTelemetry's
-# own PRIMARY KEY is (LocationId, LastUpload) -- LocationId leading means
+# PoleTelemetry's own PRIMARY KEY is (LocationId, LastUpload), so
 # `TOP 1 ... WHERE LocationId = @x ORDER BY LastUpload DESC` seeks
-# directly into that one pole's rows in the clustered index, rather than
-# scanning the table -- OUTER APPLY driven per-pole from Poles (a small,
-# bounded table, unlike PoleTelemetry's own multi-million-row scale) is
-# the natural way to express "correlated per-row TOP-1 lookup" in T-SQL.
-# OUTER, not CROSS: a pole with no LocationId, or one with zero matching
-# PoleTelemetry rows, must still appear in the result (with these three
-# columns NULL) rather than being dropped entirely -- same "still
-# appears, just unclassified" philosophy used throughout this query.
+# directly into that one pole's rows rather than scanning the table.
+# OUTER, not CROSS: a pole with no LocationId, or zero matching
+# PoleTelemetry rows, must still appear (with these columns NULL).
 #
-# Plain INNER JOINs for Poles->Projects->Customers, unlike the aggregate
-# query's LEFT JOINs: no phantom-row handling is needed here
-# specifically, since a project or customer with zero matching poles
-# simply returns zero rows for this query -- the aggregate query already
-# correctly reports totalLights=0 etc. for that case, and an empty
-# "poles" list falls out naturally when grouping these rows in Python (a
-# project that isn't a key in the resulting dict just gets [] when
-# looked up).
-# The "full" RecentPoleStats CTE -- LightStatus (priority-based rollup),
-# IsOnline (any-online-in-window), and the three averaged percentage
-# metrics, all from the same GROUP BY LocationId aggregation pass over
-# PoleVitals. Factored out into its own constant (rather than inlined
-# directly into _POLE_DETAILS_SQL_TEMPLATE below) specifically so
-# shared/poles_api.py's lighter "summary" query (see that module) can
-# reuse the exact same CASE/MAX logic without a second, independently
-# -maintained copy that could quietly drift out of sync with this one.
-# _FETCH_SQL_TEMPLATE above intentionally does NOT use this -- it only
-# ever needs LightStatus for its own aggregate counts, not the other
-# four columns, so duplicating just the LightStatus CASE expression
-# there (not the whole CTE) keeps that query from computing three
-# unused AVG()s for no reason.
-_RECENT_POLE_STATS_CTE = """RecentPoleStats AS (
-    SELECT
-        LocationId,
-        ROUND(AVG(AvgBatteryPercentage), 2) AS BatteryPercentage,
-        ROUND(AVG(AvgPanelPercentage), 2) AS PanelPercentage,
-        ROUND(AVG(AvgLightPercentage), 2) AS LightPercentage,
-        CAST(MAX(CASE WHEN IsOnline = 1 THEN 1 ELSE 0 END) AS BIT) AS IsOnline,
-        CASE
-            WHEN MAX(CASE WHEN LightStatus = 'Not Working' THEN 1 ELSE 0 END) = 1 THEN 'Not Working'
-            WHEN MAX(CASE WHEN LightStatus = 'Working' THEN 1 ELSE 0 END) = 1 THEN 'Working'
-            ELSE 'DayLight'
-        END AS LightStatus
-    FROM PoleVitals
-    WHERE PeriodType = ?
-      AND PeriodStart >= DATEADD(HOUR, -{hours_window}, SYSDATETIMEOFFSET())
-    GROUP BY LocationId
-)"""
-
-_POLE_DETAILS_SQL_TEMPLATE = (
-    """
-;WITH """
-    + _RECENT_POLE_STATS_CTE
-    + """
+# Plain INNER JOINs for Poles->Projects->Customers: a project/customer
+# with zero matching poles simply returns zero rows for this query -- the
+# aggregate query already correctly reports totalLights=0 etc. for that
+# case, and an empty "poles" list falls out naturally in Python.
+_POLE_DETAILS_SQL_TEMPLATE = """
 SELECT
     proj.Id AS ProjectId,
     p.Id AS PoleId,
@@ -193,19 +139,24 @@ SELECT
     p.InstallDate AS InstallDate,
     p.Lat AS Lat,
     p.Long AS Long,
-    latest_pt.LastUpload AS LastUpload,
+    latest_pt.LastUpload AT TIME ZONE ISNULL(ptz.WindowsTimeZone, 'Eastern Standard Time') AS LastUpload,
     latest_pt.BatteryVoltage1 AS BatteryVoltage1,
     latest_pt.BatteryVoltage2 AS BatteryVoltage2,
-    rps.LightStatus AS LightStatus,
     rps.IsOnline AS IsOnline,
-    rps.BatteryPercentage AS BatteryPercentage,
-    rps.PanelPercentage AS PanelPercentage,
-    rps.LightPercentage AS LightPercentage,
+    rps.IsLedFault AS IsLedFault,
+    rps.IsBatteryFault AS IsBatteryFault,
+    rps.IsPanelFault AS IsPanelFault,
+    rps.IsOpenIssueFault AS IsOpenIssueFault,
+    rps.IsPoleFault AS IsPoleFault,
+    rps.AvgBatteryPercentage AS BatteryPercentage,
+    rps.AvgPanelPercentage AS PanelPercentage,
+    rps.AvgLightPercentage AS LightPercentage,
     c.Id AS CustomerId
 FROM Poles p
 JOIN Projects proj ON p.ProjectId = proj.Id
 JOIN Customers c ON proj.CustomerId = c.Id
-LEFT JOIN RecentPoleStats rps ON p.LocationId = rps.LocationId
+LEFT JOIN PoleVitals rps ON p.LocationId = rps.LocationId AND rps.PeriodType = ?
+LEFT JOIN PoleTimeZones ptz ON p.LocationId = ptz.LocationId
 OUTER APPLY (
     SELECT TOP 1 pt.LastUpload, pt.BatteryVoltage1, pt.BatteryVoltage2
     FROM PoleTelemetry pt
@@ -215,10 +166,9 @@ OUTER APPLY (
 {where_clause}
 ORDER BY proj.Id, p.PoleNumber
 """
-)
 
 
-def _working_percentage(working_count: int, total_lights: int) -> float:
+def _percent_working(total_lights: int, total_faults: int) -> float:
     """
     0 when total_lights is 0 (nothing to be a percentage OF), not a
     divide-by-zero error and not None -- a plain 0.0 is a safer default
@@ -227,25 +177,18 @@ def _working_percentage(working_count: int, total_lights: int) -> float:
     """
     if total_lights == 0:
         return 0.0
-    return round((working_count / total_lights) * 100, 2)
+    return round(((total_lights - total_faults) / total_lights) * 100, 2)
 
 
 def _pole_row_to_dict(row) -> dict:
     """Converts one row from _POLE_DETAILS_SQL_TEMPLATE into its own
     dict for a project's "poles" list.
 
-    lightStatus is None (JSON null) for a pole with no Hour PoleVitals
-    rows in the recent window -- deliberately not a made-up string like
-    "No Telemetry", since that's not a real LightStatus value
-    (CK_PoleVitals_LightStatus only allows 'Working', 'DayLight', 'Not
-    Working') and null more accurately mirrors what's actually in the
-    database: nothing, not a fourth status. isOnline is the same pole's
-    rolled-up PoleVitals.IsOnline across that same window (was any
-    reading in it online) -- also None for an unclassified pole, for the
-    same reason. The three avg*Percentage fields are each simply
-    averaged across the window's Hour rows (already NULL-safe -- AVG()
-    ignores NULLs, and a pole with zero rows in the window naturally
-    gets NULL for all three via the LEFT JOIN).
+    isOnline/isLedFault/isBatteryFault/isPanelFault/isOpenIssueFault/
+    isPoleFault, and the three avg*Percentage fields, all come directly
+    from that pole's own Last48Hours PoleVitals row -- None (JSON null)
+    for a pole with no such row yet (installed, but no telemetry
+    processed for it, or none recent enough), not a fabricated value.
 
     installDate/lat/long come straight from Poles -- static install-time
     facts, not derived from any telemetry or vitals aggregation.
@@ -253,20 +196,19 @@ def _pole_row_to_dict(row) -> dict:
     lastUpdate/batteryVoltage1/batteryVoltage2 come from that pole's
     single most recent PoleTelemetry row (via the OUTER APPLY in
     _POLE_DETAILS_SQL_TEMPLATE) -- the raw reading itself, genuinely
-    different from avgBatteryPercentage (which is PoleVitals' own
-    aggregate of BatteryElecCurrent1/2, a DIFFERENT pair of columns from
-    BatteryVoltage1/2). All three are None for a pole with no LocationId
-    or no matching PoleTelemetry rows at all -- same "unclassified, not
-    a fabricated zero" treatment as everything else here.
+    different from avgBatteryPercentage (PoleVitals' own aggregate of a
+    DIFFERENT pair of PoleTelemetry columns, BatteryElecCurrent1/2, not
+    BatteryVoltage1/2). lastUpdate reflects the POLE'S OWN local time
+    (via PoleTimeZones), not UTC -- see _POLE_DETAILS_SQL_TEMPLATE's own
+    comment. All three are None for a pole with no LocationId or no
+    matching PoleTelemetry rows at all.
 
     The row's ProjectId (first column) and CustomerId (last column,
-    added for shared/poles_api.py's benefit -- see that module's
-    docstring) are both deliberately NOT included in this function's own
-    output: getPoleVitals nests each pole under its own project (already
-    under its own customer), so both are already implied by that
-    nesting; only poles_api.py's flat, non-nested getPoles listing needs
-    them included explicitly, which it adds itself by reading straight
-    from the row rather than through this function."""
+    added for shared/poles_api.py's benefit) are both deliberately NOT
+    included in this function's own output: getPoleVitals nests each
+    pole under its own project (already under its own customer), so both
+    are already implied by that nesting; only poles_api.py's flat,
+    non-nested getPoles listing needs them included explicitly."""
     (
         _,
         pole_id,
@@ -278,8 +220,12 @@ def _pole_row_to_dict(row) -> dict:
         last_update,
         battery_voltage_1,
         battery_voltage_2,
-        light_status,
         is_online,
+        is_led_fault,
+        is_battery_fault,
+        is_panel_fault,
+        is_open_issue_fault,
+        is_pole_fault,
         battery_percentage,
         panel_percentage,
         light_percentage,
@@ -295,8 +241,12 @@ def _pole_row_to_dict(row) -> dict:
         "lastUpdate": json_safe(last_update),
         "batteryVoltage1": json_safe(battery_voltage_1),
         "batteryVoltage2": json_safe(battery_voltage_2),
-        "lightStatus": json_safe(light_status),
         "isOnline": json_safe(is_online),
+        "isLedFault": json_safe(is_led_fault),
+        "isBatteryFault": json_safe(is_battery_fault),
+        "isPanelFault": json_safe(is_panel_fault),
+        "isOpenIssueFault": json_safe(is_open_issue_fault),
+        "isPoleFault": json_safe(is_pole_fault),
         "avgBatteryPercentage": json_safe(battery_percentage),
         "avgPanelPercentage": json_safe(panel_percentage),
         "avgLightPercentage": json_safe(light_percentage),
@@ -304,115 +254,100 @@ def _pole_row_to_dict(row) -> dict:
 
 
 def _row_to_project_dict(row, poles: list) -> dict:
-    _, _, project_id, project_name, total_lights, working_count, total_faults, no_telemetry_count = row
+    _, _, project_id, project_name, total_lights, connected_lights, total_faults = row
     return {
         "id": json_safe(project_id),
         "name": json_safe(project_name),
         "totalLights": json_safe(total_lights),
-        "workingPercentage": _working_percentage(working_count, total_lights),
-        "optimisticWorkingPercentage": _working_percentage(
-            working_count + no_telemetry_count, total_lights
-        ),
+        "connectedLights": json_safe(connected_lights),
         "totalFaults": json_safe(total_faults),
-        "totalNonTelemetryAvailable": json_safe(no_telemetry_count),
+        "percentWorking": _percent_working(total_lights, total_faults),
         "poles": poles,
     }
 
 
 def _sum_pole_stats(rows) -> tuple:
     """
-    Sums TotalLights/WorkingCount/TotalFaults/NoTelemetryCount (columns
-    4/5/6/7) across a set of project rows -- used for the customer-level
-    rollup, which is a true pole-weighted aggregate (sum of working /
-    sum of total across every one of that customer's projects), not an
-    average of each project's own already-rounded percentage --
-    averaging percentages would give a tiny project equal weight to a
-    huge one, misrepresenting the customer's actual overall pole health.
+    Sums TotalLights/ConnectedLights/TotalFaults (columns 4/5/6) across a
+    set of project rows -- used for the customer-level rollup, which is
+    a true pole-weighted aggregate (sum of faults / sum of total across
+    every one of that customer's projects), not an average of each
+    project's own already-rounded percentage -- averaging percentages
+    would give a tiny project equal weight to a huge one, misrepresenting
+    the customer's actual overall pole health.
 
     Callers must exclude any "phantom" no-project row (ProjectId, column
     2, is NULL -- a customer with zero projects) before calling this,
     since such a row has None for these columns, not 0.
     """
     total_lights = sum(row[4] for row in rows)
-    working_count = sum(row[5] for row in rows)
+    connected_lights = sum(row[5] for row in rows)
     total_faults = sum(row[6] for row in rows)
-    no_telemetry_count = sum(row[7] for row in rows)
-    return total_lights, working_count, total_faults, no_telemetry_count
+    return total_lights, connected_lights, total_faults
 
 
 def _customer_rollup_fields(rows) -> dict:
-    """Returns the five customer-level rollup fields (totalLights,
-    workingPercentage, optimisticWorkingPercentage, totalFaults,
-    totalNonTelemetryAvailable), computed via _sum_pole_stats() over
-    rows -- all 0/0.0 if rows is empty (a customer with no real
-    projects)."""
+    """Returns the four customer-level rollup fields (totalLights,
+    connectedLights, totalFaults, percentWorking), computed via
+    _sum_pole_stats() over rows -- all 0/0.0 if rows is empty (a customer
+    with no real projects)."""
     if not rows:
         return {
             "totalLights": 0,
-            "workingPercentage": 0.0,
-            "optimisticWorkingPercentage": 0.0,
+            "connectedLights": 0,
             "totalFaults": 0,
-            "totalNonTelemetryAvailable": 0,
+            "percentWorking": 0.0,
         }
-    total_lights, working_count, total_faults, no_telemetry_count = _sum_pole_stats(rows)
+    total_lights, connected_lights, total_faults = _sum_pole_stats(rows)
     return {
         "totalLights": total_lights,
-        "workingPercentage": _working_percentage(working_count, total_lights),
-        "optimisticWorkingPercentage": _working_percentage(
-            working_count + no_telemetry_count, total_lights
-        ),
+        "connectedLights": connected_lights,
         "totalFaults": total_faults,
-        "totalNonTelemetryAvailable": no_telemetry_count,
+        "percentWorking": _percent_working(total_lights, total_faults),
     }
 
 
 def get_pole_vitals(customer_id: str = None, project_id: str = None, limit: int = None):
     """
     Returns each Customer's Projects, each annotated with pole-health
-    rollup stats (totalLights, workingPercentage,
-    optimisticWorkingPercentage, totalFaults, totalNonTelemetryAvailable)
-    and a "poles" list (one entry per Pole belonging to that project:
-    id, poleNumber, locationId, installDate, lat, long, lastUpdate,
-    batteryVoltage1, batteryVoltage2, lightStatus, isOnline,
+    rollup stats (totalLights, connectedLights, totalFaults,
+    percentWorking) and a "poles" list (one entry per Pole belonging to
+    that project: id, poleNumber, locationId, installDate, lat, long,
+    lastUpdate, batteryVoltage1, batteryVoltage2, isOnline, isLedFault,
+    isBatteryFault, isPanelFault, isOpenIssueFault, isPoleFault,
     avgBatteryPercentage, avgPanelPercentage, avgLightPercentage) --
     computed from every Pole belonging to that project and each pole's
-    own Hour-period PoleVitals rows from the last _RECENT_HOURS_WINDOW
-    hours (not just the single most recent one) -- see
-    _WORKING_LIGHT_STATUSES, _STATUS_PERIOD_TYPE, and
-    _RECENT_HOURS_WINDOW above for the three business-rule choices this
-    is built on. lightStatus/isOnline are rolled up across that window
-    using the same priority-based aggregation PoleVitals' own
-    bucket-level aggregation uses (Not Working beats Working beats the
-    DayLight default; IsOnline is "was any reading in the window
-    online") -- not just read from a single Hour bucket. The three
-    avg*Percentage fields are a plain average of that same window's Hour
-    rows. totalNonTelemetryAvailable is a pole with zero Hour PoleVitals
-    rows in the window (LightStatus IS NULL after the LEFT JOIN) --
-    counted separately, not folded into totalFaults or workingPercentage,
-    since "we don't know" is a genuinely different state from "confirmed
-    broken"; the same pole shows up in "poles" with lightStatus: null,
-    isOnline: null, and all three avg*Percentage fields null.
+    own Last48Hours PoleVitals row (a single, continuously-updated
+    rolling-window row per pole -- see pole_vitals_loader.py's own module
+    docstring for why that period type is structured that way; no
+    window-aggregation happens at this API layer at all anymore).
+
+    Rollup design: totalLights (population) counts poles that are
+    IsOnline, PLUS poles that aren't online but DO have an open issue
+    (IsOpenIssueFault) -- a pole that's neither online nor known to have
+    an issue is excluded from the population entirely, not counted as
+    broken. connectedLights is just the IsOnline poles. totalFaults is
+    poles WITHIN that population whose IsPoleFault is true. percentWorking
+    is (totalLights - totalFaults) / totalLights * 100. See
+    _FETCH_SQL_TEMPLATE's own comment for the full reasoning.
+
     installDate/lat/long come straight from Poles -- static, unrelated to
     any telemetry or vitals data (present even for a pole with neither).
     lastUpdate/batteryVoltage1/batteryVoltage2 come from that pole's own
     single most recent PoleTelemetry row (an OUTER APPLY, not the
-    PoleVitals-based rollup above) -- the raw reading itself, distinct
+    PoleVitals-based fields above) -- the raw reading itself, distinct
     from avgBatteryPercentage (PoleVitals' own aggregate of a DIFFERENT
     pair of PoleTelemetry columns, BatteryElecCurrent1/2, not
-    BatteryVoltage1/2). All three are None for a pole with no LocationId
-    or no matching PoleTelemetry rows at all.
-    optimisticWorkingPercentage is the same percentage computed as if
-    every one of those unclassified poles WERE working ((workingCount +
-    noTelemetryCount) / totalLights) -- the best-case reading, alongside
-    workingPercentage's more conservative one (which excludes them from
-    the numerator entirely). The Customer itself ALSO carries the same
-    five rollup fields (but NOT a "poles" list of its own -- poles only
-    ever appear nested under their own project), summed across all of
-    that customer's own projects -- a true pole-weighted aggregate for
-    both percentages (sum of working, or sum of working plus
-    non-telemetry, / sum of total), not an average of each project's own
-    percentage (see _sum_pole_stats()'s docstring for why that
-    distinction matters).
+    BatteryVoltage1/2). lastUpdate reflects the pole's own local time
+    zone (via PoleTimeZones), not UTC. All three are None for a pole with
+    no LocationId or no matching PoleTelemetry rows at all.
+
+    The Customer itself ALSO carries the same four rollup fields (but NOT
+    a "poles" list of its own -- poles only ever appear nested under
+    their own project), summed across all of that customer's own projects
+    -- a true pole-weighted aggregate (see _sum_pole_stats()'s docstring
+    for why that distinction matters), not an average of each project's
+    own percentage.
 
     project_id: if given, returns a SINGLE FLAT dict for that one project
     (customerId/customerName included directly on it for context, not
@@ -425,14 +360,12 @@ def get_pole_vitals(customer_id: str = None, project_id: str = None, limit: int 
     project's customer's own rollup totals -- this is a single-project
     view, not a customer view.
     customer_id: if given WITHOUT project_id, returns a SINGLE dict for
-    that one customer (with its own totalLights/workingPercentage/
-    totalFaults, and a nested "projects" list, one entry per project --
-    including projects with zero poles, AND an empty list with all
-    rollup fields at 0/0.0 if the customer itself has zero projects), or
-    None if that customer doesn't exist. NOT a list -- a customerId
-    always identifies at most one customer, unlike projects_api.py's
-    customer_id filter (which returns that customer's many projects as a
-    genuine list).
+    that one customer (with its own rollup totals, and a nested
+    "projects" list, one entry per project -- including projects with
+    zero poles, AND an empty list with all rollup fields at 0/0.0 if the
+    customer itself has zero projects), or None if that customer doesn't
+    exist. NOT a list -- a customerId always identifies at most one
+    customer, unlike projects_api.py's customer_id filter.
     limit: max number of CUSTOMERS returned when neither id is given --
     the top-level entity in the unfiltered case. Each returned customer
     still includes ALL of their projects (limit doesn't truncate
@@ -462,7 +395,7 @@ def get_pole_vitals(customer_id: str = None, project_id: str = None, limit: int 
     cursor = conn.cursor()
     try:
         cursor.execute(
-            _FETCH_SQL_TEMPLATE.format(where_clause=where_clause, hours_window=_RECENT_HOURS_WINDOW),
+            _FETCH_SQL_TEMPLATE.format(where_clause=where_clause),
             *params,
         )
         rows = cursor.fetchall()
@@ -471,7 +404,7 @@ def get_pole_vitals(customer_id: str = None, project_id: str = None, limit: int 
         # _POLE_DETAILS_SQL_TEMPLATE's own comment for why this is a
         # separate query rather than merged into the one above).
         cursor.execute(
-            _POLE_DETAILS_SQL_TEMPLATE.format(where_clause=where_clause, hours_window=_RECENT_HOURS_WINDOW),
+            _POLE_DETAILS_SQL_TEMPLATE.format(where_clause=where_clause),
             *params,
         )
         pole_rows = cursor.fetchall()
@@ -546,38 +479,29 @@ def get_pole_vitals(customer_id: str = None, project_id: str = None, limit: int 
 
 # --------------------------------------------------------------------------
 # get_pole_vitals_by_period() -- a genuinely different kind of query from
-# get_pole_vitals() above: that one rolls up the last _RECENT_HOURS_WINDOW
-# hours of 'Hour'-period PoleVitals rows into one steady current-status
-# signal. This one returns a pole's FULL history of PoleVitals rows for a
-# CALLER-CHOSEN period type, each read directly -- no rollup, no averaging
-# across rows, no priority-based LightStatus aggregation across a window.
-# Different use case: "show me every one of this pole's own Hour buckets
-# (or Day buckets), as-is", not "give me a steadier, less noise-prone
-# current-status summary".
+# get_pole_vitals() above: that one reads each pole's single Last48Hours
+# PoleVitals row directly (no window/aggregation at all -- it's already a
+# single row per pole). This one returns a pole's FULL HISTORY of
+# PoleVitals rows for a CALLER-CHOSEN period type (Hour or Day -- genuine
+# historical buckets, unlike Last48Hours), each read directly, exactly as
+# stored.
 
-# Valid PoleVitals period types -- Week/Month were removed from
-# load_pole_vitals() entirely (see that loader's own module docstring and
-# the README for that history), so only these two remain.
+# Valid PoleVitals period types for THIS function specifically --
+# Last48Hours is deliberately excluded: it's a single current-state row,
+# not a history to page through, so "give me its history" doesn't apply
+# to it the way it does for Hour/Day.
 _VALID_PERIOD_TYPES = ("Hour", "Day")
-
-# How many history rows to return by default/at most when a caller
-# doesn't specify limit -- PoleVitals has no retention/cleanup of its
-# own (unlike PoleTelemetry), so it grows by one row per pole per Hour
-# (or Day) forever; "all of it, no bound at all" would eventually mean
-# thousands of rows for a pole with a long install history. Reuses
-# api_utils.clamp_limit()'s existing DEFAULT_LIMIT/MAX_LIMIT, same as
-# every other list-returning endpoint in this project, rather than
-# inventing a separate cap just for this one.
 
 # A pole's static facts -- id, poleNumber, locationId, installDate, lat,
 # long, lastUpdate -- are properties of the POLE, not of any individual
 # PoleVitals bucket, so they're fetched once here rather than repeated
 # on every history entry (which would be wasteful once this can return
-# many rows). Only ONE OUTER APPLY now (PoleTelemetry, for lastUpdate) --
+# many rows). Only ONE OUTER APPLY (PoleTelemetry, for lastUpdate) --
 # batteryVoltage1/batteryVoltage2 were dropped from this endpoint
-# entirely per explicit request, so there's nothing else needing that
-# join. OUTER, not CROSS: a pole with no PoleTelemetry row yet must
-# still be returned (with lastUpdate null), not dropped.
+# entirely per earlier explicit request. lastUpdate reflects the pole's
+# own local time zone (via PoleTimeZones), same as get_pole_vitals()'s
+# per-pole lastUpdate -- not UTC. OUTER, not CROSS: a pole with no
+# PoleTelemetry row yet must still be returned (with lastUpdate null).
 _POLE_INFO_FOR_HISTORY_SQL_TEMPLATE = """
 SELECT
     p.Id AS PoleId,
@@ -586,8 +510,9 @@ SELECT
     p.InstallDate AS InstallDate,
     p.Lat AS Lat,
     p.Long AS Long,
-    latest_pt.LastUpload AS LastUpload
+    latest_pt.LastUpload AT TIME ZONE ISNULL(ptz.WindowsTimeZone, 'Eastern Standard Time') AS LastUpload
 FROM Poles p
+LEFT JOIN PoleTimeZones ptz ON p.LocationId = ptz.LocationId
 OUTER APPLY (
     SELECT TOP 1 pt.LastUpload
     FROM PoleTelemetry pt
@@ -599,20 +524,20 @@ WHERE p.Id = ?
 
 # The actual history: every PoleVitals row for this pole's LocationId and
 # the caller-specified period type, each returned exactly as stored --
-# no CTE/aggregation machinery (unlike _RECENT_POLE_STATS_CTE, built for
-# rolling multiple rows into one). PeriodStart/PeriodEnd are included
-# specifically so each entry can actually be told apart from the others
-# -- without them, an array of otherwise-identical-shaped percentage
-# values would have no way to say which hour/day each one belongs to.
-# Ordered most-recent-first, matching every other "give me a list"
-# endpoint in this project, so a TOP(?)-bounded result still returns the
-# most current data rather than an arbitrary/oldest slice.
+# no aggregation. PeriodStart/PeriodEnd are included specifically so each
+# entry can actually be told apart from the others. Ordered
+# most-recent-first, so a TOP(?)-bounded result still returns the most
+# current data rather than an arbitrary/oldest slice.
 _POLE_VITALS_HISTORY_SQL_TEMPLATE = """
 SELECT TOP (?)
     pv.PeriodStart AS PeriodStart,
     pv.PeriodEnd AS PeriodEnd,
-    pv.LightStatus AS LightStatus,
     pv.IsOnline AS IsOnline,
+    pv.IsLedFault AS IsLedFault,
+    pv.IsBatteryFault AS IsBatteryFault,
+    pv.IsPanelFault AS IsPanelFault,
+    pv.IsOpenIssueFault AS IsOpenIssueFault,
+    pv.IsPoleFault AS IsPoleFault,
     pv.AvgBatteryPercentage AS AvgBatteryPercentage,
     pv.AvgPanelPercentage AS AvgPanelPercentage,
     pv.AvgLightPercentage AS AvgLightPercentage
@@ -627,16 +552,16 @@ def _pole_vitals_history_row_to_dict(row) -> dict:
     """Converts one row from _POLE_VITALS_HISTORY_SQL_TEMPLATE -- one
     entry in the "vitals" array. Same null-handling convention as the
     rest of this module: null (never a fabricated value) for anything a
-    given bucket doesn't have -- though in practice every PoleVitals row
-    that exists at all already has every one of these columns populated
-    by load_pole_vitals(); null here would mean something upstream
-    changed, not an expected/normal case the way it is for a pole with
-    no PoleVitals rows at all yet."""
+    given bucket doesn't have."""
     (
         period_start,
         period_end,
-        light_status,
         is_online,
+        is_led_fault,
+        is_battery_fault,
+        is_panel_fault,
+        is_open_issue_fault,
+        is_pole_fault,
         battery_percentage,
         panel_percentage,
         light_percentage,
@@ -644,8 +569,12 @@ def _pole_vitals_history_row_to_dict(row) -> dict:
     return {
         "periodStart": json_safe(period_start),
         "periodEnd": json_safe(period_end),
-        "lightStatus": json_safe(light_status),
         "isOnline": json_safe(is_online),
+        "isLedFault": json_safe(is_led_fault),
+        "isBatteryFault": json_safe(is_battery_fault),
+        "isPanelFault": json_safe(is_panel_fault),
+        "isOpenIssueFault": json_safe(is_open_issue_fault),
+        "isPoleFault": json_safe(is_pole_fault),
         "avgBatteryPercentage": json_safe(battery_percentage),
         "avgPanelPercentage": json_safe(panel_percentage),
         "avgLightPercentage": json_safe(light_percentage),
@@ -657,32 +586,25 @@ def get_pole_vitals_by_period(pole_id: str, period_type: str, limit: int = None)
     Returns a single pole's static info (id, poleNumber, locationId,
     installDate, lat, long, lastUpdate) plus its full history of
     PoleVitals rows for the given period_type, each entry as its own
-    dict in a "vitals" list (periodStart, periodEnd, lightStatus,
-    isOnline, avgBatteryPercentage, avgPanelPercentage,
+    dict in a "vitals" list (periodStart, periodEnd, isOnline,
+    isLedFault, isBatteryFault, isPanelFault, isOpenIssueFault,
+    isPoleFault, avgBatteryPercentage, avgPanelPercentage,
     avgLightPercentage). Deliberately NO rollup/aggregation across
-    entries -- each one is a direct read of one PoleVitals row, unlike
-    get_pole_vitals()'s 6-hour-window rollup (which uses the same
-    priority logic PoleVitals' own bucket-level aggregation does).
-    batteryVoltage1/batteryVoltage2 are not included at all -- dropped
-    per explicit request, along with the PoleTelemetry join that would
-    otherwise be needed to get them.
+    entries -- each one is a direct read of one PoleVitals row.
 
-    period_type: must be 'Hour' or 'Day' -- Week/Month were removed from
-    PoleVitals entirely (see pole_vitals_loader.py's own module docstring
-    and the README for that history). Raises ValueError for anything
+    period_type: must be 'Hour' or 'Day' -- Last48Hours is excluded (see
+    _VALID_PERIOD_TYPES' own comment for why: it's a single current-state
+    row, not a history to page through). Raises ValueError for anything
     else; the HTTP layer maps that to a 400.
 
     limit: max number of history entries returned, most-recent-first.
     Defaults to DEFAULT_LIMIT, capped at MAX_LIMIT (see
-    shared/api_utils.py) -- PoleVitals has no retention/cleanup of its
-    own, so an actually-unbounded "every row that has ever existed"
-    isn't offered here.
+    shared/api_utils.py).
 
     Returns None if no Pole exists with that id. If the pole exists but
     has no PoleTelemetry row yet, lastUpdate comes back null. If it has
     no PoleVitals rows of the requested period_type yet, "vitals" comes
-    back as an empty list -- not an error, and not a 404 (the pole
-    itself was found; it just has no history yet for this period type).
+    back as an empty list -- not an error, and not a 404.
     """
     if period_type not in _VALID_PERIOD_TYPES:
         raise ValueError(f"periodType must be one of: {', '.join(_VALID_PERIOD_TYPES)}")

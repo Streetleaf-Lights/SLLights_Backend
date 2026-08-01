@@ -13,6 +13,7 @@ import os
 
 os.environ.setdefault("AIRTABLE_API_KEY", "test-airtable-key")
 os.environ.setdefault("AIRTABLE_BASE_ID", "test-base-id")
+os.environ.setdefault("AIRTABLE_POLE_ISSUES_BASE_ID", "test-pole-issues-base-id")
 os.environ.setdefault("SQL_CONNECTION_STRING", "test-connection-string")
 os.environ.setdefault("ENVIRONMENT", "Dev")
 os.environ.setdefault("AUTH_JWT_SECRET", "test-jwt-secret")
@@ -175,6 +176,111 @@ def patch_get_connection_poles(mocker, mock_conn):
     """Patches shared.poles_loader.get_connection to return mock_conn."""
     return mocker.patch(
         "shared.poles_loader.get_connection", return_value=mock_conn
+    )
+
+
+@pytest.fixture
+def patch_get_connection_pole_telemetry(mocker, mock_conn):
+    """Patches shared.pole_telemetry_loader.get_connection to return mock_conn."""
+    return mocker.patch(
+        "shared.pole_telemetry_loader.get_connection", return_value=mock_conn
+    )
+
+
+@pytest.fixture
+def patch_fetch_lamps(mocker):
+    """Patches shared.pole_telemetry_loader.fetch_lamps (already imported by name)."""
+    return mocker.patch("shared.pole_telemetry_loader.fetch_lamps")
+
+
+@pytest.fixture
+def make_lamp_record():
+    """
+    Factory for building a raw Leadsun /lamps record dict with sane
+    defaults, using the real (lowerCamelCase) Leadsun field names --
+    matches the confirmed real sample record test_pole_telemetry_loader.py
+    is written against (e.g. LeadsunId=10358, LeadsunProjectId=482,
+    LeadsunProjectName="Chaparral", ProductId="AE3SAP7323113143").
+    """
+
+    def _make(
+        product_name="12009-1000",
+        last_upload="2026-07-15T12:35:30.000+00:00",
+        extra_fields=None,
+    ):
+        record = {
+            "productName": product_name,
+            "lastUpload": last_upload,
+            "batteryVoltage1": 13.52,
+            "batteryVoltage2": 13.48,
+            "batteryElecCurrent1": 2.1,
+            "batteryElecCurrent2": 2.0,
+            "lampPower1": 0.0,
+            "lampPower2": 0.0,
+            "solarBoardVoltage": 0.0,
+            "solarBoardElecCurrent": 0.0,
+            "dcInVoltage": 13.5,
+            "batteryOutElecCurrent": 0.5,
+            "batteryTemperature1": 28.3,
+            "batteryTemperature2": 28.1,
+            "mcuTemperature": 32.0,
+            "envTemperature": 27.5,
+            "lightingState": "lighting-off  ",  # trailing whitespace, as Leadsun sends it
+            "dcInState": 3,
+            "dcOutState": 1,
+            "solarBoardState": 1,
+            "battery1State": 1,
+            "battery2State": 1,
+            "lamp1State": 0,
+            "lamp2State": 0,
+            "controllerCode": "CTRL-001",
+            "productId": "AE3SAP7323113143",
+            "createTime": None,  # None in the confirmed real sample
+            "solarBoardDcStatus": "NORMAL",
+            "lampBatteryStatus": "NORMAL",
+            "userName": "field-tech-1",
+            "id": 10358,
+            "groupId": 55,
+            "groupName": "Zone A",
+            "gatewayCode": "GW-001",
+            "projectId": 482,
+            "projectName": "Chaparral",
+            "modelId": 7,
+            "isOnline": True,
+            "timeoutFlag": 0,
+            "longitude": -80.7236,
+            "latitude": 27.99507,
+            "controlModelCode": "CM-01",
+            "controlModelName": "Standard",
+        }
+        if extra_fields:
+            record.update(extra_fields)
+        return record
+
+    return _make
+
+
+@pytest.fixture
+def patch_get_connection_pole_vitals(mocker, mock_conn):
+    """Patches shared.pole_vitals_loader.get_connection to return mock_conn."""
+    return mocker.patch(
+        "shared.pole_vitals_loader.get_connection", return_value=mock_conn
+    )
+
+
+@pytest.fixture
+def patch_get_connection_pole_vitals_api(mocker, mock_conn):
+    """Patches shared.pole_vitals_api.get_connection to return mock_conn."""
+    return mocker.patch(
+        "shared.pole_vitals_api.get_connection", return_value=mock_conn
+    )
+
+
+@pytest.fixture
+def patch_get_connection_poles_api(mocker, mock_conn):
+    """Patches shared.poles_api.get_connection to return mock_conn."""
+    return mocker.patch(
+        "shared.poles_api.get_connection", return_value=mock_conn
     )
 
 

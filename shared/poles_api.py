@@ -7,7 +7,7 @@ carries the exact same fields as a pole entry inside getPoleVitals's
 "poles" list, by explicit request, so a single shared implementation is
 the only way these two endpoints can't silently drift apart from each
 other over time. If pole_vitals_api.py's per-pole shape changes later
-(a new field, a different window, etc.), getPoles' shape changes with
+(a new field, a different source, etc.), getPoles' shape changes with
 it automatically -- that's the explicit intent, not an accident of
 implementation reuse.
 
@@ -23,8 +23,6 @@ unlikely to be used by anything outside this codebase.
 from shared.api_utils import clamp_limit, json_safe
 from shared.pole_vitals_api import (
     _POLE_DETAILS_SQL_TEMPLATE,
-    _RECENT_HOURS_WINDOW,
-    _RECENT_POLE_STATS_CTE,
     _STATUS_PERIOD_TYPE,
     _pole_row_to_dict,
 )
@@ -48,11 +46,10 @@ def _clamp_summary_limit(limit) -> int:
     return max(1, min(int(limit), _SUMMARY_MAX_LIMIT))
 
 
-# A THIRD query, alongside pole_vitals_api.py's two -- reuses that
-# module's exact same _RECENT_POLE_STATS_CTE (LightStatus/IsOnline/the
-# three avg*Percentage fields, all from one aggregation pass over
-# PoleVitals), but deliberately DROPS the OUTER APPLY into PoleTelemetry
-# that _POLE_DETAILS_SQL_TEMPLATE has. That OUTER APPLY runs once per
+# A SECOND query, alongside pole_vitals_api.py's own -- a direct LEFT
+# JOIN against PoleVitals (WHERE PeriodType = ?), same as
+# _POLE_DETAILS_SQL_TEMPLATE there, but deliberately DROPS the OUTER
+# APPLY into PoleTelemetry that query has. That OUTER APPLY runs once per
 # pole (a correlated TOP-1 lookup) -- each individual seek is cheap
 # (PoleTelemetry's own clustered index is (LocationId, LastUpload),
 # LocationId leading), but doing it ~14,000 times in one query execution
@@ -64,11 +61,7 @@ def _clamp_summary_limit(limit) -> int:
 # pole (e.g. after a user clicks a pin) can still get it cheaply via
 # ?poleId=X, which uses the full _POLE_DETAILS_SQL_TEMPLATE and pays that
 # per-row cost for exactly one row, not thousands.
-_POLE_SUMMARY_SQL_TEMPLATE = (
-    """
-;WITH """
-    + _RECENT_POLE_STATS_CTE
-    + """
+_POLE_SUMMARY_SQL_TEMPLATE = """
 SELECT
     proj.Id AS ProjectId,
     p.Id AS PoleId,
@@ -77,20 +70,23 @@ SELECT
     p.InstallDate AS InstallDate,
     p.Lat AS Lat,
     p.Long AS Long,
-    rps.LightStatus AS LightStatus,
     rps.IsOnline AS IsOnline,
-    rps.BatteryPercentage AS BatteryPercentage,
-    rps.PanelPercentage AS PanelPercentage,
-    rps.LightPercentage AS LightPercentage,
+    rps.IsLedFault AS IsLedFault,
+    rps.IsBatteryFault AS IsBatteryFault,
+    rps.IsPanelFault AS IsPanelFault,
+    rps.IsOpenIssueFault AS IsOpenIssueFault,
+    rps.IsPoleFault AS IsPoleFault,
+    rps.AvgBatteryPercentage AS BatteryPercentage,
+    rps.AvgPanelPercentage AS PanelPercentage,
+    rps.AvgLightPercentage AS LightPercentage,
     c.Id AS CustomerId
 FROM Poles p
 JOIN Projects proj ON p.ProjectId = proj.Id
 JOIN Customers c ON proj.CustomerId = c.Id
-LEFT JOIN RecentPoleStats rps ON p.LocationId = rps.LocationId
+LEFT JOIN PoleVitals rps ON p.LocationId = rps.LocationId AND rps.PeriodType = ?
 {where_clause}
 ORDER BY proj.Id, p.PoleNumber
 """
-)
 
 
 def _pole_row_to_dict_with_parents(row) -> dict:
@@ -130,8 +126,12 @@ def _summary_row_to_dict(row) -> dict:
         install_date,
         lat,
         long_,
-        light_status,
         is_online,
+        is_led_fault,
+        is_battery_fault,
+        is_panel_fault,
+        is_open_issue_fault,
+        is_pole_fault,
         battery_percentage,
         panel_percentage,
         light_percentage,
@@ -144,8 +144,12 @@ def _summary_row_to_dict(row) -> dict:
         "installDate": json_safe(install_date),
         "lat": json_safe(lat),
         "long": json_safe(long_),
-        "lightStatus": json_safe(light_status),
         "isOnline": json_safe(is_online),
+        "isLedFault": json_safe(is_led_fault),
+        "isBatteryFault": json_safe(is_battery_fault),
+        "isPanelFault": json_safe(is_panel_fault),
+        "isOpenIssueFault": json_safe(is_open_issue_fault),
+        "isPoleFault": json_safe(is_pole_fault),
         "avgBatteryPercentage": json_safe(battery_percentage),
         "avgPanelPercentage": json_safe(panel_percentage),
         "avgLightPercentage": json_safe(light_percentage),
@@ -164,8 +168,9 @@ def get_poles(
     """
     Returns Poles, each with the exact same fields a pole carries inside
     getPoleVitals's "poles" list (id, poleNumber, locationId, installDate,
-    lat, long, lastUpdate, batteryVoltage1, batteryVoltage2, lightStatus,
-    isOnline, avgBatteryPercentage, avgPanelPercentage,
+    lat, long, lastUpdate, batteryVoltage1, batteryVoltage2, isOnline,
+    isLedFault, isBatteryFault, isPanelFault, isOpenIssueFault,
+    isPoleFault, avgBatteryPercentage, avgPanelPercentage,
     avgLightPercentage -- see pole_vitals_api.get_pole_vitals()'s own
     docstring for what each of these means and where it comes from),
     plus two additions beyond that literal field set: projectId and
@@ -242,7 +247,7 @@ def get_poles(
     cursor = conn.cursor()
     try:
         cursor.execute(
-            sql_template.format(where_clause=where_clause, hours_window=_RECENT_HOURS_WINDOW),
+            sql_template.format(where_clause=where_clause),
             *params,
         )
         rows = cursor.fetchall()

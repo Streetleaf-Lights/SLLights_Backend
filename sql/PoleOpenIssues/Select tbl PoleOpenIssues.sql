@@ -1,0 +1,7 @@
+SELECT TOP (1000) [Id]
+      ,[IssueId]
+      ,[PoleId]
+      ,[Status]
+      ,[PoleStatus]
+      ,[SP_ExecId]
+  FROM [dbo].[PoleOpenIssues]

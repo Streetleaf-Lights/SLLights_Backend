@@ -1,0 +1,28 @@
+-- One-time data migration, not a schema change: clears every existing
+-- PoleTimeZones row so load_pole_timezones() re-resolves all of them
+-- from Poles.Lat/Poles.Long (Airtable) instead of PoleTelemetry's raw
+-- device GPS (the source they were originally resolved from, before
+-- shared/pole_timezones_loader.py was changed to read from Poles
+-- instead -- see that file's own comments for why: PoleTelemetry's raw
+-- coordinates are the ones documented elsewhere in this codebase as
+-- occasionally corrupted/placeholder values).
+--
+-- Without this, existing rows would silently keep whatever timezone was
+-- resolved from the old (potentially bad) PoleTelemetry coordinates
+-- forever -- load_pole_timezones() only ever resolves LocationIds NOT
+-- YET in PoleTimeZones, so simply changing the loader's source query
+-- has no effect on rows that already exist.
+--
+-- RUN THIS *AFTER* DEPLOYING THE UPDATED pole_timezones_loader.py, NOT
+-- BEFORE: if the old code (still reading from PoleTelemetry) runs even
+-- once after this table is cleared but before the new code is live, it
+-- will simply re-populate every row right back from the same source
+-- this migration is trying to move away from.
+--
+-- After this runs, the next loadLeadsunData cycle (or a manual trigger)
+-- will naturally re-resolve every pole's timezone from Poles.Lat/Long --
+-- no separate backfill script needed, since that's exactly what
+-- load_pole_timezones() already does for any LocationId it doesn't
+-- currently have a row for.
+
+DELETE FROM PoleTimeZones;
