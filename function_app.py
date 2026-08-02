@@ -13,6 +13,7 @@ from shared.pole_open_issues_loader import load_pole_open_issues
 from shared.pole_models_loader import load_pole_models
 from shared.pole_telemetry_loader import load_pole_telemetry
 from shared.pole_timezones_loader import load_pole_timezones
+from shared.pole_daylight_flags_loader import load_pole_daylight_flags
 from shared.pole_vitals_loader import load_pole_vitals
 from shared.customers_api import get_customers
 from shared.projects_api import get_projects
@@ -86,7 +87,6 @@ def loadAirTableData(myTimer: func.TimerRequest) -> None:
     load_poles()
     load_projects()
     load_customers()
-    # load_pole_statuses()
 
     # PoleOpenIssues comes from a genuinely separate Airtable base (see
     # shared/pole_open_issues_loader.py's own AIRTABLE_POLE_ISSUES_BASE_ID
@@ -134,16 +134,23 @@ def loadAirTableDataManual(req: func.HttpRequest) -> func.HttpResponse:
 # Renamed from loadPoleRawData now that it orchestrates two loaders, not
 # one -- mirrors loadAirTableData's naming (source name + "Data" as the
 # umbrella, individual load_<x>() functions underneath). Load order is
-# Models -> Telemetry -> TimeZones -> Vitals: PoleModels is a device-model
-# reference table needed by PoleVitals' Panel/Light percentage formulas
-# (SunboardPower/LightPower), PoleTelemetry is the raw readings PoleVitals
-# aggregates (now also computing IsOpenIssueFault per reading, joining
-# against PoleOpenIssues/Poles -- see pole_telemetry_loader.py), PoleTimeZones
-# resolves each pole's own timezone (from that same fresh telemetry's
-# Longitude/Latitude) so PoleVitals can bucket in each pole's local time
-# instead of assuming Eastern for every pole regardless of where it
-# actually is, and PoleVitals depends on all three already being current
-# for this cycle.
+# Models -> Telemetry -> TimeZones -> DaylightFlags -> Vitals: PoleModels
+# is a device-model reference table needed by PoleVitals' Panel/Light
+# percentage formulas (SunboardPower/LightPower), PoleTelemetry is the raw
+# readings PoleVitals aggregates (now also computing IsOpenIssueFault per
+# reading, joining against PoleOpenIssues/Poles -- see
+# pole_telemetry_loader.py), PoleTimeZones resolves each pole's own
+# timezone (from that same fresh telemetry's Longitude/Latitude) so
+# PoleVitals can bucket in each pole's local time instead of assuming
+# Eastern for every pole regardless of where it actually is,
+# DaylightFlags computes/caches whether each not-yet-flagged reading
+# happened during real daylight (using PoleTimeZones' coordinates and
+# real per-day/per-location sunrise/sunset math -- see
+# pole_daylight_flags_loader.py/shared/daylight_utils.py -- restored
+# after a fixed clock-time window was tried in its place and found to
+# misclassify whichever bucket straddles the actual sunrise/sunset
+# moment), needed by PoleVitals' IsLedFault column, and PoleVitals
+# depends on all four already being current for this cycle.
 #
 # schedule history, for anyone wondering why this keeps moving: 10
 # minutes originally -> widened to 30 when Week/Month (since removed
@@ -189,6 +196,7 @@ def loadLeadsunData(myTimer: func.TimerRequest) -> None:
     load_pole_models()
     load_pole_telemetry()
     load_pole_timezones()
+    load_pole_daylight_flags()
     load_pole_vitals()
     logging.info("loadLeadsunData: run complete.")
 
@@ -208,12 +216,13 @@ def loadLeadsunDataManual(req: func.HttpRequest) -> func.HttpResponse:
     load_pole_models()
     load_pole_telemetry()
     load_pole_timezones()
+    load_pole_daylight_flags()
     load_pole_vitals()
     logging.info("loadLeadsunDataManual: run complete.")
 
     return func.HttpResponse(
         "loadPoleModels + loadPoleTelemetry + loadPoleTimeZones + "
-        "loadPoleVitals run complete.",
+        "loadPoleDaylightFlags + loadPoleVitals run complete.",
         status_code=200,
     )
 

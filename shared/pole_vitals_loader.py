@@ -71,11 +71,25 @@ def _compute_cutoff(now, period_type: str, backfill: bool):
 
 # ----------------------------------------------------------------------
 # Fault-flag design (replaces the earlier Daylight-based LightStatus
-# classification entirely -- IsDaylight/LightStatus no longer exist
-# anywhere in this schema; see the README for that history).
+# classification -- LightStatus itself no longer exists anywhere in this
+# schema; see the README for that history). IsDaylight, however, IS back
+# -- restored specifically to drive IsLedFault below with real
+# per-day/per-location sunrise/sunset math (shared/daylight_utils.py,
+# via shared/pole_daylight_flags_loader.py), after a fixed 7:00AM-8:00PM
+# clock window was tried first and found to have a real, unavoidable
+# flaw: whichever bucket straddles the actual sunrise/sunset moment for a
+# given day/location gets misclassified in one direction or the other.
 #
 # Four independent fault signals, computed per PoleTelemetry reading:
-#   IsLedFault      = (LampPower1 + LampPower2) = 0
+#   IsLedFault      = (LampPower1 + LampPower2) = 0, EXCEPT while
+#                      IsDaylight = 1 -- a solar-powered light is
+#                      SUPPOSED to be off while the sun is actually up,
+#                      so zero lamp power during real daylight is
+#                      expected, correct behavior, never a fault; only
+#                      once it's genuinely dark (IsDaylight = 0, or NULL
+#                      if not yet computed for this reading -- treated
+#                      the same as confirmed-dark, not exempted) does
+#                      zero lamp power indicate a real problem.
 #   IsBatteryFault  = (BatteryElecCurrent1 + BatteryElecCurrent2) / 2 < 10
 #   IsPanelFault    = (SolarBoardVoltage * SolarBoardElecCurrent) = 0
 #   IsOpenIssueFault = t.IsOpenIssueFault (already computed and stored per
@@ -136,7 +150,33 @@ SET ANSI_WARNINGS OFF;
         (t.SolarBoardVoltage * t.SolarBoardElecCurrent) / NULLIF(pm.SunboardPower, 0) * 100.0 AS PanelPercentage,
         (t.LampPower1 + t.LampPower2) / NULLIF(pm.LightPower, 0) * 100.0 AS LightPercentage,
         CASE WHEN t.IsOnline = 1 THEN 1 ELSE 0 END AS IsOnlineFlag,
-        CASE WHEN (t.LampPower1 + t.LampPower2) = 0 THEN 1 ELSE 0 END AS IsLedFaultFlag,
+        -- Solar-powered lights are SUPPOSED to be off during daylight --
+        -- LampPower1+LampPower2=0 while the sun is actually up
+        -- (t.IsDaylight, computed via real per-day/per-location
+        -- sunrise/sunset math in pole_daylight_flags_loader.py -- NOT a
+        -- fixed clock window, which was tried first and had a real,
+        -- unavoidable flaw: whichever bucket straddles the actual
+        -- sunrise/sunset moment for a given day/location gets
+        -- misclassified in one direction or the other) is expected,
+        -- correct behavior, not a fault. Only when it's actually dark
+        -- does zero lamp power indicate a real problem. See this CASE's
+        -- own ordering: the daylight check comes first and
+        -- unconditionally returns 0, regardless of LampPower -- only
+        -- falls through to the actual LampPower check once it's
+        -- established this reading is genuinely at night.
+        --
+        -- t.IsDaylight NULL (not yet computed by
+        -- pole_daylight_flags_loader.py for this specific reading) falls
+        -- through to the LampPower check below, same as "confirmed
+        -- dark" -- treating "we don't know yet" as "subject to the
+        -- normal check" is the safer default, rather than silently
+        -- exempting a reading from fault detection just because its
+        -- daylight status hasn't been computed yet.
+        CASE
+            WHEN t.IsDaylight = 1 THEN 0
+            WHEN (t.LampPower1 + t.LampPower2) = 0 THEN 1
+            ELSE 0
+        END AS IsLedFaultFlag,
         CASE WHEN (t.BatteryElecCurrent1 + t.BatteryElecCurrent2) / 2.0 < 10 THEN 1 ELSE 0 END AS IsBatteryFaultFlag,
         CASE WHEN (t.SolarBoardVoltage * t.SolarBoardElecCurrent) = 0 THEN 1 ELSE 0 END AS IsPanelFaultFlag,
         t.IsOpenIssueFault,
@@ -238,7 +278,33 @@ SET ANSI_WARNINGS OFF;
         (t.SolarBoardVoltage * t.SolarBoardElecCurrent) / NULLIF(pm.SunboardPower, 0) * 100.0 AS PanelPercentage,
         (t.LampPower1 + t.LampPower2) / NULLIF(pm.LightPower, 0) * 100.0 AS LightPercentage,
         t.IsOnline,
-        CASE WHEN (t.LampPower1 + t.LampPower2) = 0 THEN 1 ELSE 0 END AS IsLedFaultFlag,
+        -- Solar-powered lights are SUPPOSED to be off during daylight --
+        -- LampPower1+LampPower2=0 while the sun is actually up
+        -- (t.IsDaylight, computed via real per-day/per-location
+        -- sunrise/sunset math in pole_daylight_flags_loader.py -- NOT a
+        -- fixed clock window, which was tried first and had a real,
+        -- unavoidable flaw: whichever bucket straddles the actual
+        -- sunrise/sunset moment for a given day/location gets
+        -- misclassified in one direction or the other) is expected,
+        -- correct behavior, not a fault. Only when it's actually dark
+        -- does zero lamp power indicate a real problem. See this CASE's
+        -- own ordering: the daylight check comes first and
+        -- unconditionally returns 0, regardless of LampPower -- only
+        -- falls through to the actual LampPower check once it's
+        -- established this reading is genuinely at night.
+        --
+        -- t.IsDaylight NULL (not yet computed by
+        -- pole_daylight_flags_loader.py for this specific reading) falls
+        -- through to the LampPower check below, same as "confirmed
+        -- dark" -- treating "we don't know yet" as "subject to the
+        -- normal check" is the safer default, rather than silently
+        -- exempting a reading from fault detection just because its
+        -- daylight status hasn't been computed yet.
+        CASE
+            WHEN t.IsDaylight = 1 THEN 0
+            WHEN (t.LampPower1 + t.LampPower2) = 0 THEN 1
+            ELSE 0
+        END AS IsLedFaultFlag,
         CASE WHEN (t.BatteryElecCurrent1 + t.BatteryElecCurrent2) / 2.0 < 10 THEN 1 ELSE 0 END AS IsBatteryFaultFlag,
         CASE WHEN (t.SolarBoardVoltage * t.SolarBoardElecCurrent) = 0 THEN 1 ELSE 0 END AS IsPanelFaultFlag,
         t.IsOpenIssueFault,
@@ -369,7 +435,33 @@ SET ANSI_WARNINGS OFF;
         (t.SolarBoardVoltage * t.SolarBoardElecCurrent) / NULLIF(pm.SunboardPower, 0) * 100.0 AS PanelPercentage,
         (t.LampPower1 + t.LampPower2) / NULLIF(pm.LightPower, 0) * 100.0 AS LightPercentage,
         CASE WHEN t.IsOnline = 1 THEN 1 ELSE 0 END AS IsOnlineFlag,
-        CASE WHEN (t.LampPower1 + t.LampPower2) = 0 THEN 1 ELSE 0 END AS IsLedFaultFlag,
+        -- Solar-powered lights are SUPPOSED to be off during daylight --
+        -- LampPower1+LampPower2=0 while the sun is actually up
+        -- (t.IsDaylight, computed via real per-day/per-location
+        -- sunrise/sunset math in pole_daylight_flags_loader.py -- NOT a
+        -- fixed clock window, which was tried first and had a real,
+        -- unavoidable flaw: whichever bucket straddles the actual
+        -- sunrise/sunset moment for a given day/location gets
+        -- misclassified in one direction or the other) is expected,
+        -- correct behavior, not a fault. Only when it's actually dark
+        -- does zero lamp power indicate a real problem. See this CASE's
+        -- own ordering: the daylight check comes first and
+        -- unconditionally returns 0, regardless of LampPower -- only
+        -- falls through to the actual LampPower check once it's
+        -- established this reading is genuinely at night.
+        --
+        -- t.IsDaylight NULL (not yet computed by
+        -- pole_daylight_flags_loader.py for this specific reading) falls
+        -- through to the LampPower check below, same as "confirmed
+        -- dark" -- treating "we don't know yet" as "subject to the
+        -- normal check" is the safer default, rather than silently
+        -- exempting a reading from fault detection just because its
+        -- daylight status hasn't been computed yet.
+        CASE
+            WHEN t.IsDaylight = 1 THEN 0
+            WHEN (t.LampPower1 + t.LampPower2) = 0 THEN 1
+            ELSE 0
+        END AS IsLedFaultFlag,
         CASE WHEN (t.BatteryElecCurrent1 + t.BatteryElecCurrent2) / 2.0 < 10 THEN 1 ELSE 0 END AS IsBatteryFaultFlag,
         CASE WHEN (t.SolarBoardVoltage * t.SolarBoardElecCurrent) = 0 THEN 1 ELSE 0 END AS IsPanelFaultFlag,
         t.IsOpenIssueFault,

@@ -147,12 +147,14 @@ class TestMergeSqlStructureCommon:
         assert f"'{period_type}' AS PeriodType" in sql
 
     @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
-    def test_no_light_status_or_is_daylight_anywhere(self, period_type):
-        """The whole point of this redesign -- Daylight-based
-        classification is gone entirely, replaced by fault flags."""
+    def test_no_light_status_anywhere(self, period_type):
+        """LightStatus (the old Working/DayLight/Not Working
+        classification) is gone entirely, replaced by fault flags --
+        unlike IsDaylight, which was restored specifically to drive
+        IsLedFault with real sunrise/sunset math (see this file's own
+        module-level comment for that history)."""
         sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE[period_type]
         assert "LightStatus" not in sql
-        assert "IsDaylight" not in sql
 
     @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
     def test_ansi_warnings_disabled_around_the_merge_then_restored(self, period_type):
@@ -246,12 +248,17 @@ class TestLast48HoursMergeSqlStructure:
         assert "DATEADD(HOUR, -48, SYSDATETIMEOFFSET())" in sql
         assert "SYSDATETIMEOFFSET() AS PeriodEnd" in sql
 
-    def test_no_pole_timezones_join(self):
-        """No local-time bucketing at all -- this is a pure duration
-        window, not calendar-aligned, so there's nothing for a timezone
-        conversion to add."""
+    def test_no_pole_timezones_join_needed(self):
+        """IsLedFault now reads t.IsDaylight directly (computed and
+        cached by pole_daylight_flags_loader.py), not a local-time clock
+        check -- so unlike the brief period where this DID need
+        PoleTimeZones (for a since-removed fixed clock window), there's
+        no reason for this period type to join it at all anymore. Still
+        no local-time bucketing either way: this is a pure duration
+        window, not calendar-aligned."""
         sql = pole_vitals_loader._LAST_48_HOURS_MERGE_SQL
         assert "PoleTimeZones" not in sql
+        assert "TimeZoneName" not in sql
 
     def test_no_bucketed_cte_groups_directly_from_telemetry(self):
         """Unlike Hour/Day, there's only ever one 'bucket' per
@@ -275,7 +282,57 @@ class TestFaultFlagFormulas:
     @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
     def test_led_fault_formula(self, period_type):
         sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE[period_type]
-        assert "WHEN (t.LampPower1 + t.LampPower2) = 0 THEN 1 ELSE 0 END AS IsLedFaultFlag" in sql
+        assert "WHEN (t.LampPower1 + t.LampPower2) = 0 THEN 1" in sql
+
+    @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
+    def test_led_fault_excludes_daylight_via_is_daylight_column(self, period_type):
+        """Solar-powered lights are supposed to be off during daylight --
+        LampPower1+LampPower2=0 while t.IsDaylight=1 must never be
+        flagged as a fault, regardless of the LampPower values -- the
+        daylight check must come first in the CASE expression and
+        unconditionally return 0. Uses t.IsDaylight (real per-day/
+        per-location sunrise/sunset math, computed and cached by
+        pole_daylight_flags_loader.py) rather than a fixed clock window,
+        which was tried first and had a real flaw: whichever bucket
+        straddles the actual sunrise/sunset moment gets misclassified."""
+        sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE[period_type]
+        led_fault_case = sql.split("AS IsLedFaultFlag")[0].split("CASE")[-1]
+        assert "WHEN t.IsDaylight = 1 THEN 0" in led_fault_case
+        # The daylight WHEN must appear before the LampPower WHEN, so
+        # it's checked first and short-circuits regardless of LampPower.
+        daylight_pos = led_fault_case.find("IsDaylight")
+        lamp_power_pos = led_fault_case.find("LampPower1")
+        assert daylight_pos < lamp_power_pos
+
+    @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
+    def test_led_fault_null_is_daylight_falls_through_to_lamp_power_check(self, period_type):
+        """A reading pole_daylight_flags_loader.py hasn't processed yet
+        (t.IsDaylight IS NULL) must be treated the same as "confirmed
+        dark" -- subject to the normal LampPower check -- not silently
+        exempted from fault detection just because its daylight status
+        isn't known yet. NULL = 1 is UNKNOWN (not TRUE) in T-SQL, so this
+        falls out of the CASE's own NULL-propagation naturally, without
+        needing an explicit ISNULL() guard."""
+        sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE[period_type]
+        led_fault_case = sql.split("AS IsLedFaultFlag")[0].split("CASE")[-1]
+        # No ISNULL/COALESCE guard around IsDaylight -- NULL propagation
+        # handles it correctly on its own; adding one would be redundant,
+        # not incorrect, so this documents the intentional simplicity
+        # rather than testing for an absence that would otherwise be
+        # meaningless.
+        assert "WHEN t.IsDaylight = 1 THEN 0" in led_fault_case
+
+    @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
+    def test_led_fault_no_longer_references_local_time_or_clock_window(self, period_type):
+        """Regression guard: this used to be a fixed clock-time window
+        (BETWEEN '07:00:00' AND '20:00:00', via a LocalTime computation)
+        before being replaced by real sunrise/sunset math -- neither
+        should be present in the CASE expression anymore."""
+        sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE[period_type]
+        led_fault_case = sql.split("AS IsLedFaultFlag")[0].split("CASE")[-1]
+        assert "LocalTime" not in led_fault_case
+        assert "BETWEEN" not in led_fault_case
+        assert "07:00:00" not in led_fault_case
 
     @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
     def test_battery_fault_formula(self, period_type):
@@ -453,8 +510,10 @@ class TestPerPoleTimeZonePropagation:
     """
     Dedicated coverage for the per-pole (not hardcoded-Eastern) timezone
     feature -- specifically that TimeZoneName survives the GROUP BY
-    intact. Hour/Day only -- Last48Hours has no timezone handling at all
-    (see TestLast48HoursMergeSqlStructure.test_no_pole_timezones_join).
+    intact. Hour/Day only -- Last48Hours joins PoleTimeZones too now (for
+    IsLedFaultFlag's daytime check), but never carries TimeZoneName
+    through to a GROUP BY the way Hour/Day do (see
+    TestLast48HoursMergeSqlStructure.test_pole_time_zones_joined_only_for_led_fault_not_bucketing).
     """
 
     @pytest.mark.parametrize("period_type", ("Hour", "Day"))

@@ -269,6 +269,14 @@ def patch_get_connection_pole_vitals(mocker, mock_conn):
 
 
 @pytest.fixture
+def patch_get_connection_pole_daylight_flags(mocker, mock_conn):
+    """Patches shared.pole_daylight_flags_loader.get_connection to return mock_conn."""
+    return mocker.patch(
+        "shared.pole_daylight_flags_loader.get_connection", return_value=mock_conn
+    )
+
+
+@pytest.fixture
 def patch_get_connection_pole_vitals_api(mocker, mock_conn):
     """Patches shared.pole_vitals_api.get_connection to return mock_conn."""
     return mocker.patch(
