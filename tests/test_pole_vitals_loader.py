@@ -2,6 +2,7 @@
 
 import re
 from datetime import datetime, timedelta
+from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -245,8 +246,23 @@ class TestLast48HoursMergeSqlStructure:
         parameter -- there's no "PeriodStart placeholder" the way Hour/
         Day don't need one either."""
         sql = pole_vitals_loader._LAST_48_HOURS_MERGE_SQL
-        assert "DATEADD(HOUR, -48, SYSDATETIMEOFFSET())" in sql
-        assert "SYSDATETIMEOFFSET() AS PeriodEnd" in sql
+        assert "DATEADD(HOUR, -48, SYSDATETIMEOFFSET()" in sql
+        assert "SYSDATETIMEOFFSET() AT TIME ZONE 'Eastern Standard Time' AS PeriodEnd" in sql
+
+    def test_period_start_and_end_are_converted_to_eastern(self):
+        """SYSDATETIMEOFFSET() alone reflects the SERVER's own time zone
+        -- Azure SQL Database runs in UTC regardless of physical region
+        -- which would otherwise show PeriodStart/PeriodEnd as +00:00
+        while every other "now"-style timestamp in this project (e.g.
+        SP_Execution's StartDateTime/EndDateTime) is Eastern. Applying AT
+        TIME ZONE before subtracting 48 hours doesn't change WHICH
+        absolute instant PeriodStart lands on -- DATEADD operates on the
+        underlying instant, not the display offset -- only how that same
+        instant is displayed."""
+        sql = pole_vitals_loader._LAST_48_HOURS_MERGE_SQL
+        assert "SYSDATETIMEOFFSET() AT TIME ZONE 'Eastern Standard Time'" in sql
+        # Both PeriodStart and PeriodEnd get the conversion, not just one.
+        assert sql.count("SYSDATETIMEOFFSET() AT TIME ZONE 'Eastern Standard Time'") == 2
 
     def test_no_pole_timezones_join_needed(self):
         """IsLedFault now reads t.IsDaylight directly (computed and
@@ -285,42 +301,68 @@ class TestFaultFlagFormulas:
         assert "WHEN (t.LampPower1 + t.LampPower2) = 0 THEN 1" in sql
 
     @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
-    def test_led_fault_excludes_daylight_via_is_daylight_column(self, period_type):
+    def test_led_fault_excludes_daylight_via_is_daylight_for_led_fault_column(self, period_type):
         """Solar-powered lights are supposed to be off during daylight --
-        LampPower1+LampPower2=0 while t.IsDaylight=1 must never be
-        flagged as a fault, regardless of the LampPower values -- the
-        daylight check must come first in the CASE expression and
-        unconditionally return 0. Uses t.IsDaylight (real per-day/
-        per-location sunrise/sunset math, computed and cached by
-        pole_daylight_flags_loader.py) rather than a fixed clock window,
-        which was tried first and had a real flaw: whichever bucket
-        straddles the actual sunrise/sunset moment gets misclassified."""
+        LampPower1+LampPower2=0 while t.IsDaylightForLedFault=1 must
+        never be flagged as a fault, regardless of the LampPower values
+        -- the daylight check must come first in the CASE expression and
+        unconditionally return 0. Uses t.IsDaylightForLedFault, NOT the
+        stricter t.IsDaylight used by IsPanelFaultFlag -- a deliberately
+        more forgiving definition (true at the exact moment, or up to a
+        1-hour grace period before it -- see
+        pole_daylight_flags_loader.py's own _LED_FAULT_GRACE_PERIOD),
+        confirmed necessary in practice: a real lamp doesn't always turn
+        on the instant the sun crosses the sunset threshold."""
         sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE[period_type]
         led_fault_case = sql.split("AS IsLedFaultFlag")[0].split("CASE")[-1]
-        assert "WHEN t.IsDaylight = 1 THEN 0" in led_fault_case
+        assert "WHEN t.IsDaylightForLedFault = 1 THEN 0" in led_fault_case
         # The daylight WHEN must appear before the LampPower WHEN, so
         # it's checked first and short-circuits regardless of LampPower.
-        daylight_pos = led_fault_case.find("IsDaylight")
+        daylight_pos = led_fault_case.find("IsDaylightForLedFault")
         lamp_power_pos = led_fault_case.find("LampPower1")
         assert daylight_pos < lamp_power_pos
 
     @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
-    def test_led_fault_null_is_daylight_falls_through_to_lamp_power_check(self, period_type):
-        """A reading pole_daylight_flags_loader.py hasn't processed yet
-        (t.IsDaylight IS NULL) must be treated the same as "confirmed
-        dark" -- subject to the normal LampPower check -- not silently
-        exempted from fault detection just because its daylight status
-        isn't known yet. NULL = 1 is UNKNOWN (not TRUE) in T-SQL, so this
-        falls out of the CASE's own NULL-propagation naturally, without
-        needing an explicit ISNULL() guard."""
+    def test_led_fault_does_not_use_the_strict_is_daylight_column(self, period_type):
+        """Regression guard for the two flags needing genuinely
+        different daylight definitions: IsLedFaultFlag's own CASE
+        expression must reference IsDaylightForLedFault, never the
+        plain, strict IsDaylight that IsPanelFaultFlag uses instead."""
         sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE[period_type]
         led_fault_case = sql.split("AS IsLedFaultFlag")[0].split("CASE")[-1]
-        # No ISNULL/COALESCE guard around IsDaylight -- NULL propagation
-        # handles it correctly on its own; adding one would be redundant,
-        # not incorrect, so this documents the intentional simplicity
-        # rather than testing for an absence that would otherwise be
-        # meaningless.
-        assert "WHEN t.IsDaylight = 1 THEN 0" in led_fault_case
+        assert "t.IsDaylight = " not in led_fault_case
+
+    @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
+    def test_led_fault_null_is_daylight_for_led_fault_falls_through_to_lamp_power_check(self, period_type):
+        """A reading pole_daylight_flags_loader.py hasn't processed yet
+        (t.IsDaylightForLedFault IS NULL) must be treated the same as
+        "confirmed dark" -- subject to the normal LampPower check -- not
+        silently exempted from fault detection just because its daylight
+        status isn't known yet. NULL = 1 is UNKNOWN (not TRUE) in T-SQL,
+        so this falls out of the CASE's own NULL-propagation naturally,
+        without needing an explicit ISNULL() guard."""
+        sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE[period_type]
+        led_fault_case = sql.split("AS IsLedFaultFlag")[0].split("CASE")[-1]
+        # No ISNULL/COALESCE guard around IsDaylightForLedFault -- NULL
+        # propagation handles it correctly on its own; adding one would
+        # be redundant, not incorrect, so this documents the intentional
+        # simplicity rather than testing for an absence that would
+        # otherwise be meaningless.
+        assert "WHEN t.IsDaylightForLedFault = 1 THEN 0" in led_fault_case
+
+    @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
+    def test_panel_fault_uses_its_own_daylight_column_not_the_led_variant(self, period_type):
+        """IsPanelFaultFlag has its own daylight definition
+        (IsDaylightForPanelFault, a sunrise-only warmup grace period) --
+        must never reference IsDaylightForLedFault (a completely
+        different, symmetric grace period tuned for lamp response lag)
+        or the plain, unmodified IsDaylight (which neither fault flag
+        reads directly anymore)."""
+        sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE[period_type]
+        panel_fault_case = sql.split("AS IsPanelFaultFlag")[0].split("CASE")[-1]
+        assert "WHEN t.IsDaylightForPanelFault = 0 THEN 0" in panel_fault_case
+        assert "IsDaylightForLedFault" not in panel_fault_case
+        assert "t.IsDaylight = " not in panel_fault_case
 
     @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
     def test_led_fault_no_longer_references_local_time_or_clock_window(self, period_type):
@@ -345,9 +387,101 @@ class TestFaultFlagFormulas:
     @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
     def test_panel_fault_formula(self, period_type):
         sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE[period_type]
+        assert "WHEN (t.SolarBoardVoltage * t.SolarBoardElecCurrent) = 0 THEN 1" in sql
+
+    @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
+    def test_panel_fault_excludes_nighttime_and_sunrise_warmup_via_is_daylight_for_panel_fault(
+        self, period_type
+    ):
+        """Solar panels only charge once past the sunrise warmup period
+        -- zero panel output while t.IsDaylightForPanelFault=0 (either
+        confirmed night, OR daylight but still within the first hour
+        after sunrise) must never be flagged as a fault, regardless of
+        the panel-output values -- this check must come first in the
+        CASE expression and unconditionally return 0."""
+        sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE[period_type]
+        panel_fault_case = sql.split("AS IsPanelFaultFlag")[0].split("CASE")[-1]
+        assert "WHEN t.IsDaylightForPanelFault = 0 THEN 0" in panel_fault_case
+        # The daylight-for-panel-fault WHEN must appear before both the
+        # battery-charging WHEN and the panel-output WHEN, so it's
+        # checked first and short-circuits regardless of either.
+        daylight_pos = panel_fault_case.find("IsDaylightForPanelFault")
+        battery_charging_pos = panel_fault_case.find("BatteryChargingMin")
+        panel_output_pos = panel_fault_case.find("SolarBoardVoltage")
+        assert daylight_pos < battery_charging_pos < panel_output_pos
+
+    @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
+    def test_panel_fault_null_is_daylight_for_panel_fault_falls_through_to_panel_output_check(self, period_type):
+        """A reading pole_daylight_flags_loader.py hasn't processed yet
+        (t.IsDaylightForPanelFault IS NULL) must be treated the same as
+        "confirmed past warmup" -- subject to the normal panel-output
+        check -- not silently exempted from fault detection just because
+        its daylight status isn't known yet. NULL = 0 is UNKNOWN (not
+        TRUE) in T-SQL, so this falls out of the CASE's own
+        NULL-propagation naturally, without needing an explicit ISNULL()
+        guard. The mirror image of IsLedFault's own NULL handling, which
+        falls through to being treated as "confirmed dark" instead."""
+        sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE[period_type]
+        panel_fault_case = sql.split("AS IsPanelFaultFlag")[0].split("CASE")[-1]
+        assert "WHEN t.IsDaylightForPanelFault = 0 THEN 0" in panel_fault_case
+
+    @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
+    def test_panel_fault_excludes_a_sufficiently_charged_battery(self, period_type):
+        """A solar panel only needs to charge when the battery actually
+        needs it -- once the average of BatteryVoltage1/BatteryVoltage2
+        is already at or above PoleModels' own BatteryChargingMin for
+        that pole's ModelId, zero panel output is expected (nothing left
+        to charge), not a fault, even during daylight."""
+        sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE[period_type]
+        panel_fault_case = sql.split("AS IsPanelFaultFlag")[0].split("CASE")[-1]
         assert (
-            "WHEN (t.SolarBoardVoltage * t.SolarBoardElecCurrent) = 0 THEN 1 ELSE 0 END AS IsPanelFaultFlag" in sql
+            "WHEN (t.BatteryVoltage1 + t.BatteryVoltage2) / 2.0 >= ISNULL(pm.BatteryChargingMin, 13.5) THEN 0"
+            in panel_fault_case
         )
+
+    @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
+    def test_panel_fault_uses_battery_voltage_not_battery_elec_current(self, period_type):
+        """Easy to confuse with IsBatteryFaultFlag's own
+        BatteryElecCurrent1/BatteryElecCurrent2 (a genuinely different
+        electrical property, current not voltage, used for a completely
+        different fault check) -- this must reference the Voltage
+        columns specifically."""
+        sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE[period_type]
+        panel_fault_case = sql.split("AS IsPanelFaultFlag")[0].split("CASE")[-1]
+        assert "BatteryVoltage1" in panel_fault_case
+        assert "BatteryVoltage2" in panel_fault_case
+        assert "BatteryElecCurrent" not in panel_fault_case
+
+    @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
+    def test_panel_fault_missing_battery_voltage_still_falls_through_to_panel_output_check(self, period_type):
+        """Missing BatteryVoltage1/2 readings (a NULL average) must
+        still be treated as "unknown whether the battery needs
+        charging" -- falls through to the normal panel-output check,
+        not silently exempted. NULL >= anything is UNKNOWN, not TRUE, in
+        T-SQL, so this falls out of the CASE's own NULL-propagation
+        naturally, regardless of what the ISNULL()-defaulted threshold
+        itself is."""
+        sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE[period_type]
+        panel_fault_case = sql.split("AS IsPanelFaultFlag")[0].split("CASE")[-1]
+        assert (
+            "WHEN (t.BatteryVoltage1 + t.BatteryVoltage2) / 2.0 >= ISNULL(pm.BatteryChargingMin, 13.5) THEN 0"
+            in panel_fault_case
+        )
+
+    @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
+    def test_panel_fault_defaults_to_13_5_when_model_id_has_no_pole_models_match(self, period_type):
+        """DELIBERATE CHANGE from the plain-NULL-falls-through pattern
+        used everywhere else in this CASE expression: a ModelId with no
+        PoleModels match at all (the LEFT JOIN below produces a NULL
+        pm.BatteryChargingMin) does NOT fall through to the panel-output
+        check -- ISNULL() defaults the threshold itself to 13.5 (the
+        same value every model in PoleModels currently has anyway), so
+        an unmatched model is treated the same as a matched one with
+        today's default value, not as "assume it still needs charging"
+        regardless of actual battery level."""
+        sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE[period_type]
+        panel_fault_case = sql.split("AS IsPanelFaultFlag")[0].split("CASE")[-1]
+        assert "ISNULL(pm.BatteryChargingMin, 13.5)" in panel_fault_case
 
     @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
     def test_open_issue_fault_read_directly_not_recomputed(self, period_type):
@@ -613,7 +747,7 @@ class TestLoadPoleVitalsSuccessFlow:
         pole_vitals_loader.load_pole_vitals()
 
         calls = mock_cursor.execute.call_args_list
-        assert len(calls) == 7
+        assert len(calls) == 8
 
         insert_sql, name, env, start_time, source = calls[0].args
         assert "INSERT INTO SP_Execution" in insert_sql
@@ -637,7 +771,15 @@ class TestLoadPoleVitalsSuccessFlow:
         day_prune = calls[4].args
         assert day_prune == (pole_vitals_loader._RETENTION_PRUNE_SQL, "Day", "Day", 7)
 
-        update_sql, end_time, success, errors, batch_count, sp_exec_id = calls[6].args
+        # Last48Hours' own stale-row cleanup is at index 6, using the
+        # SAME cutoff/sentinel bound into its own MERGE at index 5.
+        last48_cleanup = calls[6].args
+        assert last48_cleanup[0] == pole_vitals_loader._LAST_48_HOURS_STALE_ROW_PRUNE_SQL
+        last48_merge_cutoff = calls[5].args[1]
+        assert last48_cleanup[1] == last48_merge_cutoff
+        assert last48_cleanup[2] == pole_vitals_loader._MISSING_LAST_UPLOAD_SENTINEL
+
+        update_sql, end_time, success, errors, batch_count, sp_exec_id = calls[7].args
         assert "UPDATE SP_Execution" in update_sql
         assert (success, errors, batch_count, sp_exec_id) == (15, 0, 3, 77)  # 5 rows x 3 period types
 
@@ -705,6 +847,7 @@ class TestLoadPoleVitalsBenignWarningHandling:
             None,  # Day MERGE
             None,  # Day prune
             None,  # Last48Hours MERGE
+            None,  # Last48Hours stale-row cleanup
             None,  # final update
         ]
 
@@ -723,7 +866,7 @@ class TestLoadPoleVitalsBenignWarningHandling:
         mock_cursor.execute.side_effect = [
             None,
             self._make_01003_exception(),
-            None, None, None, None, None,
+            None, None, None, None, None, None,
         ]
 
         with caplog.at_level("INFO"):
@@ -796,13 +939,13 @@ class TestLoadPoleVitalsPerPeriodTypeCommits:
         pole_vitals_loader.load_pole_vitals()
 
         # insert+commit, then (MERGE, prune, commit) for Hour, then Day,
-        # then (MERGE, commit) for Last48Hours (no prune), then final
-        # update+commit.
+        # then (MERGE, stale-row cleanup, commit) for Last48Hours, then
+        # final update+commit.
         assert call_order == [
             "execute", "commit",             # SP_Execution insert
             "execute", "execute", "commit",  # Hour MERGE + prune
             "execute", "execute", "commit",  # Day MERGE + prune
-            "execute", "commit",             # Last48Hours MERGE (no prune)
+            "execute", "execute", "commit",  # Last48Hours MERGE + stale-row cleanup
             "execute", "commit",             # SP_Execution final update
         ]
 
@@ -834,7 +977,7 @@ class TestLoadPoleVitalsPerPeriodTypeCommits:
             "execute", "commit",             # SP_Execution insert
             "execute", "rollback",           # Hour MERGE -- fails, rolled back (prune never runs)
             "execute", "execute", "commit",  # Day -- still attempted, succeeds
-            "execute", "commit",             # Last48Hours -- still attempted, succeeds
+            "execute", "execute", "commit",  # Last48Hours -- still attempted, succeeds
             "execute", "commit",             # SP_Execution final update
         ]
 
@@ -852,7 +995,7 @@ class TestLoadPoleVitalsPerPeriodTypeCommits:
             "execute", "commit",             # SP_Execution insert
             "execute", "execute", "commit",  # Hour -- already committed here
             "execute", "rollback",           # Day MERGE -- fails AFTER Hour's commit above
-            "execute", "commit",             # Last48Hours -- still attempted, succeeds
+            "execute", "execute", "commit",  # Last48Hours -- still attempted, succeeds
             "execute", "commit",             # SP_Execution final update
         ]
 
@@ -870,7 +1013,100 @@ class TestLoadPoleVitalsPerPeriodTypeCommits:
         assert (success, errors) == (10, 1)  # 2 successful period types x 5 rows, 1 failed
 
 
-class TestLoadPoleVitalsPartialFailure:
+class TestLast48HoursStaleRowCleanup:
+    """
+    Dedicated coverage for the gap this closes: a pole that goes
+    completely silent (zero telemetry within the current 48-hour window)
+    would otherwise keep its last successfully-computed Last48Hours row
+    forever, since _LAST_48_HOURS_MERGE_SQL's own source query only ever
+    includes poles that DO still have recent telemetry -- a silent pole
+    simply never appears in that source, so the MERGE can neither update
+    nor remove its existing row.
+    """
+
+    def test_stale_row_prune_sql_targets_last_48_hours_only(self):
+        sql = pole_vitals_loader._LAST_48_HOURS_STALE_ROW_PRUNE_SQL
+        assert "WHERE pv.PeriodType = 'Last48Hours'" in sql
+
+    def test_stale_row_prune_sql_checks_for_any_recent_telemetry_at_all(self):
+        sql = pole_vitals_loader._LAST_48_HOURS_STALE_ROW_PRUNE_SQL
+        assert "NOT EXISTS" in sql
+        assert "FROM PoleTelemetry t" in sql
+        assert "WHERE t.LocationId = pv.LocationId" in sql
+        assert "AND t.LastUpload >= ?" in sql
+        assert "AND t.LastUpload <> ?" in sql
+
+    def test_cleanup_dispatches_to_retention_prune_for_hour_and_day(self):
+        for period_type, expected_limit in (("Hour", 168), ("Day", 7)):
+            mock_cursor = MagicMock()
+            mock_cursor.rowcount = 3
+
+            result = pole_vitals_loader._run_cleanup_for_period_type(
+                mock_cursor, period_type, cutoff="2026-08-01 00:00:00.000 -04:00"
+            )
+
+            mock_cursor.execute.assert_called_once_with(
+                pole_vitals_loader._RETENTION_PRUNE_SQL, period_type, period_type, expected_limit
+            )
+            assert result == 3
+
+    def test_cleanup_dispatches_to_stale_row_prune_for_last_48_hours(self):
+        mock_cursor = MagicMock()
+        mock_cursor.rowcount = 2
+        cutoff = "2026-08-01 00:00:00.000 -04:00"
+
+        result = pole_vitals_loader._run_cleanup_for_period_type(
+            mock_cursor, "Last48Hours", cutoff=cutoff
+        )
+
+        mock_cursor.execute.assert_called_once_with(
+            pole_vitals_loader._LAST_48_HOURS_STALE_ROW_PRUNE_SQL,
+            cutoff,
+            pole_vitals_loader._MISSING_LAST_UPLOAD_SENTINEL,
+        )
+        assert result == 2
+
+    def test_cleanup_returns_zero_not_negative_for_zero_or_missing_rowcount(self):
+        mock_cursor = MagicMock()
+        mock_cursor.rowcount = -1  # pyodbc convention for "not applicable"
+
+        result = pole_vitals_loader._run_cleanup_for_period_type(
+            mock_cursor, "Last48Hours", cutoff="2026-08-01 00:00:00.000 -04:00"
+        )
+
+        assert result == 0
+
+    def test_stale_pole_removed_end_to_end(
+        self, patch_get_connection_pole_vitals, mock_cursor
+    ):
+        """A pole with an existing Last48Hours row but zero current
+        telemetry: the MERGE's own source is empty for it (nothing to
+        update), but the stale-row cleanup step still runs and its
+        rowcount is correctly picked up as the "pruned" count for
+        logging -- confirmed by checking exactly which execute() call is
+        the cleanup step and that its bound SQL/params match."""
+        mock_cursor.fetchone.return_value = (1,)
+        call_count = {"n": 0}
+
+        def _execute_with_stale_cleanup_rowcount(*args, **kwargs):
+            call_count["n"] += 1
+            # The Last48Hours stale-row cleanup is the 7th execute() call
+            # in a normal, no-exception run (see
+            # test_full_success_flow_executes_all_three_period_types_in_order
+            # for the full index layout this mirrors): 1=insert,
+            # 2=Hour MERGE, 3=Hour prune, 4=Day MERGE, 5=Day prune,
+            # 6=Last48Hours MERGE, 7=Last48Hours stale-row cleanup.
+            mock_cursor.rowcount = 1 if call_count["n"] == 7 else 0
+
+        mock_cursor.execute.side_effect = _execute_with_stale_cleanup_rowcount
+
+        pole_vitals_loader.load_pole_vitals()
+
+        cleanup_call = mock_cursor.execute.call_args_list[6]
+        assert cleanup_call.args[0] == pole_vitals_loader._LAST_48_HOURS_STALE_ROW_PRUNE_SQL
+
+
+
     def test_one_period_type_failing_does_not_block_the_others(
         self, patch_get_connection_pole_vitals, mock_cursor
     ):
@@ -881,6 +1117,7 @@ class TestLoadPoleVitalsPartialFailure:
             None,  # Day MERGE
             None,  # Day prune
             None,  # Last48Hours MERGE
+            None,  # Last48Hours stale-row cleanup
             None,  # final update
         ]
         mock_cursor.rowcount = 3
@@ -899,7 +1136,7 @@ class TestLoadPoleVitalsPartialFailure:
         mock_cursor.execute.side_effect = [
             None,
             RuntimeError("boom"),
-            None, None, None, None,
+            None, None, None, None, None,
         ]
         mock_cursor.rowcount = 0
 

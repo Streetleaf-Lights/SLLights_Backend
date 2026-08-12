@@ -2,6 +2,7 @@ SELECT --TOP (1000)
         [Id]
       ,[PoleNumber]
       ,[LocationId]
+      ,CountyFips
       ,[ProjectId]
       ,[CustomerId]
       ,[InstallDate]
@@ -11,8 +12,41 @@ SELECT --TOP (1000)
       ,[AirTableCreatedDateTime]
   FROM [dbo].[Poles]
   WHERE 1 = 1
---   AND [LocationId] = '12081-1240'
-    -- AND LocationId LIKE '%12057%'
-  AND PoleNumber = 'PAS-4938'
+  AND [LocationId] = 'JAX-DEMO'
+    -- AND LocationId LIKE '%jacks%'
+--   AND PoleNumber = 'JAX-DEMO'
     -- AND PoleNumber LIKE '%12009-100%'
-  ORDER BY InstallDate --DESC, [LocationId] DESC, [PoleNumber] DESC;
+    -- AND (Long IS NULL OR Lat IS NULL)
+    -- AND CountyFips IS NOT NULL
+  ORDER BY [LocationId], [PoleNumber] DESC;
+
+-- SELECT LocationId, COUNT(*) AS PoleCount
+-- FROM Poles
+-- WHERE LocationId IS NOT NULL
+-- GROUP BY LocationId
+-- HAVING COUNT(*) > 1;
+
+-- SELECT
+--     p.Id,
+--     p.PoleNumber,
+--     p.LocationId,
+--     p.CountyFips,
+--     CASE
+--         WHEN p.CountyFips IS NULL THEN 'Missing entirely'
+--         ELSE 'Not found in CountyTimeZones'
+--     END AS Reason
+-- FROM Poles p
+-- LEFT JOIN CountyTimeZones ctz ON p.CountyFips = ctz.FIPS
+-- WHERE p.LocationId IS NOT NULL
+--   AND ctz.FIPS IS NULL
+-- ORDER BY p.LocationId;
+
+-- SELECT
+--     p.CountyFips,
+--     COUNT(*) AS PoleCount
+-- FROM Poles p
+-- LEFT JOIN CountyTimeZones ctz ON p.CountyFips = ctz.FIPS
+-- WHERE p.LocationId IS NOT NULL
+--   AND ctz.FIPS IS NULL
+-- GROUP BY p.CountyFips
+-- ORDER BY PoleCount DESC;

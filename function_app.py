@@ -121,7 +121,8 @@ def loadAirTableDataManual(req: func.HttpRequest) -> func.HttpResponse:
     logging.info("loadAirTableDataManual: run complete.")
 
     return func.HttpResponse(
-        "loadPoles + loadProjects + loadCustomers + loadPoleOpenIssues run complete.", status_code=200
+        "loadPoles + loadProjects + loadCustomers + loadPoleOpenIssues run complete.",
+        status_code=200,
     )
 
 
@@ -176,7 +177,7 @@ def loadAirTableDataManual(req: func.HttpRequest) -> func.HttpResponse:
 # Singleton Lock still separately guarantees no actual overlapping runs,
 # regardless of this setting.
 @app.timer_trigger(
-    schedule="0 */30 * * * *",
+    schedule="0 */10 * * * *",
     arg_name="myTimer",
     run_on_startup=False,
     use_monitor=False,
@@ -833,7 +834,9 @@ def deleteUser(req: func.HttpRequest) -> func.HttpResponse:
 # to see every one of this pole's own Hour buckets (or Day buckets) as-is;
 # use getPoleVitals/getPoles for a steadier current-status signal (which
 # reads each pole's single Last48Hours row instead).
-@app.route(route="getPoleVitalsByPeriod", methods=["GET"], auth_level=func.AuthLevel.FUNCTION)
+@app.route(
+    route="getPoleVitalsByPeriod", methods=["GET"], auth_level=func.AuthLevel.FUNCTION
+)
 def getPoleVitalsByPeriod(req: func.HttpRequest) -> func.HttpResponse:
     """
     Query params:
@@ -894,12 +897,18 @@ def getPoleVitalsByPeriod(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as ex:
         logging.error("getPoleVitalsByPeriod: query failed: %s", ex)
         return func.HttpResponse(
-            json.dumps({"error": "internal error"}), status_code=500, mimetype="application/json"
+            json.dumps({"error": "internal error"}),
+            status_code=500,
+            mimetype="application/json",
         )
 
     if result is None:
         return func.HttpResponse(
-            json.dumps({"error": "pole not found"}), status_code=404, mimetype="application/json"
+            json.dumps({"error": "pole not found"}),
+            status_code=404,
+            mimetype="application/json",
         )
 
-    return func.HttpResponse(json.dumps(result), status_code=200, mimetype="application/json")
+    return func.HttpResponse(
+        json.dumps(result), status_code=200, mimetype="application/json"
+    )

@@ -20,6 +20,8 @@ AIRTABLE_POLES_TABLE = "Streetleaf Poles"
 AIRTABLE_POLES_FIELDS = [
     "Pole Number",
     "Location ID",
+    "CountyFips",  # this pole's county FIPS code -- unrelated to "Location
+    # ID" above, which is the pole's own identifier.
     "Contracting Entity",
     "Customer ID",
     "Field Installed",
@@ -59,20 +61,21 @@ _POLE_UPSERT_SQL = """
 MERGE Poles AS target
 USING (
     SELECT
-        ? AS Id, ? AS PoleNumber, ? AS LocationId, ? AS ProjectId, ? AS CustomerId,
+        ? AS Id, ? AS PoleNumber, ? AS LocationId, ? AS CountyFips, ? AS ProjectId, ? AS CustomerId,
         ? AS InstallDate, ? AS Lat, ? AS Long, ? AS SP_ExecId, ? AS AirTableCreatedDateTime
 ) AS source
 ON target.Id = source.Id
 WHEN MATCHED AND NOT EXISTS (
-    SELECT target.PoleNumber, target.LocationId, target.ProjectId, target.CustomerId,
+    SELECT target.PoleNumber, target.LocationId, target.CountyFips, target.ProjectId, target.CustomerId,
            target.InstallDate, target.Lat, target.Long
     INTERSECT
-    SELECT source.PoleNumber, source.LocationId, source.ProjectId, source.CustomerId,
+    SELECT source.PoleNumber, source.LocationId, source.CountyFips, source.ProjectId, source.CustomerId,
            source.InstallDate, source.Lat, source.Long
 )
 THEN UPDATE SET
     PoleNumber  = source.PoleNumber,
     LocationId  = source.LocationId,
+    CountyFips  = source.CountyFips,
     ProjectId   = source.ProjectId,
     CustomerId  = source.CustomerId,
     InstallDate = source.InstallDate,
@@ -80,8 +83,8 @@ THEN UPDATE SET
     Long        = source.Long,
     SP_ExecId   = source.SP_ExecId
 WHEN NOT MATCHED THEN
-    INSERT (Id, PoleNumber, LocationId, ProjectId, CustomerId, InstallDate, Lat, Long, SP_ExecId, AirTableCreatedDateTime)
-    VALUES (source.Id, source.PoleNumber, source.LocationId, source.ProjectId, source.CustomerId,
+    INSERT (Id, PoleNumber, LocationId, CountyFips, ProjectId, CustomerId, InstallDate, Lat, Long, SP_ExecId, AirTableCreatedDateTime)
+    VALUES (source.Id, source.PoleNumber, source.LocationId, source.CountyFips, source.ProjectId, source.CustomerId,
             source.InstallDate, source.Lat, source.Long, source.SP_ExecId, source.AirTableCreatedDateTime);
 """
 
@@ -109,6 +112,7 @@ CREATE TABLE #PolesStaging (
     Id                      VARCHAR(50)       NULL,
     PoleNumber              NVARCHAR(100)     NULL,
     LocationId              VARCHAR(50)       NULL,
+    CountyFips              VARCHAR(5)        NULL,
     ProjectId               VARCHAR(50)       NULL,
     CustomerId              VARCHAR(50)       NULL,
     InstallDate             DATE              NULL,
@@ -120,8 +124,8 @@ CREATE TABLE #PolesStaging (
 """
 
 _STAGING_INSERT_SQL = """
-INSERT INTO #PolesStaging (Id, PoleNumber, LocationId, ProjectId, CustomerId, InstallDate, Lat, Long, SP_ExecId, AirTableCreatedDateTime)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO #PolesStaging (Id, PoleNumber, LocationId, CountyFips, ProjectId, CustomerId, InstallDate, Lat, Long, SP_ExecId, AirTableCreatedDateTime)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 _MERGE_FROM_STAGING_SQL = """
@@ -129,15 +133,16 @@ MERGE Poles AS target
 USING #PolesStaging AS source
 ON target.Id = source.Id
 WHEN MATCHED AND NOT EXISTS (
-    SELECT target.PoleNumber, target.LocationId, target.ProjectId, target.CustomerId,
+    SELECT target.PoleNumber, target.LocationId, target.CountyFips, target.ProjectId, target.CustomerId,
            target.InstallDate, target.Lat, target.Long
     INTERSECT
-    SELECT source.PoleNumber, source.LocationId, source.ProjectId, source.CustomerId,
+    SELECT source.PoleNumber, source.LocationId, source.CountyFips, source.ProjectId, source.CustomerId,
            source.InstallDate, source.Lat, source.Long
 )
 THEN UPDATE SET
     PoleNumber  = source.PoleNumber,
     LocationId  = source.LocationId,
+    CountyFips  = source.CountyFips,
     ProjectId   = source.ProjectId,
     CustomerId  = source.CustomerId,
     InstallDate = source.InstallDate,
@@ -145,8 +150,8 @@ THEN UPDATE SET
     Long        = source.Long,
     SP_ExecId   = source.SP_ExecId
 WHEN NOT MATCHED THEN
-    INSERT (Id, PoleNumber, LocationId, ProjectId, CustomerId, InstallDate, Lat, Long, SP_ExecId, AirTableCreatedDateTime)
-    VALUES (source.Id, source.PoleNumber, source.LocationId, source.ProjectId, source.CustomerId,
+    INSERT (Id, PoleNumber, LocationId, CountyFips, ProjectId, CustomerId, InstallDate, Lat, Long, SP_ExecId, AirTableCreatedDateTime)
+    VALUES (source.Id, source.PoleNumber, source.LocationId, source.CountyFips, source.ProjectId, source.CustomerId,
             source.InstallDate, source.Lat, source.Long, source.SP_ExecId, source.AirTableCreatedDateTime);
 """
 
@@ -167,6 +172,62 @@ def _clean_coordinate(value):
     return value
 
 
+def _clean_county_fips(value):
+    """
+    County FIPS codes are always exactly 5 digits (2-digit state + 3-digit
+    county), with a leading zero for any state FIPS < 10 (e.g. "01001" for
+    Autauga County, AL). If this Airtable field is (or ever becomes) a
+    Number-type field rather than Text, Airtable would hand back a plain
+    int/float, which has already silently dropped that leading zero (01001
+    read as the integer 1001) -- str(1001) would then fail to match
+    ANYTHING in CountyTimeZones, not just resolve to the wrong county,
+    since no real FIPS code is 4 digits. Re-zero-pad defensively here
+    rather than assume the field will always stay a Text field forever.
+
+    Also unwraps a single-item list -- confirmed in practice that
+    Airtable's "CountyFips" field returns its value wrapped in a list
+    (e.g. ["12101"]), the same shape a lookup/linked-record field
+    produces regardless of cardinality -- same "list of values, take the
+    one that matters" shape as ProjectId/CustomerId elsewhere in this
+    file, just a single value rather than a record id. A list with more
+    than one entry is unexpected for what should be one pole -> one
+    county, but still takes the first rather than failing outright,
+    logging a warning so it's visible without blocking this pole's other
+    fields from loading.
+
+    Returns None for missing/blank values -- a pole with no county on file
+    should end up with no resolved timezone via this path, not a fabricated
+    one, same as this project's stance on other missing-location data.
+    """
+    if isinstance(value, list):
+        if not value:
+            return None
+        if len(value) > 1:
+            logging.warning(
+                "loadPoles: County FIPS field returned %d values %r -- "
+                "expected at most one; using the first.",
+                len(value),
+                value,
+            )
+        value = value[0]
+    if value is None:
+        return None
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    if not text.isdigit():
+        logging.warning(
+            "loadPoles: County FIPS value %r is not purely numeric -- "
+            "leaving CountyFips NULL for this pole rather than storing "
+            "something that can never match CountyTimeZones.",
+            value,
+        )
+        return None
+    return text.zfill(5)
+
+
 def _map_record_to_pole(record: dict) -> dict:
     """Maps a raw Airtable record to Poles table columns."""
     fields = record.get("fields", {})
@@ -182,6 +243,7 @@ def _map_record_to_pole(record: dict) -> dict:
         "Id": record["id"],  # Airtable's own record id, e.g. "recAbCdEfGh12345"
         "PoleNumber": fields.get("Pole Number"),
         "LocationId": fields.get("Location ID"),  # plain scalar, confirmed
+        "CountyFips": _clean_county_fips(fields.get("CountyFips")),
         "ProjectId": (
             project_ids[0]
             if isinstance(project_ids, list) and project_ids
@@ -254,6 +316,7 @@ def load_poles() -> None:
                 pole["Id"],
                 pole["PoleNumber"],
                 pole["LocationId"],
+                pole["CountyFips"],
                 pole["ProjectId"],
                 pole["CustomerId"],
                 pole["InstallDate"],

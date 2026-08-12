@@ -20,6 +20,7 @@ class TestMapRecordToPole:
             record_id="recPole001",
             pole_number="P-2002",
             location_id="LOC-7",
+            county_fips="12057",
             project_ids=["recProjABC"],
             customer_ids=["recCustXYZ"],
             install_date="2026-05-01",
@@ -32,11 +33,24 @@ class TestMapRecordToPole:
         assert result["Id"] == "recPole001"
         assert result["PoleNumber"] == "P-2002"
         assert result["LocationId"] == "LOC-7"
+        assert result["CountyFips"] == "12057"
         assert result["ProjectId"] == "recProjABC"  # first (only) linked id
         assert result["CustomerId"] == "recCustXYZ"  # first (only) linked id
         assert result["InstallDate"] == "2026-05-01"
         assert result["Lat"] == 27.9
         assert result["Long"] == -82.4
+
+    def test_location_id_and_county_fips_are_read_from_separate_fields(
+        self, make_pole_record
+    ):
+        """"Location ID" (the pole's own identifier) and "CountyFips"
+        (that same pole's county) are unrelated Airtable fields -- must
+        never get merged/confused."""
+        record = make_pole_record(location_id="LOC-99", county_fips="06037")
+        result = poles_loader._map_record_to_pole(record)
+        assert result["LocationId"] == "LOC-99"
+        assert result["CountyFips"] == "06037"
+        assert result["LocationId"] != result["CountyFips"]
 
     def test_multiple_linked_projects_takes_first_id(self, make_pole_record):
         record = make_pole_record(project_ids=["recFirst", "recSecond"])
@@ -75,12 +89,98 @@ class TestMapRecordToPole:
 
         assert result["PoleNumber"] is None
         assert result["LocationId"] is None
+        assert result["CountyFips"] is None
         assert result["ProjectId"] is None
         assert result["CustomerId"] is None
         assert result["InstallDate"] is None
         assert result["Lat"] is None
         assert result["Long"] is None
         assert result["AirTableCreatedDateTime"] is None
+
+
+class TestCleanCountyFips:
+    """
+    Dedicated coverage for two real, specific risks, both confirmed in
+    practice against the real Airtable base, not just theoretical:
+
+    1. If Airtable's "CountyFips" field is (or ever becomes) a
+       Number-type field rather than Text, a leading zero in the FIPS
+       code (e.g. "01001" for Autauga County, AL) is already gone by the
+       time Python ever sees the value -- Airtable would hand back the
+       plain int 1001, not the string "01001". str(1001).zfill(5)
+       correctly recovers "01001" since zfill pads on the LEFT.
+
+    2. Airtable's "CountyFips" field returns its value wrapped in a
+       list (e.g. ["12101"]) -- the same shape a lookup/linked-record
+       field produces regardless of cardinality, same as ProjectId/
+       CustomerId elsewhere in this file. Without unwrapping this first,
+       str(["12101"]) produces the literal string "['12101']", which
+       correctly (but unhelpfully) fails the purely-numeric check and
+       gets rejected -- a real bug this project hit in production.
+    """
+
+    def test_none_becomes_none(self):
+        assert poles_loader._clean_county_fips(None) is None
+
+    def test_blank_string_becomes_none(self):
+        assert poles_loader._clean_county_fips("") is None
+        assert poles_loader._clean_county_fips("   ") is None
+
+    def test_correctly_formatted_five_digit_string_passes_through(self):
+        assert poles_loader._clean_county_fips("12057") == "12057"
+
+    def test_string_missing_leading_zero_gets_zero_padded(self):
+        assert poles_loader._clean_county_fips("1001") == "01001"
+
+    def test_int_gets_converted_and_zero_padded(self):
+        """The core risk this function exists for: Airtable handing back
+        a plain int (leading zero already lost) instead of a string."""
+        assert poles_loader._clean_county_fips(1001) == "01001"
+
+    def test_float_gets_converted_and_zero_padded(self):
+        """Airtable's API can return Number-type fields as floats even for
+        whole numbers (e.g. 1001.0) -- must still recover correctly, not
+        produce "1001.0" or crash."""
+        assert poles_loader._clean_county_fips(1001.0) == "01001"
+
+    def test_single_item_list_gets_unwrapped(self):
+        """The exact real-world bug this covers: Airtable returning
+        ["12101"] rather than the plain string "12101"."""
+        assert poles_loader._clean_county_fips(["12101"]) == "12101"
+
+    def test_single_item_list_with_missing_leading_zero_still_gets_padded(self):
+        """Unwrapping happens BEFORE the zero-pad/numeric checks, so both
+        fixes compose correctly rather than only one applying."""
+        assert poles_loader._clean_county_fips(["1101"]) == "01101"
+
+    def test_single_item_list_with_int_gets_unwrapped_and_padded(self):
+        assert poles_loader._clean_county_fips([1101]) == "01101"
+
+    def test_empty_list_becomes_none(self):
+        assert poles_loader._clean_county_fips([]) is None
+
+    def test_multi_item_list_uses_first_and_logs_a_warning(self, caplog):
+        """Unexpected for what should be one pole -> one county, but
+        takes the first rather than failing this pole's entire load --
+        same "don't let one odd field block everything else" philosophy
+        as the rest of this loader."""
+        with caplog.at_level("WARNING"):
+            result = poles_loader._clean_county_fips(["12101", "12102"])
+
+        assert result == "12101"
+        warnings = [rec.message for rec in caplog.records if rec.levelname == "WARNING"]
+        assert any("returned 2 values" in w for w in warnings)
+
+    def test_whitespace_is_stripped_before_padding(self):
+        assert poles_loader._clean_county_fips("  12057  ") == "12057"
+
+    def test_non_numeric_string_becomes_none_not_garbage(self):
+        """A FIPS code is never anything but digits -- something like
+        "N/A" or a stray formula-error string must not silently become a
+        5-character, zfill-padded garbage value that could coincidentally
+        collide with a real FIPS code."""
+        assert poles_loader._clean_county_fips("N/A") is None
+        assert poles_loader._clean_county_fips("#ERROR!") is None
 
     def test_missing_id_raises_keyerror(self):
         record = {"createdTime": "2026-01-01T00:00:00.000Z", "fields": {}}
@@ -168,7 +268,7 @@ class TestPoleUpsertSqlStructure:
         sql_text, batch = mock_cursor.executemany.call_args.args
         assert "INSERT INTO #PolesStaging" in sql_text
         assert len(batch) == 1
-        assert sql_text.count("?") == len(batch[0]) == 10
+        assert sql_text.count("?") == len(batch[0]) == 11
 
     def test_merge_from_staging_is_executed_after_staging_insert(
         self, patch_get_connection_poles, patch_fetch_all_records_poles, mock_cursor, make_pole_record
@@ -186,7 +286,7 @@ class TestPoleUpsertSqlStructure:
         sql = poles_loader._POLE_UPSERT_SQL
         insert_cols = re.search(r"INSERT \(([^)]+)\)", sql).group(1)
         values_cols = re.search(r"VALUES \(([^)]+)\)", sql, re.DOTALL).group(1)
-        assert len(insert_cols.split(",")) == len(values_cols.split(",")) == 10
+        assert len(insert_cols.split(",")) == len(values_cols.split(",")) == 11
 
     def test_merge_match_key_is_id(self):
         assert "ON target.Id = source.Id" in poles_loader._POLE_UPSERT_SQL
@@ -217,7 +317,7 @@ class TestStagingMergeSqlStructure:
     def test_staging_insert_placeholder_count_matches_column_count(self):
         sql = poles_loader._STAGING_INSERT_SQL
         insert_cols = re.search(r"INSERT INTO #PolesStaging \(([^)]+)\)", sql).group(1)
-        assert len(insert_cols.split(",")) == sql.count("?") == 10
+        assert len(insert_cols.split(",")) == sql.count("?") == 11
 
     def test_merge_from_staging_sources_the_staging_table(self):
         assert "USING #PolesStaging AS source" in poles_loader._MERGE_FROM_STAGING_SQL
@@ -236,7 +336,7 @@ class TestStagingMergeSqlStructure:
         sql = poles_loader._MERGE_FROM_STAGING_SQL
         insert_cols = re.search(r"INSERT \(([^)]+)\)", sql).group(1)
         values_cols = re.search(r"VALUES \(([^)]+)\)", sql, re.DOTALL).group(1)
-        assert len(insert_cols.split(",")) == len(values_cols.split(",")) == 10
+        assert len(insert_cols.split(",")) == len(values_cols.split(",")) == 11
 
     def test_truncate_staging_sql_targets_staging_table(self):
         assert poles_loader._TRUNCATE_STAGING_SQL == "TRUNCATE TABLE #PolesStaging"
@@ -347,9 +447,10 @@ class TestLoadPolesSuccessFlow:
         assert "INSERT INTO #PolesStaging" in staging_insert_sql
         assert len(batch) == 2
         assert batch[0][0] == "recPole1"
-        assert batch[0][8] == 7  # SP_ExecId position
+        assert batch[0][3] == "12057"  # CountyFips position
+        assert batch[0][9] == 7  # SP_ExecId position
         assert batch[1][0] == "recPole2"
-        assert batch[1][8] == 7
+        assert batch[1][9] == 7
 
         update_sql, end_time, success, errors, batch_count, sp_exec_id = calls[4].args
         assert "UPDATE SP_Execution" in update_sql

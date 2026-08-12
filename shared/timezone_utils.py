@@ -24,6 +24,13 @@ IANA_TO_WINDOWS = {
     "America/New_York": "Eastern Standard Time",
     "America/Detroit": "Eastern Standard Time",
     "America/Indiana/Indianapolis": "US Eastern Standard Time",
+    "America/Indiana/Vincennes": "Eastern Standard Time",
+    "America/Indiana/Winamac": "Eastern Standard Time",
+    "America/Indiana/Petersburg": "Eastern Standard Time",
+    "America/Indiana/Marengo": "US Eastern Standard Time",  # groups with Indianapolis's own historical no-DST-until-2006 quirk, not the plain Eastern group
+    "America/Indiana/Vevay": "US Eastern Standard Time",  # same historical group as Marengo/Indianapolis, not plain Eastern
+    "America/Kentucky/Louisville": "Eastern Standard Time",  # CLDR lists this under its legacy alias "America/Louisville", not this canonical IANA name -- same zone
+    "America/Kentucky/Monticello": "Eastern Standard Time",
     "America/Chicago": "Central Standard Time",
     "America/Indiana/Knox": "Central Standard Time",
     "America/Indiana/Tell_City": "Central Standard Time",

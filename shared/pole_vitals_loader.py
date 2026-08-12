@@ -82,16 +82,53 @@ def _compute_cutoff(now, period_type: str, backfill: bool):
 #
 # Four independent fault signals, computed per PoleTelemetry reading:
 #   IsLedFault      = (LampPower1 + LampPower2) = 0, EXCEPT while
-#                      IsDaylight = 1 -- a solar-powered light is
-#                      SUPPOSED to be off while the sun is actually up,
-#                      so zero lamp power during real daylight is
-#                      expected, correct behavior, never a fault; only
-#                      once it's genuinely dark (IsDaylight = 0, or NULL
-#                      if not yet computed for this reading -- treated
-#                      the same as confirmed-dark, not exempted) does
-#                      zero lamp power indicate a real problem.
+#                      IsDaylightForLedFault = 1 -- a solar-powered
+#                      light is SUPPOSED to be off while the sun is
+#                      actually up, so zero lamp power during real
+#                      daylight is expected, correct behavior, never a
+#                      fault; only once it's genuinely dark
+#                      (IsDaylightForLedFault = 0, or NULL if not yet
+#                      computed for this reading -- treated the same as
+#                      confirmed-dark, not exempted) does zero lamp
+#                      power indicate a real problem.
+#                      IsDaylightForLedFault (a PoleTelemetry column,
+#                      computed by pole_daylight_flags_loader.py) is
+#                      DELIBERATELY not the same value as IsPanelFault's
+#                      own IsDaylight below -- it's true at the exact
+#                      moment, OR within a 1-hour grace period before OR
+#                      after that moment, confirmed necessary in practice
+#                      since a real lamp doesn't always turn on the
+#                      instant the sun crosses the sunset threshold (nor
+#                      off exactly at sunrise -- some lamps sense
+#                      approaching dawn light and turn off slightly
+#                      early). IsPanelFault has no equivalent lag (solar
+#                      output tracks the sun
+#                      closely), so it keeps using the strict column.
 #   IsBatteryFault  = (BatteryElecCurrent1 + BatteryElecCurrent2) / 2 < 10
-#   IsPanelFault    = (SolarBoardVoltage * SolarBoardElecCurrent) = 0
+#   IsPanelFault    = (SolarBoardVoltage * SolarBoardElecCurrent) = 0,
+#                      EXCEPT while IsDaylightForPanelFault = 0 (a solar
+#                      panel only charges once it's been daylight for at
+#                      least an hour -- IsDaylightForPanelFault, a
+#                      PoleTelemetry column computed by
+#                      pole_daylight_flags_loader.py, gives the panel
+#                      time to physically warm up right after sunrise --
+#                      so zero panel output at night OR during that
+#                      first hour is expected, correct behavior, never a
+#                      fault; only once it's past the warmup period
+#                      (IsDaylightForPanelFault = 1, or NULL if not yet
+#                      computed for this reading -- treated the same as
+#                      confirmed-past-warmup, not exempted) does zero
+#                      panel output indicate a real problem -- mirror
+#                      image of IsLedFault above: each flag's own
+#                      condition only applies during the OPPOSITE time
+#                      of day), AND EXCEPT while the average of
+#                      BatteryVoltage1/BatteryVoltage2 is already >=
+#                      PoleModels' BatteryChargingMin for that pole's
+#                      ModelId, defaulting to 13.5 if that ModelId has no
+#                      PoleModels match at all (a fully (or sufficiently)
+#                      charged battery has nothing left to charge, so
+#                      zero panel output is expected there too, even
+#                      during daylight).
 #   IsOpenIssueFault = t.IsOpenIssueFault (already computed and stored per
 #                      reading by pole_telemetry_loader.py -- joining
 #                      PoleOpenIssues at read time here would be
@@ -152,20 +189,37 @@ SET ANSI_WARNINGS OFF;
         CASE WHEN t.IsOnline = 1 THEN 1 ELSE 0 END AS IsOnlineFlag,
         -- Solar-powered lights are SUPPOSED to be off during daylight --
         -- LampPower1+LampPower2=0 while the sun is actually up
-        -- (t.IsDaylight, computed via real per-day/per-location
-        -- sunrise/sunset math in pole_daylight_flags_loader.py -- NOT a
-        -- fixed clock window, which was tried first and had a real,
-        -- unavoidable flaw: whichever bucket straddles the actual
-        -- sunrise/sunset moment for a given day/location gets
-        -- misclassified in one direction or the other) is expected,
-        -- correct behavior, not a fault. Only when it's actually dark
-        -- does zero lamp power indicate a real problem. See this CASE's
-        -- own ordering: the daylight check comes first and
-        -- unconditionally returns 0, regardless of LampPower -- only
-        -- falls through to the actual LampPower check once it's
-        -- established this reading is genuinely at night.
+        -- (t.IsDaylightForLedFault, computed via real per-day/
+        -- per-location sunrise/sunset math in
+        -- pole_daylight_flags_loader.py -- NOT a fixed clock window,
+        -- which was tried first and had a real, unavoidable flaw:
+        -- whichever bucket straddles the actual sunrise/sunset moment
+        -- for a given day/location gets misclassified in one direction
+        -- or the other) is expected, correct behavior, not a fault.
+        -- Only when it's actually dark does zero lamp power indicate a
+        -- real problem. See this CASE's own ordering: the daylight
+        -- check comes first and unconditionally returns 0, regardless
+        -- of LampPower -- only falls through to the actual LampPower
+        -- check once it's established this reading is genuinely at
+        -- night.
         --
-        -- t.IsDaylight NULL (not yet computed by
+        -- t.IsDaylightForLedFault is DELIBERATELY NOT the same as
+        -- IsPanelFaultFlag's own t.IsDaylight below -- it's a more
+        -- forgiving definition (true at the exact moment, OR within 1
+        -- hour before OR after -- see pole_daylight_flags_loader.py's
+        -- own _LED_FAULT_GRACE_PERIOD), confirmed necessary in
+        -- practice: a real lamp doesn't always turn on the INSTANT the
+        -- sun crosses the sunset threshold (the "before" side of the
+        -- grace period), nor does one always turn off exactly at
+        -- sunrise -- some lamps sense approaching dawn light and turn
+        -- off slightly early (the "after" side). IsPanelFault has no
+        -- equivalent lag (solar output genuinely does track the sun
+        -- closely), so it keeps using the strict column unmodified --
+        -- these two flags need different daylight definitions, which
+        -- is exactly why this is two separate PoleTelemetry columns,
+        -- not one shared value.
+        --
+        -- t.IsDaylightForLedFault NULL (not yet computed by
         -- pole_daylight_flags_loader.py for this specific reading) falls
         -- through to the LampPower check below, same as "confirmed
         -- dark" -- treating "we don't know yet" as "subject to the
@@ -173,12 +227,72 @@ SET ANSI_WARNINGS OFF;
         -- exempting a reading from fault detection just because its
         -- daylight status hasn't been computed yet.
         CASE
-            WHEN t.IsDaylight = 1 THEN 0
+            WHEN t.IsDaylightForLedFault = 1 THEN 0
             WHEN (t.LampPower1 + t.LampPower2) = 0 THEN 1
             ELSE 0
         END AS IsLedFaultFlag,
         CASE WHEN (t.BatteryElecCurrent1 + t.BatteryElecCurrent2) / 2.0 < 10 THEN 1 ELSE 0 END AS IsBatteryFaultFlag,
-        CASE WHEN (t.SolarBoardVoltage * t.SolarBoardElecCurrent) = 0 THEN 1 ELSE 0 END AS IsPanelFaultFlag,
+        -- Solar panels only need to charge when BOTH (a) it's been
+        -- daylight for at least an hour (t.IsDaylightForPanelFault = 1
+        -- -- see pole_daylight_flags_loader.py's own
+        -- _PANEL_FAULT_SUNRISE_WARMUP_PERIOD; gives a panel time to
+        -- physically warm up right after sunrise) AND (b) the battery
+        -- actually needs it -- the average of BatteryVoltage1/
+        -- BatteryVoltage2 is below pm.BatteryChargingMin (a per-model
+        -- threshold, currently a fixed 13.5 for every model -- see
+        -- "sql/PoleModels/Add BatteryChargingMin column.sql"). Once the
+        -- battery is already at or above that threshold, zero panel
+        -- output is expected, correct behavior (nothing left to
+        -- charge), not a fault, even during daylight. Only once it's
+        -- past the sunrise warmup AND the battery genuinely needs
+        -- charging does zero panel output indicate a real problem. See
+        -- this CASE's own ordering: t.IsDaylightForPanelFault = 0 is
+        -- checked first and unconditionally returns 0 regardless of
+        -- anything else -- it's False both at night (no daylight at
+        -- all) AND during the first hour after sunrise (daylight, but
+        -- not yet past warmup), so this single check covers both cases
+        -- without needing a separate plain-nighttime condition;
+        -- "battery already charged enough" is checked second and ALSO
+        -- unconditionally returns 0 regardless of panel output -- only
+        -- once both of those are ruled out does this fall through to
+        -- the actual panel-output check.
+        --
+        -- t.IsDaylightForPanelFault NULL (not yet computed by
+        -- pole_daylight_flags_loader.py for this specific reading) falls
+        -- through past that first check, same as "confirmed past
+        -- warmup" -- treating "we don't know yet" as "subject to the
+        -- normal check" is the safer default, rather than silently
+        -- exempting a reading from fault detection just because its
+        -- daylight status hasn't been computed yet. This is the mirror
+        -- image of IsLedFaultFlag's own NULL handling above (which
+        -- treats unknown as "confirmed dark" instead) -- each flag's
+        -- fault condition only applies during the OPPOSITE time of day,
+        -- so "unknown" always falls through to that flag's own check,
+        -- just via a different comparison (= 1 there, = 0 here).
+        --
+        -- A NULL average BatteryVoltage (missing readings) still falls
+        -- through past the battery-already-charged check -- "unknown
+        -- whether the battery needs charging" is treated as "assume it
+        -- might", not silently exempted, since NULL >= anything is
+        -- still UNKNOWN in T-SQL regardless of what the threshold
+        -- itself is.
+        --
+        -- A ModelId with no PoleModels match AT ALL (the LEFT JOIN
+        -- below produces a NULL pm.BatteryChargingMin) is DIFFERENT --
+        -- rather than falling through the same way, ISNULL() below
+        -- defaults the threshold itself to 13.5, the same value every
+        -- model in PoleModels currently has anyway (see
+        -- "sql/PoleModels/Add BatteryChargingMin column.sql"). An
+        -- unmatched model is deliberately treated the same as a
+        -- matched one with today's default value, not as "unknown,
+        -- assume it might still need charging" regardless of how
+        -- charged the battery actually is.
+        CASE
+            WHEN t.IsDaylightForPanelFault = 0 THEN 0
+            WHEN (t.BatteryVoltage1 + t.BatteryVoltage2) / 2.0 >= ISNULL(pm.BatteryChargingMin, 13.5) THEN 0
+            WHEN (t.SolarBoardVoltage * t.SolarBoardElecCurrent) = 0 THEN 1
+            ELSE 0
+        END AS IsPanelFaultFlag,
         t.IsOpenIssueFault,
         t.LastUpload
     FROM PoleTelemetry t
@@ -280,20 +394,37 @@ SET ANSI_WARNINGS OFF;
         t.IsOnline,
         -- Solar-powered lights are SUPPOSED to be off during daylight --
         -- LampPower1+LampPower2=0 while the sun is actually up
-        -- (t.IsDaylight, computed via real per-day/per-location
-        -- sunrise/sunset math in pole_daylight_flags_loader.py -- NOT a
-        -- fixed clock window, which was tried first and had a real,
-        -- unavoidable flaw: whichever bucket straddles the actual
-        -- sunrise/sunset moment for a given day/location gets
-        -- misclassified in one direction or the other) is expected,
-        -- correct behavior, not a fault. Only when it's actually dark
-        -- does zero lamp power indicate a real problem. See this CASE's
-        -- own ordering: the daylight check comes first and
-        -- unconditionally returns 0, regardless of LampPower -- only
-        -- falls through to the actual LampPower check once it's
-        -- established this reading is genuinely at night.
+        -- (t.IsDaylightForLedFault, computed via real per-day/
+        -- per-location sunrise/sunset math in
+        -- pole_daylight_flags_loader.py -- NOT a fixed clock window,
+        -- which was tried first and had a real, unavoidable flaw:
+        -- whichever bucket straddles the actual sunrise/sunset moment
+        -- for a given day/location gets misclassified in one direction
+        -- or the other) is expected, correct behavior, not a fault.
+        -- Only when it's actually dark does zero lamp power indicate a
+        -- real problem. See this CASE's own ordering: the daylight
+        -- check comes first and unconditionally returns 0, regardless
+        -- of LampPower -- only falls through to the actual LampPower
+        -- check once it's established this reading is genuinely at
+        -- night.
         --
-        -- t.IsDaylight NULL (not yet computed by
+        -- t.IsDaylightForLedFault is DELIBERATELY NOT the same as
+        -- IsPanelFaultFlag's own t.IsDaylight below -- it's a more
+        -- forgiving definition (true at the exact moment, OR within 1
+        -- hour before OR after -- see pole_daylight_flags_loader.py's
+        -- own _LED_FAULT_GRACE_PERIOD), confirmed necessary in
+        -- practice: a real lamp doesn't always turn on the INSTANT the
+        -- sun crosses the sunset threshold (the "before" side of the
+        -- grace period), nor does one always turn off exactly at
+        -- sunrise -- some lamps sense approaching dawn light and turn
+        -- off slightly early (the "after" side). IsPanelFault has no
+        -- equivalent lag (solar output genuinely does track the sun
+        -- closely), so it keeps using the strict column unmodified --
+        -- these two flags need different daylight definitions, which
+        -- is exactly why this is two separate PoleTelemetry columns,
+        -- not one shared value.
+        --
+        -- t.IsDaylightForLedFault NULL (not yet computed by
         -- pole_daylight_flags_loader.py for this specific reading) falls
         -- through to the LampPower check below, same as "confirmed
         -- dark" -- treating "we don't know yet" as "subject to the
@@ -301,12 +432,72 @@ SET ANSI_WARNINGS OFF;
         -- exempting a reading from fault detection just because its
         -- daylight status hasn't been computed yet.
         CASE
-            WHEN t.IsDaylight = 1 THEN 0
+            WHEN t.IsDaylightForLedFault = 1 THEN 0
             WHEN (t.LampPower1 + t.LampPower2) = 0 THEN 1
             ELSE 0
         END AS IsLedFaultFlag,
         CASE WHEN (t.BatteryElecCurrent1 + t.BatteryElecCurrent2) / 2.0 < 10 THEN 1 ELSE 0 END AS IsBatteryFaultFlag,
-        CASE WHEN (t.SolarBoardVoltage * t.SolarBoardElecCurrent) = 0 THEN 1 ELSE 0 END AS IsPanelFaultFlag,
+        -- Solar panels only need to charge when BOTH (a) it's been
+        -- daylight for at least an hour (t.IsDaylightForPanelFault = 1
+        -- -- see pole_daylight_flags_loader.py's own
+        -- _PANEL_FAULT_SUNRISE_WARMUP_PERIOD; gives a panel time to
+        -- physically warm up right after sunrise) AND (b) the battery
+        -- actually needs it -- the average of BatteryVoltage1/
+        -- BatteryVoltage2 is below pm.BatteryChargingMin (a per-model
+        -- threshold, currently a fixed 13.5 for every model -- see
+        -- "sql/PoleModels/Add BatteryChargingMin column.sql"). Once the
+        -- battery is already at or above that threshold, zero panel
+        -- output is expected, correct behavior (nothing left to
+        -- charge), not a fault, even during daylight. Only once it's
+        -- past the sunrise warmup AND the battery genuinely needs
+        -- charging does zero panel output indicate a real problem. See
+        -- this CASE's own ordering: t.IsDaylightForPanelFault = 0 is
+        -- checked first and unconditionally returns 0 regardless of
+        -- anything else -- it's False both at night (no daylight at
+        -- all) AND during the first hour after sunrise (daylight, but
+        -- not yet past warmup), so this single check covers both cases
+        -- without needing a separate plain-nighttime condition;
+        -- "battery already charged enough" is checked second and ALSO
+        -- unconditionally returns 0 regardless of panel output -- only
+        -- once both of those are ruled out does this fall through to
+        -- the actual panel-output check.
+        --
+        -- t.IsDaylightForPanelFault NULL (not yet computed by
+        -- pole_daylight_flags_loader.py for this specific reading) falls
+        -- through past that first check, same as "confirmed past
+        -- warmup" -- treating "we don't know yet" as "subject to the
+        -- normal check" is the safer default, rather than silently
+        -- exempting a reading from fault detection just because its
+        -- daylight status hasn't been computed yet. This is the mirror
+        -- image of IsLedFaultFlag's own NULL handling above (which
+        -- treats unknown as "confirmed dark" instead) -- each flag's
+        -- fault condition only applies during the OPPOSITE time of day,
+        -- so "unknown" always falls through to that flag's own check,
+        -- just via a different comparison (= 1 there, = 0 here).
+        --
+        -- A NULL average BatteryVoltage (missing readings) still falls
+        -- through past the battery-already-charged check -- "unknown
+        -- whether the battery needs charging" is treated as "assume it
+        -- might", not silently exempted, since NULL >= anything is
+        -- still UNKNOWN in T-SQL regardless of what the threshold
+        -- itself is.
+        --
+        -- A ModelId with no PoleModels match AT ALL (the LEFT JOIN
+        -- below produces a NULL pm.BatteryChargingMin) is DIFFERENT --
+        -- rather than falling through the same way, ISNULL() below
+        -- defaults the threshold itself to 13.5, the same value every
+        -- model in PoleModels currently has anyway (see
+        -- "sql/PoleModels/Add BatteryChargingMin column.sql"). An
+        -- unmatched model is deliberately treated the same as a
+        -- matched one with today's default value, not as "unknown,
+        -- assume it might still need charging" regardless of how
+        -- charged the battery actually is.
+        CASE
+            WHEN t.IsDaylightForPanelFault = 0 THEN 0
+            WHEN (t.BatteryVoltage1 + t.BatteryVoltage2) / 2.0 >= ISNULL(pm.BatteryChargingMin, 13.5) THEN 0
+            WHEN (t.SolarBoardVoltage * t.SolarBoardElecCurrent) = 0 THEN 1
+            ELSE 0
+        END AS IsPanelFaultFlag,
         t.IsOpenIssueFault,
         t.LastUpload
     FROM PoleTelemetry t
@@ -437,20 +628,37 @@ SET ANSI_WARNINGS OFF;
         CASE WHEN t.IsOnline = 1 THEN 1 ELSE 0 END AS IsOnlineFlag,
         -- Solar-powered lights are SUPPOSED to be off during daylight --
         -- LampPower1+LampPower2=0 while the sun is actually up
-        -- (t.IsDaylight, computed via real per-day/per-location
-        -- sunrise/sunset math in pole_daylight_flags_loader.py -- NOT a
-        -- fixed clock window, which was tried first and had a real,
-        -- unavoidable flaw: whichever bucket straddles the actual
-        -- sunrise/sunset moment for a given day/location gets
-        -- misclassified in one direction or the other) is expected,
-        -- correct behavior, not a fault. Only when it's actually dark
-        -- does zero lamp power indicate a real problem. See this CASE's
-        -- own ordering: the daylight check comes first and
-        -- unconditionally returns 0, regardless of LampPower -- only
-        -- falls through to the actual LampPower check once it's
-        -- established this reading is genuinely at night.
+        -- (t.IsDaylightForLedFault, computed via real per-day/
+        -- per-location sunrise/sunset math in
+        -- pole_daylight_flags_loader.py -- NOT a fixed clock window,
+        -- which was tried first and had a real, unavoidable flaw:
+        -- whichever bucket straddles the actual sunrise/sunset moment
+        -- for a given day/location gets misclassified in one direction
+        -- or the other) is expected, correct behavior, not a fault.
+        -- Only when it's actually dark does zero lamp power indicate a
+        -- real problem. See this CASE's own ordering: the daylight
+        -- check comes first and unconditionally returns 0, regardless
+        -- of LampPower -- only falls through to the actual LampPower
+        -- check once it's established this reading is genuinely at
+        -- night.
         --
-        -- t.IsDaylight NULL (not yet computed by
+        -- t.IsDaylightForLedFault is DELIBERATELY NOT the same as
+        -- IsPanelFaultFlag's own t.IsDaylight below -- it's a more
+        -- forgiving definition (true at the exact moment, OR within 1
+        -- hour before OR after -- see pole_daylight_flags_loader.py's
+        -- own _LED_FAULT_GRACE_PERIOD), confirmed necessary in
+        -- practice: a real lamp doesn't always turn on the INSTANT the
+        -- sun crosses the sunset threshold (the "before" side of the
+        -- grace period), nor does one always turn off exactly at
+        -- sunrise -- some lamps sense approaching dawn light and turn
+        -- off slightly early (the "after" side). IsPanelFault has no
+        -- equivalent lag (solar output genuinely does track the sun
+        -- closely), so it keeps using the strict column unmodified --
+        -- these two flags need different daylight definitions, which
+        -- is exactly why this is two separate PoleTelemetry columns,
+        -- not one shared value.
+        --
+        -- t.IsDaylightForLedFault NULL (not yet computed by
         -- pole_daylight_flags_loader.py for this specific reading) falls
         -- through to the LampPower check below, same as "confirmed
         -- dark" -- treating "we don't know yet" as "subject to the
@@ -458,12 +666,72 @@ SET ANSI_WARNINGS OFF;
         -- exempting a reading from fault detection just because its
         -- daylight status hasn't been computed yet.
         CASE
-            WHEN t.IsDaylight = 1 THEN 0
+            WHEN t.IsDaylightForLedFault = 1 THEN 0
             WHEN (t.LampPower1 + t.LampPower2) = 0 THEN 1
             ELSE 0
         END AS IsLedFaultFlag,
         CASE WHEN (t.BatteryElecCurrent1 + t.BatteryElecCurrent2) / 2.0 < 10 THEN 1 ELSE 0 END AS IsBatteryFaultFlag,
-        CASE WHEN (t.SolarBoardVoltage * t.SolarBoardElecCurrent) = 0 THEN 1 ELSE 0 END AS IsPanelFaultFlag,
+        -- Solar panels only need to charge when BOTH (a) it's been
+        -- daylight for at least an hour (t.IsDaylightForPanelFault = 1
+        -- -- see pole_daylight_flags_loader.py's own
+        -- _PANEL_FAULT_SUNRISE_WARMUP_PERIOD; gives a panel time to
+        -- physically warm up right after sunrise) AND (b) the battery
+        -- actually needs it -- the average of BatteryVoltage1/
+        -- BatteryVoltage2 is below pm.BatteryChargingMin (a per-model
+        -- threshold, currently a fixed 13.5 for every model -- see
+        -- "sql/PoleModels/Add BatteryChargingMin column.sql"). Once the
+        -- battery is already at or above that threshold, zero panel
+        -- output is expected, correct behavior (nothing left to
+        -- charge), not a fault, even during daylight. Only once it's
+        -- past the sunrise warmup AND the battery genuinely needs
+        -- charging does zero panel output indicate a real problem. See
+        -- this CASE's own ordering: t.IsDaylightForPanelFault = 0 is
+        -- checked first and unconditionally returns 0 regardless of
+        -- anything else -- it's False both at night (no daylight at
+        -- all) AND during the first hour after sunrise (daylight, but
+        -- not yet past warmup), so this single check covers both cases
+        -- without needing a separate plain-nighttime condition;
+        -- "battery already charged enough" is checked second and ALSO
+        -- unconditionally returns 0 regardless of panel output -- only
+        -- once both of those are ruled out does this fall through to
+        -- the actual panel-output check.
+        --
+        -- t.IsDaylightForPanelFault NULL (not yet computed by
+        -- pole_daylight_flags_loader.py for this specific reading) falls
+        -- through past that first check, same as "confirmed past
+        -- warmup" -- treating "we don't know yet" as "subject to the
+        -- normal check" is the safer default, rather than silently
+        -- exempting a reading from fault detection just because its
+        -- daylight status hasn't been computed yet. This is the mirror
+        -- image of IsLedFaultFlag's own NULL handling above (which
+        -- treats unknown as "confirmed dark" instead) -- each flag's
+        -- fault condition only applies during the OPPOSITE time of day,
+        -- so "unknown" always falls through to that flag's own check,
+        -- just via a different comparison (= 1 there, = 0 here).
+        --
+        -- A NULL average BatteryVoltage (missing readings) still falls
+        -- through past the battery-already-charged check -- "unknown
+        -- whether the battery needs charging" is treated as "assume it
+        -- might", not silently exempted, since NULL >= anything is
+        -- still UNKNOWN in T-SQL regardless of what the threshold
+        -- itself is.
+        --
+        -- A ModelId with no PoleModels match AT ALL (the LEFT JOIN
+        -- below produces a NULL pm.BatteryChargingMin) is DIFFERENT --
+        -- rather than falling through the same way, ISNULL() below
+        -- defaults the threshold itself to 13.5, the same value every
+        -- model in PoleModels currently has anyway (see
+        -- "sql/PoleModels/Add BatteryChargingMin column.sql"). An
+        -- unmatched model is deliberately treated the same as a
+        -- matched one with today's default value, not as "unknown,
+        -- assume it might still need charging" regardless of how
+        -- charged the battery actually is.
+        CASE
+            WHEN t.IsDaylightForPanelFault = 0 THEN 0
+            WHEN (t.BatteryVoltage1 + t.BatteryVoltage2) / 2.0 >= ISNULL(pm.BatteryChargingMin, 13.5) THEN 0
+            WHEN (t.SolarBoardVoltage * t.SolarBoardElecCurrent) = 0 THEN 1
+            ELSE 0
+        END AS IsPanelFaultFlag,
         t.IsOpenIssueFault,
         -- Identifies each pole's own single most-recent reading in the
         -- window, for IsOpenIssueFault's "take the last telemetry" rule.
@@ -493,8 +761,21 @@ USING (
     SELECT
         LocationId,
         'Last48Hours' AS PeriodType,
-        DATEADD(HOUR, -48, SYSDATETIMEOFFSET()) AS PeriodStart,
-        SYSDATETIMEOFFSET() AS PeriodEnd,
+        -- Converted to Eastern -- SYSDATETIMEOFFSET() alone reflects the
+        -- SERVER's own time zone (Azure SQL Database runs in UTC
+        -- regardless of physical region), which would otherwise show
+        -- PeriodStart/PeriodEnd as +00:00 while every other "now"-style
+        -- timestamp in this project (e.g. SP_Execution's StartDateTime/
+        -- EndDateTime, via shared/datetime_utils.py's now_eastern())
+        -- is Eastern -- confusing side-by-side, and inconsistent with
+        -- the rest of this codebase for no real reason. Applying AT TIME
+        -- ZONE before subtracting 48 hours doesn't change WHICH absolute
+        -- instant PeriodStart lands on (DATEADD operates on the
+        -- underlying instant, not the display offset, so this is safe
+        -- even across a DST transition) -- it only changes how that
+        -- same instant is displayed.
+        DATEADD(HOUR, -48, SYSDATETIMEOFFSET() AT TIME ZONE 'Eastern Standard Time') AS PeriodStart,
+        SYSDATETIMEOFFSET() AT TIME ZONE 'Eastern Standard Time' AS PeriodEnd,
         AvgBatteryPercentage, AvgPanelPercentage, AvgLightPercentage,
         IsOnlineAgg AS IsOnline,
         CAST(IsLedFaultAgg AS BIT) AS IsLedFault,
@@ -542,8 +823,11 @@ _MERGE_SQL_BY_PERIOD_TYPE = {
 
 # Deletes anything beyond the newest N rows per LocationId, ordered by
 # PeriodStart DESC -- run once per period type, right after that period
-# type's own MERGE commits. Only Hour/Day are in _RETENTION_LIMITS (see
-# that dict's own comment for why Last48Hours doesn't need this at all).
+# type's own MERGE commits. Only Hour/Day are in _RETENTION_LIMITS --
+# count-based retention doesn't apply to Last48Hours, which is always
+# exactly one row per pole by construction, not a growing history to cap.
+# Last48Hours has its own, different cleanup need instead -- see
+# _LAST_48_HOURS_STALE_ROW_PRUNE_SQL below.
 _RETENTION_PRUNE_SQL = """
 ;WITH Ranked AS (
     SELECT LocationId, PeriodStart,
@@ -556,6 +840,69 @@ FROM PoleVitals pv
 JOIN Ranked r ON pv.LocationId = r.LocationId AND pv.PeriodStart = r.PeriodStart
 WHERE pv.PeriodType = ? AND r.rn > ?
 """
+
+# Removes any existing Last48Hours row for a pole that no longer has ANY
+# telemetry within the current 48-hour window -- without this, a pole
+# that goes completely silent (zero readings at all, not even one) keeps
+# whatever it last successfully computed FOREVER, since
+# _LAST_48_HOURS_MERGE_SQL's own source query only ever includes poles
+# that DO still have recent telemetry -- a silent pole simply never
+# appears in that source at all, so the MERGE can neither update nor
+# remove its existing row. A stale "IsOnline=1" (or whatever it last
+# was) for a pole that hasn't reported in days would keep silently
+# counting toward getPoleVitals' connectedLights/totalLights, which is
+# actively misleading, not just imprecise -- this is a correctness gap,
+# not a nice-to-have.
+#
+# cutoff/sentinel here must be the SAME two values bound into
+# _LAST_48_HOURS_MERGE_SQL's own WHERE clause for this same run -- this
+# has to describe exactly the same "no recent telemetry" condition the
+# MERGE itself used to decide who's IN its source, or this could delete
+# (or fail to delete) the wrong set of rows relative to what the MERGE
+# just did.
+_LAST_48_HOURS_STALE_ROW_PRUNE_SQL = """
+DELETE pv
+FROM PoleVitals pv
+WHERE pv.PeriodType = 'Last48Hours'
+  AND NOT EXISTS (
+      SELECT 1 FROM PoleTelemetry t
+      WHERE t.LocationId = pv.LocationId
+        AND t.LastUpload >= ?
+        AND t.LastUpload <> ?
+  )
+"""
+
+
+def _run_cleanup_for_period_type(cursor, period_type: str, cutoff: str) -> int:
+    """
+    Runs whatever "remove now-irrelevant rows" step applies to this
+    period type, right after its own MERGE succeeds. Hour/Day get the
+    keep-newest-N retention prune; Last48Hours gets its own stale-row
+    removal instead (see _LAST_48_HOURS_STALE_ROW_PRUNE_SQL's own
+    comment for why retention-by-count doesn't apply to it). A single,
+    shared call site for both success paths in load_pole_vitals() (the
+    normal one and the benign-01003-warning one) -- rather than
+    duplicating this same period-type dispatch logic in both places,
+    which had already happened once before this function existed and
+    was exactly the kind of near-identical duplication worth collapsing.
+
+    Returns the number of rows removed, for logging.
+    """
+    retention_limit = _RETENTION_LIMITS.get(period_type)
+    if retention_limit is not None:
+        cursor.execute(_RETENTION_PRUNE_SQL, period_type, period_type, retention_limit)
+        return cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+
+    if period_type == "Last48Hours":
+        cursor.execute(
+            _LAST_48_HOURS_STALE_ROW_PRUNE_SQL,
+            cutoff,
+            _MISSING_LAST_UPLOAD_SENTINEL,
+        )
+        return cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+
+    return 0
+
 
 
 def _is_benign_null_aggregate_warning(exc: Exception) -> bool:
@@ -595,16 +942,24 @@ def load_pole_vitals(backfill: bool = False) -> None:
     Retention: Hour keeps the newest 168 rows per pole, Day keeps 7 --
     this table had no pruning at all before this change, so it will
     shrink (once) the first time this runs against an existing,
-    unpruned table. Last48Hours needs no pruning -- it's structurally
-    always exactly one row per pole (see _LAST_48_HOURS_MERGE_SQL's own
-    comment for why its MERGE is built that way).
+    unpruned table. Last48Hours doesn't need count-based retention (it's
+    structurally always exactly one row per pole -- see
+    _LAST_48_HOURS_MERGE_SQL's own comment for why its MERGE is built
+    that way), but DOES get its own different cleanup: any existing row
+    for a pole that's gone completely silent (no telemetry at all within
+    the current 48-hour window) is removed, since the MERGE itself can
+    never touch such a pole -- it simply never appears in the MERGE's
+    own source query, so without this cleanup its last-known values
+    would persist forever, misleadingly counting toward getPoleVitals'
+    connectedLights/totalLights long after the pole stopped reporting.
 
-    Commits after EACH period type's MERGE (and, for Hour/Day, its
-    retention prune) individually, not once at the end for all of them
-    -- a slow or failing period type can no longer roll back an earlier
-    period type's already-computed, already-succeeded results. Each
-    period type's fate -- commit on success, rollback on genuine failure
-    -- is independent of what happens to the others.
+    Commits after EACH period type's MERGE (and its own cleanup step --
+    retention prune for Hour/Day, stale-row removal for Last48Hours)
+    individually, not once at the end for all of them -- a slow or
+    failing period type can no longer roll back an earlier period
+    type's already-computed, already-succeeded results. Each period
+    type's fate -- commit on success, rollback on genuine failure -- is
+    independent of what happens to the others.
 
     Set backfill=True for a one-off historical recompute covering
     PoleTelemetry's entire 6-month retention window for Hour/Day, instead
@@ -652,11 +1007,7 @@ def load_pole_vitals(backfill: bool = False) -> None:
                 cursor.execute(merge_sql, *params)
                 affected = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
 
-                retention_limit = _RETENTION_LIMITS.get(period_type)
-                pruned = 0
-                if retention_limit is not None:
-                    cursor.execute(_RETENTION_PRUNE_SQL, period_type, period_type, retention_limit)
-                    pruned = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+                pruned = _run_cleanup_for_period_type(cursor, period_type, cutoff)
 
                 conn.commit()
                 total_success += affected
@@ -676,11 +1027,7 @@ def load_pole_vitals(backfill: bool = False) -> None:
                     # way as the success path above) -- only pyodbc's
                     # exception-raising made it look like a failure.
                     affected = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
-                    retention_limit = _RETENTION_LIMITS.get(period_type)
-                    pruned = 0
-                    if retention_limit is not None:
-                        cursor.execute(_RETENTION_PRUNE_SQL, period_type, period_type, retention_limit)
-                        pruned = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+                    pruned = _run_cleanup_for_period_type(cursor, period_type, cutoff)
                     conn.commit()
                     total_success += affected
                     logging.info(

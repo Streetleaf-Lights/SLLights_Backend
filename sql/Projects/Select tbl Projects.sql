@@ -11,4 +11,17 @@ SELECT TOP (1000) [Id]
   FROM [dbo].[Projects]
   WHERE 1 = 1
   -- AND [CustomerId] = 'recwx649JfiRmWqxF'
+  AND PoleNumbers LIKE '%HIL-1333%'
+    -- AND Name LIKE '%acacia%'
   ORDER BY [AirTableCreatedDateTime] DESC
+
+-- SELECT DISTINCT t.LocationId
+-- FROM PoleTelemetry t
+-- WHERE t.LocationId IN (
+--     SELECT p.LocationId
+--     FROM Poles p
+--     JOIN Projects proj ON p.ProjectId = proj.Id
+--     WHERE proj.Name LIKE '%acacia%'
+--       AND p.LocationId IS NOT NULL
+-- )
+-- ORDER BY t.LocationId;
