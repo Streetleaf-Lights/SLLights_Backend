@@ -177,7 +177,7 @@ def loadAirTableDataManual(req: func.HttpRequest) -> func.HttpResponse:
 # Singleton Lock still separately guarantees no actual overlapping runs,
 # regardless of this setting.
 @app.timer_trigger(
-    schedule="0 */10 * * * *",
+    schedule="0 */30 * * * *",
     arg_name="myTimer",
     run_on_startup=False,
     use_monitor=False,

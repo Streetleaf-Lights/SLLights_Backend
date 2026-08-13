@@ -172,6 +172,40 @@ class TestPoleDetailsSqlStructure:
         assert "JOIN Projects proj ON p.ProjectId = proj.Id" in sql
         assert "JOIN Customers c ON proj.CustomerId = c.Id" in sql
 
+    def test_new_latest_telemetry_columns_present(self):
+        sql = m._POLE_DETAILS_SQL_TEMPLATE
+        for col in (
+            "LampPower1", "LampPower2",
+            "BatteryElecCurrent1", "BatteryElecCurrent2",
+            "SolarBoardVoltage", "SolarBoardElecCurrent",
+        ):
+            assert f"latest_pt.{col} AS {col}" in sql
+
+    def test_new_columns_read_from_the_same_outer_apply_not_a_second_one(self):
+        """One seek into PoleTelemetry already returns the latest row --
+        no reason to query it twice for the same row."""
+        sql = m._POLE_DETAILS_SQL_TEMPLATE
+        assert sql.count("OUTER APPLY") == 1
+        apply_block = sql.split("OUTER APPLY (")[1].split(") AS latest_pt")[0]
+        for col in (
+            "pt.LampPower1", "pt.LampPower2",
+            "pt.BatteryElecCurrent1", "pt.BatteryElecCurrent2",
+            "pt.SolarBoardVoltage", "pt.SolarBoardElecCurrent",
+            "pt.ModelId",
+        ):
+            assert col in apply_block
+
+    def test_battery_charging_min_defaults_to_13_5_via_isnull(self):
+        sql = m._POLE_DETAILS_SQL_TEMPLATE
+        assert "ISNULL(pm.BatteryChargingMin, 13.5) AS BatteryChargingMin" in sql
+
+    def test_battery_charging_min_joins_pole_models_via_latest_telemetrys_own_model_id(self):
+        """Must join on latest_pt.ModelId (that SAME reading's model),
+        not some other, possibly stale source of ModelId -- consistent
+        with how pole_vitals_loader.py itself resolves this value."""
+        sql = m._POLE_DETAILS_SQL_TEMPLATE
+        assert "LEFT JOIN PoleModels pm ON latest_pt.ModelId = pm.ModelId" in sql
+
 
 # --------------------------------------------------------------------------
 # Dict-mapping functions
@@ -191,6 +225,13 @@ class TestPoleRowToDict:
         last_update="2026-07-31 08:00:00 -04:00",
         battery_voltage_1=12.6,
         battery_voltage_2=12.4,
+        lamp_power_1=8.7,
+        lamp_power_2=8.6,
+        battery_elec_current_1=15.0,
+        battery_elec_current_2=15.2,
+        solar_board_voltage=18.0,
+        solar_board_elec_current=2.0,
+        battery_charging_min=13.5,
         is_online=True,
         is_led_fault=False,
         is_battery_fault=False,
@@ -205,6 +246,8 @@ class TestPoleRowToDict:
         return (
             project_id, pole_id, pole_number, location_id, install_date, lat, long_,
             last_update, battery_voltage_1, battery_voltage_2,
+            lamp_power_1, lamp_power_2, battery_elec_current_1, battery_elec_current_2,
+            solar_board_voltage, solar_board_elec_current, battery_charging_min,
             is_online, is_led_fault, is_battery_fault, is_panel_fault, is_open_issue_fault, is_pole_fault,
             battery_percentage, panel_percentage, light_percentage, customer_id,
         )
@@ -221,6 +264,13 @@ class TestPoleRowToDict:
             "lastUpdate": "2026-07-31 08:00:00 -04:00",
             "batteryVoltage1": 12.6,
             "batteryVoltage2": 12.4,
+            "lampPower1": 8.7,
+            "lampPower2": 8.6,
+            "batteryElecCurrent1": 15.0,
+            "batteryElecCurrent2": 15.2,
+            "solarBoardVoltage": 18.0,
+            "solarBoardElecCurrent": 2.0,
+            "batteryChargingMin": 13.5,
             "isOnline": True,
             "isLedFault": False,
             "isBatteryFault": False,
@@ -254,12 +304,39 @@ class TestPoleRowToDict:
         assert result["isPoleFault"] is None
         assert result["avgBatteryPercentage"] is None
 
-    def test_pole_with_no_telemetry_has_null_last_update_and_voltages(self):
-        row = self._row(last_update=None, battery_voltage_1=None, battery_voltage_2=None)
+    def test_pole_with_no_telemetry_has_null_last_update_and_latest_reading_fields(self):
+        """A pole with no PoleTelemetry row at all -- every field sourced
+        from the OUTER APPLY must be null, EXCEPT batteryChargingMin,
+        which has its own ISNULL(..., 13.5) default and so still comes
+        back a real number even with no telemetry to source a ModelId
+        from at all -- see _POLE_DETAILS_SQL_TEMPLATE's own comment."""
+        row = self._row(
+            last_update=None, battery_voltage_1=None, battery_voltage_2=None,
+            lamp_power_1=None, lamp_power_2=None,
+            battery_elec_current_1=None, battery_elec_current_2=None,
+            solar_board_voltage=None, solar_board_elec_current=None,
+            battery_charging_min=13.5,  # ISNULL's own default, not None
+        )
         result = m._pole_row_to_dict(row)
         assert result["lastUpdate"] is None
         assert result["batteryVoltage1"] is None
         assert result["batteryVoltage2"] is None
+        assert result["lampPower1"] is None
+        assert result["lampPower2"] is None
+        assert result["batteryElecCurrent1"] is None
+        assert result["batteryElecCurrent2"] is None
+        assert result["solarBoardVoltage"] is None
+        assert result["solarBoardElecCurrent"] is None
+        assert result["batteryChargingMin"] == 13.5
+
+    def test_battery_charging_min_defaults_to_13_5_when_model_unmatched(self):
+        """The other half of the same ISNULL() default: a pole WITH
+        telemetry, but whose ModelId has no PoleModels match at all,
+        must also fall back to 13.5 -- not just the no-telemetry-at-all
+        case above."""
+        row = self._row(battery_charging_min=13.5)
+        result = m._pole_row_to_dict(row)
+        assert result["batteryChargingMin"] == 13.5
 
 
 class TestRowToProjectDict:
@@ -329,6 +406,7 @@ class TestGetPoleVitalsUnfiltered:
             (
                 "proj1", "pole1", "PN-1", "LOC-1", "2025-01-01", 28.0, -82.0,
                 "2026-07-31 08:00:00 -04:00", 12.6, 12.4,
+                8.7, 8.6, 15.0, 15.2, 18.0, 2.0, 13.5,
                 True, False, True, False, False, True,
                 89.0, 45.0, 0.0, "cust1",
             )
@@ -349,6 +427,10 @@ class TestGetPoleVitalsUnfiltered:
         assert len(project["poles"]) == 1
         assert project["poles"][0]["id"] == "pole1"
         assert project["poles"][0]["isPoleFault"] is True
+        assert project["poles"][0]["lampPower1"] == 8.7
+        assert project["poles"][0]["batteryElecCurrent1"] == 15.0
+        assert project["poles"][0]["solarBoardVoltage"] == 18.0
+        assert project["poles"][0]["batteryChargingMin"] == 13.5
 
     def test_customer_with_zero_projects_gets_empty_projects_and_zeroed_rollup(
         self, patch_get_connection_pole_vitals_api, mock_cursor
@@ -477,6 +559,7 @@ class TestGetPoleVitalsByPeriod:
     ):
         mock_cursor.fetchone.return_value = (
             "pole1", "PN-1", "LOC-1", "2025-01-01", 28.0, -82.0, "2026-07-31 08:00:00 -04:00",
+            8.7, 8.6, 15.0, 15.2, 18.0, 2.0, 13.5,
         )
         mock_cursor.fetchall.return_value = [
             ("2026-07-31 07:00:00 -04:00", "2026-07-31 08:00:00 -04:00",
@@ -489,18 +572,48 @@ class TestGetPoleVitalsByPeriod:
         assert "lightStatus" not in entry
         assert entry["isOnline"] is True
         assert entry["isPoleFault"] is False
+        assert result["lampPower1"] == 8.7
+        assert result["batteryChargingMin"] == 13.5
 
     def test_pole_with_no_history_yet_returns_empty_vitals_list(
         self, patch_get_connection_pole_vitals_api, mock_cursor
     ):
-        mock_cursor.fetchone.return_value = ("pole1", "PN-1", "LOC-1", None, None, None, None)
+        mock_cursor.fetchone.return_value = (
+            "pole1", "PN-1", "LOC-1", None, None, None, None,
+            None, None, None, None, None, None, 13.5,
+        )
         mock_cursor.fetchall.return_value = []
 
         result = m.get_pole_vitals_by_period("pole1", "Day")
 
         assert result["vitals"] == []
+        assert result["lampPower1"] is None
+        assert result["batteryChargingMin"] == 13.5
 
     def test_pole_info_last_update_query_converts_to_local_time_zone(self):
         sql = m._POLE_INFO_FOR_HISTORY_SQL_TEMPLATE
         assert "AT TIME ZONE ISNULL(ptz.WindowsTimeZone, 'Eastern Standard Time')" in sql
         assert "LEFT JOIN PoleTimeZones ptz" in sql
+
+    def test_pole_info_new_latest_telemetry_columns_present(self):
+        sql = m._POLE_INFO_FOR_HISTORY_SQL_TEMPLATE
+        for col in (
+            "LampPower1", "LampPower2",
+            "BatteryElecCurrent1", "BatteryElecCurrent2",
+            "SolarBoardVoltage", "SolarBoardElecCurrent",
+        ):
+            assert f"latest_pt.{col} AS {col}" in sql
+
+    def test_pole_info_does_not_reintroduce_battery_voltage(self):
+        """BatteryVoltage1/BatteryVoltage2 remain deliberately excluded
+        from THIS endpoint specifically, per an earlier, separate
+        explicit request -- unrelated to this addition, not
+        reconsidered here."""
+        sql = m._POLE_INFO_FOR_HISTORY_SQL_TEMPLATE
+        assert "BatteryVoltage1" not in sql
+        assert "BatteryVoltage2" not in sql
+
+    def test_pole_info_battery_charging_min_defaults_to_13_5_via_isnull(self):
+        sql = m._POLE_INFO_FOR_HISTORY_SQL_TEMPLATE
+        assert "ISNULL(pm.BatteryChargingMin, 13.5) AS BatteryChargingMin" in sql
+        assert "LEFT JOIN PoleModels pm ON latest_pt.ModelId = pm.ModelId" in sql

@@ -1,5 +1,6 @@
 SELECT TOP 1000
-    LocationId,
+    t.LocationId,
+    PoleNumber,
     PeriodType,
     PeriodStart,
     PeriodEnd,
@@ -14,14 +15,16 @@ SELECT TOP 1000
     AvgLightPercentage,
     RecordCount,
     Source,
-    SP_ExecId
-FROM PoleVitals
+    t.SP_ExecId
+FROM PoleVitals t
+LEFT JOIN Poles p ON t.LocationId = p.LocationId
 WHERE 1 = 1
-AND LocationId LIKE '%12057-1398%'
+-- AND t.LocationId LIKE '%12057-1398%'
 -- and PeriodStart not like '%-04:%'
 -- AND IsOnline IS NOT NULL
 -- AND PeriodStart >= '2026-07-20 00:00:00'
 -- AND IsPoleFault = 0
+AND PoleNumber = 'HIL-4533'
 AND (PeriodType = 'Last48Hours' OR PeriodType = 'Hour')
 ORDER BY LocationId, PeriodStart DESC;
 

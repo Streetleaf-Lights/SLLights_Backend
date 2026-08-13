@@ -12,9 +12,9 @@ SELECT --TOP (1000)
       ,[AirTableCreatedDateTime]
   FROM [dbo].[Poles]
   WHERE 1 = 1
-  AND [LocationId] = 'JAX-DEMO'
+--   AND [LocationId] = 'JAX-DEMO'
     -- AND LocationId LIKE '%jacks%'
---   AND PoleNumber = 'JAX-DEMO'
+  AND PoleNumber = 'PAS-4938'
     -- AND PoleNumber LIKE '%12009-100%'
     -- AND (Long IS NULL OR Lat IS NULL)
     -- AND CountyFips IS NOT NULL

@@ -1,63 +1,63 @@
 -- Column list matches pole_telemetry_loader._ALL_COLUMNS exactly (order
 -- included) -- if that list ever changes, regenerate this from it rather
 -- than hand-editing, to avoid drift.
--- SELECT TOP 1000
---     LocationId,
---     LastUpload,
---     IsOnline,
---     IsOpenIssueFault,
---     -- Source,
---     -- SP_ExecId,
---     LampPower1,
---     LampPower2,
---     BatteryVoltage1,
---     BatteryVoltage2,
---     BatteryElecCurrent1,
---     BatteryElecCurrent2,
---     SolarBoardVoltage,
---     SolarBoardElecCurrent,
---     DcInVoltage,
---     BatteryOutElecCurrent,
---     BatteryTemperature1,
---     BatteryTemperature2,
---     McuTemperature,
---     EnvTemperature,
---     LightingState,
---     DcInState,
---     DcOutState,
---     SolarBoardState,
---     Battery1State,
---     Battery2State,
---     Lamp1State,
---     Lamp2State,
---     ControllerCode,
---     ProductId,
---     CreateTime,
---     SolarBoardDcStatus,
---     LampBatteryStatus,
---     UserName,
---     LeadsunId,
---     GroupId,
---     GroupName,
---     GatewayCode,
---     LeadsunProjectId,
---     LeadsunProjectName,
---     ModelId,
---     TimeoutFlag,
---     Longitude,
---     Latitude,
---     ControlModelCode,
---     ControlModelName,
---     ExtraFieldsJson
--- FROM PoleTelemetry
--- WHERE 1 = 1
--- AND LocationId = '12057-4508'
--- -- AND SP_ExecId = 442
--- -- AND IsDaylight IS NOT NULL
---     -- AND IsOnline = 0
---     -- AND LampPower1 > 0
---     -- AND LampPower2 > 0
--- ORDER BY LastUpload DESC;
+SELECT TOP 1000
+    LocationId,
+    LastUpload,
+    IsOnline,
+    IsOpenIssueFault,
+    -- Source,
+    -- SP_ExecId,
+    LampPower1,
+    LampPower2,
+    BatteryVoltage1,
+    BatteryVoltage2,
+    BatteryElecCurrent1,
+    BatteryElecCurrent2,
+    SolarBoardVoltage,
+    SolarBoardElecCurrent,
+    DcInVoltage,
+    BatteryOutElecCurrent,
+    BatteryTemperature1,
+    BatteryTemperature2,
+    McuTemperature,
+    EnvTemperature,
+    LightingState,
+    DcInState,
+    DcOutState,
+    SolarBoardState,
+    Battery1State,
+    Battery2State,
+    Lamp1State,
+    Lamp2State,
+    ControllerCode,
+    ProductId,
+    CreateTime,
+    SolarBoardDcStatus,
+    LampBatteryStatus,
+    UserName,
+    LeadsunId,
+    GroupId,
+    GroupName,
+    GatewayCode,
+    LeadsunProjectId,
+    LeadsunProjectName,
+    ModelId,
+    TimeoutFlag,
+    Longitude,
+    Latitude,
+    ControlModelCode,
+    ControlModelName,
+    ExtraFieldsJson
+FROM PoleTelemetry
+WHERE 1 = 1
+AND (LocationId = '12101-4938')
+-- AND SP_ExecId = 442
+-- AND IsDaylight IS NOT NULL
+    -- AND IsOnline = 0
+    -- AND LampPower1 > 0
+    -- AND LampPower2 > 0
+ORDER BY LastUpload DESC;
 
 WITH TelemetryWithFaultFlags AS (
     SELECT
@@ -89,7 +89,7 @@ WITH TelemetryWithFaultFlags AS (
     LEFT JOIN Poles p ON t.LocationId = p.LocationId
     LEFT JOIN PoleModels pm ON t.ModelId = pm.ModelId
     LEFT JOIN PoleTimeZones ptz ON t.LocationId = ptz.LocationId
-    WHERE t.LocationId = '12057-4615'
+    WHERE t.LocationId = '12057-4424'
         AND t.LastUpload >= DATEADD(HOUR, -48, SYSDATETIMEOFFSET())
       AND t.LastUpload <> '9999-12-31 23:59:59.999 +00:00'
 )

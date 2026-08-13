@@ -119,12 +119,35 @@ ORDER BY c.Name, proj.Name
 # operation pole_vitals_loader.py uses extensively for bucketing.
 #
 # OUTER APPLY (not a JOIN/CTE) for each pole's single most recent
-# PoleTelemetry row (LastUpload, BatteryVoltage1, BatteryVoltage2) --
-# PoleTelemetry's own PRIMARY KEY is (LocationId, LastUpload), so
-# `TOP 1 ... WHERE LocationId = @x ORDER BY LastUpload DESC` seeks
-# directly into that one pole's rows rather than scanning the table.
-# OUTER, not CROSS: a pole with no LocationId, or zero matching
-# PoleTelemetry rows, must still appear (with these columns NULL).
+# PoleTelemetry row -- PoleTelemetry's own PRIMARY KEY is (LocationId,
+# LastUpload), so `TOP 1 ... WHERE LocationId = @x ORDER BY LastUpload
+# DESC` seeks directly into that one pole's rows rather than scanning
+# the table. OUTER, not CROSS: a pole with no LocationId, or zero
+# matching PoleTelemetry rows, must still appear (with these columns
+# NULL).
+#
+# LampPower1/LampPower2, BatteryElecCurrent1/BatteryElecCurrent2,
+# SolarBoardVoltage/SolarBoardElecCurrent are this same latest reading's
+# OWN raw values -- genuinely different from the PoleVitals-based
+# avg*Percentage fields below (those are period AGGREGATES computed by
+# pole_vitals_loader.py over many readings; these are the single most
+# recent reading's own numbers, unaggregated). Added to the SAME OUTER
+# APPLY as LastUpload/BatteryVoltage1/BatteryVoltage2 above rather than
+# a second one, since it's still exactly one row per pole either way --
+# no reason to seek into PoleTelemetry twice for the same row.
+#
+# pm.ModelId also pulled from latest_pt (not from Poles or PoleTelemetry
+# directly via a separate join) specifically so BatteryChargingMin
+# reflects the SAME reading's own ModelId, not some other, possibly
+# stale telemetry row's model -- consistent with how
+# pole_vitals_loader.py itself resolves this same value. LEFT JOIN (not
+# INNER): a ModelId with no PoleModels match at all, OR a pole with no
+# PoleTelemetry row yet (latest_pt.ModelId NULL), must still return a
+# BatteryChargingMin value rather than disappearing from the result
+# entirely -- ISNULL(pm.BatteryChargingMin, 13.5) covers both of those
+# same-shaped NULL cases with the same default pole_vitals_loader.py's
+# own IsPanelFaultFlag check uses (see
+# "sql/PoleModels/Add BatteryChargingMin column.sql").
 #
 # Plain INNER JOINs for Poles->Projects->Customers: a project/customer
 # with zero matching poles simply returns zero rows for this query -- the
@@ -142,6 +165,13 @@ SELECT
     latest_pt.LastUpload AT TIME ZONE ISNULL(ptz.WindowsTimeZone, 'Eastern Standard Time') AS LastUpload,
     latest_pt.BatteryVoltage1 AS BatteryVoltage1,
     latest_pt.BatteryVoltage2 AS BatteryVoltage2,
+    latest_pt.LampPower1 AS LampPower1,
+    latest_pt.LampPower2 AS LampPower2,
+    latest_pt.BatteryElecCurrent1 AS BatteryElecCurrent1,
+    latest_pt.BatteryElecCurrent2 AS BatteryElecCurrent2,
+    latest_pt.SolarBoardVoltage AS SolarBoardVoltage,
+    latest_pt.SolarBoardElecCurrent AS SolarBoardElecCurrent,
+    ISNULL(pm.BatteryChargingMin, 13.5) AS BatteryChargingMin,
     rps.IsOnline AS IsOnline,
     rps.IsLedFault AS IsLedFault,
     rps.IsBatteryFault AS IsBatteryFault,
@@ -158,11 +188,17 @@ JOIN Customers c ON proj.CustomerId = c.Id
 LEFT JOIN PoleVitals rps ON p.LocationId = rps.LocationId AND rps.PeriodType = ?
 LEFT JOIN PoleTimeZones ptz ON p.LocationId = ptz.LocationId
 OUTER APPLY (
-    SELECT TOP 1 pt.LastUpload, pt.BatteryVoltage1, pt.BatteryVoltage2
+    SELECT TOP 1
+        pt.LastUpload, pt.BatteryVoltage1, pt.BatteryVoltage2,
+        pt.LampPower1, pt.LampPower2,
+        pt.BatteryElecCurrent1, pt.BatteryElecCurrent2,
+        pt.SolarBoardVoltage, pt.SolarBoardElecCurrent,
+        pt.ModelId
     FROM PoleTelemetry pt
     WHERE pt.LocationId = p.LocationId
     ORDER BY pt.LastUpload DESC
 ) AS latest_pt
+LEFT JOIN PoleModels pm ON latest_pt.ModelId = pm.ModelId
 {where_clause}
 ORDER BY proj.Id, p.PoleNumber
 """
@@ -193,15 +229,25 @@ def _pole_row_to_dict(row) -> dict:
     installDate/lat/long come straight from Poles -- static install-time
     facts, not derived from any telemetry or vitals aggregation.
 
-    lastUpdate/batteryVoltage1/batteryVoltage2 come from that pole's
-    single most recent PoleTelemetry row (via the OUTER APPLY in
+    lastUpdate/batteryVoltage1/batteryVoltage2/lampPower1/lampPower2/
+    batteryElecCurrent1/batteryElecCurrent2/solarBoardVoltage/
+    solarBoardElecCurrent come from that pole's single most recent
+    PoleTelemetry row (via the OUTER APPLY in
     _POLE_DETAILS_SQL_TEMPLATE) -- the raw reading itself, genuinely
-    different from avgBatteryPercentage (PoleVitals' own aggregate of a
-    DIFFERENT pair of PoleTelemetry columns, BatteryElecCurrent1/2, not
-    BatteryVoltage1/2). lastUpdate reflects the POLE'S OWN local time
-    (via PoleTimeZones), not UTC -- see _POLE_DETAILS_SQL_TEMPLATE's own
-    comment. All three are None for a pole with no LocationId or no
-    matching PoleTelemetry rows at all.
+    different from avgBatteryPercentage/avgPanelPercentage/
+    avgLightPercentage below (PoleVitals' own period AGGREGATES over
+    many readings, not this single most recent one). lastUpdate reflects
+    the POLE'S OWN local time (via PoleTimeZones), not UTC -- see
+    _POLE_DETAILS_SQL_TEMPLATE's own comment. All of these are None for
+    a pole with no LocationId or no matching PoleTelemetry rows at all.
+
+    batteryChargingMin comes from PoleModels, via that same latest
+    reading's own ModelId -- defaults to 13.5 (matching
+    pole_vitals_loader.py's own IsPanelFaultFlag default) when that
+    ModelId has no PoleModels match, or when there's no PoleTelemetry
+    row at all yet to source a ModelId from -- see
+    _POLE_DETAILS_SQL_TEMPLATE's own comment for why this is never None
+    the way the other latest-telemetry fields can be.
 
     The row's ProjectId (first column) and CustomerId (last column,
     added for shared/poles_api.py's benefit) are both deliberately NOT
@@ -220,6 +266,13 @@ def _pole_row_to_dict(row) -> dict:
         last_update,
         battery_voltage_1,
         battery_voltage_2,
+        lamp_power_1,
+        lamp_power_2,
+        battery_elec_current_1,
+        battery_elec_current_2,
+        solar_board_voltage,
+        solar_board_elec_current,
+        battery_charging_min,
         is_online,
         is_led_fault,
         is_battery_fault,
@@ -241,6 +294,13 @@ def _pole_row_to_dict(row) -> dict:
         "lastUpdate": json_safe(last_update),
         "batteryVoltage1": json_safe(battery_voltage_1),
         "batteryVoltage2": json_safe(battery_voltage_2),
+        "lampPower1": json_safe(lamp_power_1),
+        "lampPower2": json_safe(lamp_power_2),
+        "batteryElecCurrent1": json_safe(battery_elec_current_1),
+        "batteryElecCurrent2": json_safe(battery_elec_current_2),
+        "solarBoardVoltage": json_safe(solar_board_voltage),
+        "solarBoardElecCurrent": json_safe(solar_board_elec_current),
+        "batteryChargingMin": json_safe(battery_charging_min),
         "isOnline": json_safe(is_online),
         "isLedFault": json_safe(is_led_fault),
         "isBatteryFault": json_safe(is_battery_fault),
@@ -313,7 +373,9 @@ def get_pole_vitals(customer_id: str = None, project_id: str = None, limit: int 
     rollup stats (totalLights, connectedLights, totalFaults,
     percentWorking) and a "poles" list (one entry per Pole belonging to
     that project: id, poleNumber, locationId, installDate, lat, long,
-    lastUpdate, batteryVoltage1, batteryVoltage2, isOnline, isLedFault,
+    lastUpdate, batteryVoltage1, batteryVoltage2, lampPower1, lampPower2,
+    batteryElecCurrent1, batteryElecCurrent2, solarBoardVoltage,
+    solarBoardElecCurrent, batteryChargingMin, isOnline, isLedFault,
     isBatteryFault, isPanelFault, isOpenIssueFault, isPoleFault,
     avgBatteryPercentage, avgPanelPercentage, avgLightPercentage) --
     computed from every Pole belonging to that project and each pole's
@@ -333,14 +395,20 @@ def get_pole_vitals(customer_id: str = None, project_id: str = None, limit: int 
 
     installDate/lat/long come straight from Poles -- static, unrelated to
     any telemetry or vitals data (present even for a pole with neither).
-    lastUpdate/batteryVoltage1/batteryVoltage2 come from that pole's own
-    single most recent PoleTelemetry row (an OUTER APPLY, not the
-    PoleVitals-based fields above) -- the raw reading itself, distinct
-    from avgBatteryPercentage (PoleVitals' own aggregate of a DIFFERENT
-    pair of PoleTelemetry columns, BatteryElecCurrent1/2, not
-    BatteryVoltage1/2). lastUpdate reflects the pole's own local time
-    zone (via PoleTimeZones), not UTC. All three are None for a pole with
-    no LocationId or no matching PoleTelemetry rows at all.
+    lastUpdate/batteryVoltage1/batteryVoltage2/lampPower1/lampPower2/
+    batteryElecCurrent1/batteryElecCurrent2/solarBoardVoltage/
+    solarBoardElecCurrent come from that pole's own single most recent
+    PoleTelemetry row (an OUTER APPLY, not the PoleVitals-based fields
+    above) -- the raw reading itself, distinct from
+    avgBatteryPercentage/avgPanelPercentage/avgLightPercentage
+    (PoleVitals' own period AGGREGATES over many readings, not this
+    single most recent one). lastUpdate reflects the pole's own local
+    time zone (via PoleTimeZones), not UTC. All of these are None for a
+    pole with no LocationId or no matching PoleTelemetry rows at all.
+    batteryChargingMin comes from PoleModels via that same latest
+    reading's own ModelId, defaulting to 13.5 when unmatched -- see
+    _POLE_DETAILS_SQL_TEMPLATE's own comment for why this one field is
+    never None the way the others can be.
 
     The Customer itself ALSO carries the same four rollup fields (but NOT
     a "poles" list of its own -- poles only ever appear nested under
@@ -496,12 +564,26 @@ _VALID_PERIOD_TYPES = ("Hour", "Day")
 # long, lastUpdate -- are properties of the POLE, not of any individual
 # PoleVitals bucket, so they're fetched once here rather than repeated
 # on every history entry (which would be wasteful once this can return
-# many rows). Only ONE OUTER APPLY (PoleTelemetry, for lastUpdate) --
-# batteryVoltage1/batteryVoltage2 were dropped from this endpoint
-# entirely per earlier explicit request. lastUpdate reflects the pole's
-# own local time zone (via PoleTimeZones), same as get_pole_vitals()'s
-# per-pole lastUpdate -- not UTC. OUTER, not CROSS: a pole with no
-# PoleTelemetry row yet must still be returned (with lastUpdate null).
+# many rows). lastUpdate reflects the pole's own local time zone (via
+# PoleTimeZones), same as get_pole_vitals()'s per-pole lastUpdate -- not
+# UTC. OUTER, not CROSS: a pole with no PoleTelemetry row yet must still
+# be returned (with lastUpdate and the other latest-telemetry fields
+# null).
+#
+# LampPower1/LampPower2, BatteryElecCurrent1/BatteryElecCurrent2,
+# SolarBoardVoltage/SolarBoardElecCurrent added to this same OUTER APPLY
+# for the same reason as get_pole_vitals()'s own _POLE_DETAILS_SQL_TEMPLATE
+# -- one seek into PoleTelemetry already returns this same latest row, no
+# reason for a second one. (BatteryVoltage1/BatteryVoltage2 remain
+# deliberately excluded from THIS endpoint specifically, per an earlier,
+# separate explicit request -- unrelated to this addition, not
+# reconsidered here.)
+#
+# BatteryChargingMin: same ISNULL(pm.BatteryChargingMin, 13.5) pattern as
+# get_pole_vitals()'s own _POLE_DETAILS_SQL_TEMPLATE and
+# pole_vitals_loader.py's IsPanelFaultFlag -- resolved via this same
+# latest reading's own ModelId, defaulting to 13.5 when that ModelId has
+# no PoleModels match, or when there's no PoleTelemetry row at all yet.
 _POLE_INFO_FOR_HISTORY_SQL_TEMPLATE = """
 SELECT
     p.Id AS PoleId,
@@ -510,15 +592,27 @@ SELECT
     p.InstallDate AS InstallDate,
     p.Lat AS Lat,
     p.Long AS Long,
-    latest_pt.LastUpload AT TIME ZONE ISNULL(ptz.WindowsTimeZone, 'Eastern Standard Time') AS LastUpload
+    latest_pt.LastUpload AT TIME ZONE ISNULL(ptz.WindowsTimeZone, 'Eastern Standard Time') AS LastUpload,
+    latest_pt.LampPower1 AS LampPower1,
+    latest_pt.LampPower2 AS LampPower2,
+    latest_pt.BatteryElecCurrent1 AS BatteryElecCurrent1,
+    latest_pt.BatteryElecCurrent2 AS BatteryElecCurrent2,
+    latest_pt.SolarBoardVoltage AS SolarBoardVoltage,
+    latest_pt.SolarBoardElecCurrent AS SolarBoardElecCurrent,
+    ISNULL(pm.BatteryChargingMin, 13.5) AS BatteryChargingMin
 FROM Poles p
 LEFT JOIN PoleTimeZones ptz ON p.LocationId = ptz.LocationId
 OUTER APPLY (
-    SELECT TOP 1 pt.LastUpload
+    SELECT TOP 1
+        pt.LastUpload, pt.LampPower1, pt.LampPower2,
+        pt.BatteryElecCurrent1, pt.BatteryElecCurrent2,
+        pt.SolarBoardVoltage, pt.SolarBoardElecCurrent,
+        pt.ModelId
     FROM PoleTelemetry pt
     WHERE pt.LocationId = p.LocationId
     ORDER BY pt.LastUpload DESC
 ) AS latest_pt
+LEFT JOIN PoleModels pm ON latest_pt.ModelId = pm.ModelId
 WHERE p.Id = ?
 """
 
@@ -584,13 +678,19 @@ def _pole_vitals_history_row_to_dict(row) -> dict:
 def get_pole_vitals_by_period(pole_id: str, period_type: str, limit: int = None):
     """
     Returns a single pole's static info (id, poleNumber, locationId,
-    installDate, lat, long, lastUpdate) plus its full history of
-    PoleVitals rows for the given period_type, each entry as its own
-    dict in a "vitals" list (periodStart, periodEnd, isOnline,
-    isLedFault, isBatteryFault, isPanelFault, isOpenIssueFault,
-    isPoleFault, avgBatteryPercentage, avgPanelPercentage,
-    avgLightPercentage). Deliberately NO rollup/aggregation across
-    entries -- each one is a direct read of one PoleVitals row.
+    installDate, lat, long, lastUpdate, lampPower1, lampPower2,
+    batteryElecCurrent1, batteryElecCurrent2, solarBoardVoltage,
+    solarBoardElecCurrent, batteryChargingMin -- the last seven from that
+    pole's single most recent PoleTelemetry row and, for
+    batteryChargingMin, PoleModels, same as get_pole_vitals()'s own
+    per-pole fields -- see _POLE_INFO_FOR_HISTORY_SQL_TEMPLATE's own
+    comment) plus its full history of PoleVitals rows for the given
+    period_type, each entry as its own dict in a "vitals" list
+    (periodStart, periodEnd, isOnline, isLedFault, isBatteryFault,
+    isPanelFault, isOpenIssueFault, isPoleFault, avgBatteryPercentage,
+    avgPanelPercentage, avgLightPercentage). Deliberately NO rollup/
+    aggregation across entries -- each one is a direct read of one
+    PoleVitals row.
 
     period_type: must be 'Hour' or 'Day' -- Last48Hours is excluded (see
     _VALID_PERIOD_TYPES' own comment for why: it's a single current-state
@@ -602,9 +702,14 @@ def get_pole_vitals_by_period(pole_id: str, period_type: str, limit: int = None)
     shared/api_utils.py).
 
     Returns None if no Pole exists with that id. If the pole exists but
-    has no PoleTelemetry row yet, lastUpdate comes back null. If it has
-    no PoleVitals rows of the requested period_type yet, "vitals" comes
-    back as an empty list -- not an error, and not a 404.
+    has no PoleTelemetry row yet, lastUpdate and the other
+    latest-telemetry fields (lampPower1/2, batteryElecCurrent1/2,
+    solarBoardVoltage, solarBoardElecCurrent) come back null --
+    batteryChargingMin still comes back 13.5 regardless, since it has
+    its own default rather than depending on a PoleTelemetry row
+    existing at all. If it has no PoleVitals rows of the requested
+    period_type yet, "vitals" comes back as an empty list -- not an
+    error, and not a 404.
     """
     if period_type not in _VALID_PERIOD_TYPES:
         raise ValueError(f"periodType must be one of: {', '.join(_VALID_PERIOD_TYPES)}")
@@ -628,7 +733,22 @@ def get_pole_vitals_by_period(pole_id: str, period_type: str, limit: int = None)
         cursor.close()
         conn.close()
 
-    pole_id_, pole_number, location_id, install_date, lat, long_, last_update = pole_row
+    (
+        pole_id_,
+        pole_number,
+        location_id,
+        install_date,
+        lat,
+        long_,
+        last_update,
+        lamp_power_1,
+        lamp_power_2,
+        battery_elec_current_1,
+        battery_elec_current_2,
+        solar_board_voltage,
+        solar_board_elec_current,
+        battery_charging_min,
+    ) = pole_row
     return {
         "id": json_safe(pole_id_),
         "poleNumber": json_safe(pole_number),
@@ -637,5 +757,12 @@ def get_pole_vitals_by_period(pole_id: str, period_type: str, limit: int = None)
         "lat": json_safe(lat),
         "long": json_safe(long_),
         "lastUpdate": json_safe(last_update),
+        "lampPower1": json_safe(lamp_power_1),
+        "lampPower2": json_safe(lamp_power_2),
+        "batteryElecCurrent1": json_safe(battery_elec_current_1),
+        "batteryElecCurrent2": json_safe(battery_elec_current_2),
+        "solarBoardVoltage": json_safe(solar_board_voltage),
+        "solarBoardElecCurrent": json_safe(solar_board_elec_current),
+        "batteryChargingMin": json_safe(battery_charging_min),
         "vitals": [_pole_vitals_history_row_to_dict(row) for row in vitals_rows],
     }
