@@ -617,3 +617,83 @@ class TestGetPoleVitalsByPeriod:
         sql = m._POLE_INFO_FOR_HISTORY_SQL_TEMPLATE
         assert "ISNULL(pm.BatteryChargingMin, 13.5) AS BatteryChargingMin" in sql
         assert "LEFT JOIN PoleModels pm ON latest_pt.ModelId = pm.ModelId" in sql
+
+    def test_hour_history_query_has_a_48_hour_bound_anchored_to_latest_telemetry(self):
+        """The whole point of this specific change: anchored to this
+        pole's own latest PoleTelemetry reading (via PoleContext's own
+        MaxLastUpload), NOT to SYSDATETIMEOFFSET()/"now" -- so a pole
+        that's gone completely offline still returns its own last 48
+        hours of real activity instead of an empty list."""
+        sql = m._POLE_VITALS_HOUR_HISTORY_SQL_TEMPLATE
+        assert "AND pv.PeriodStart >= DATEADD(HOUR, -48, pc.MaxLastUpload)" in sql
+        assert "SYSDATETIMEOFFSET" not in sql
+
+    def test_hour_history_query_resolves_latest_telemetry_via_pole_context_cte(self):
+        sql = m._POLE_VITALS_HOUR_HISTORY_SQL_TEMPLATE
+        assert "WITH PoleContext AS (" in sql
+        assert "SELECT MAX(pt.LastUpload)" in sql
+        assert "FROM PoleTelemetry pt" in sql
+        assert "JOIN PoleContext pc ON pv.LocationId = pc.LocationId" in sql
+
+    def test_hour_history_query_excludes_the_missing_last_upload_sentinel(self):
+        """Hardcoded literal, not a bound parameter -- matches the same
+        established precedent in pole_daylight_flags_loader.py's own
+        _FIND_UNFLAGGED_SQL."""
+        sql = m._POLE_VITALS_HOUR_HISTORY_SQL_TEMPLATE
+        assert "AND pt.LastUpload <> '9999-12-31 23:59:59.999 +00:00'" in sql
+
+    def test_hour_history_query_hardcodes_hour_not_a_bound_parameter(self):
+        """This template is only ever selected when period_type == 'Hour'
+        -- nothing to parameterize, so it's a literal, not a third '?'."""
+        sql = m._POLE_VITALS_HOUR_HISTORY_SQL_TEMPLATE
+        assert "pv.PeriodType = 'Hour'" in sql
+        assert sql.count("?") == 2  # TOP (?) and p.Id = ? only -- no period_type parameter
+
+    def test_hour_history_query_keeps_the_row_count_limit_too(self):
+        """TOP (?) is kept ALONGSIDE the new time bound, not replaced by
+        it -- a caller can still ask for fewer than whatever the 48-hour
+        window would otherwise return."""
+        sql = m._POLE_VITALS_HOUR_HISTORY_SQL_TEMPLATE
+        assert "SELECT TOP (?)" in sql
+
+    def test_day_history_query_unaffected_no_time_bound_added(self):
+        """Day intentionally keeps the plain, unbounded-by-wall-clock-time
+        query -- this is a deliberate difference from Hour, not an
+        oversight."""
+        sql = m._POLE_VITALS_HISTORY_SQL_TEMPLATE
+        assert "SYSDATETIMEOFFSET" not in sql
+        assert sql.count("?") == 3  # TOP (?), p.Id = ?, AND pv.PeriodType = ?
+
+    def test_hour_period_type_uses_the_hour_specific_template(
+        self, patch_get_connection_pole_vitals_api, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = (
+            "pole1", "PN-1", "LOC-1", "2025-01-01", 28.0, -82.0, "2026-07-31 08:00:00 -04:00",
+            8.7, 8.6, 15.0, 15.2, 18.0, 2.0, 13.5,
+        )
+        mock_cursor.fetchall.return_value = []
+
+        m.get_pole_vitals_by_period("pole1", "Hour", limit=10)
+
+        history_call = mock_cursor.execute.call_args_list[-1]
+        assert history_call.args[0] == m._POLE_VITALS_HOUR_HISTORY_SQL_TEMPLATE
+        # pole_id THEN limit -- the opposite order from the Day template
+        # below, forced by PoleContext's own CTE (which needs pole_id to
+        # resolve LocationId) coming textually before the main query's
+        # own TOP (?).
+        assert history_call.args == (m._POLE_VITALS_HOUR_HISTORY_SQL_TEMPLATE, "pole1", 10)
+
+    def test_day_period_type_uses_the_original_template(
+        self, patch_get_connection_pole_vitals_api, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = (
+            "pole1", "PN-1", "LOC-1", "2025-01-01", 28.0, -82.0, "2026-07-31 08:00:00 -04:00",
+            8.7, 8.6, 15.0, 15.2, 18.0, 2.0, 13.5,
+        )
+        mock_cursor.fetchall.return_value = []
+
+        m.get_pole_vitals_by_period("pole1", "Day", limit=10)
+
+        history_call = mock_cursor.execute.call_args_list[-1]
+        assert history_call.args[0] == m._POLE_VITALS_HISTORY_SQL_TEMPLATE
+        assert history_call.args == (m._POLE_VITALS_HISTORY_SQL_TEMPLATE, 10, "pole1", "Day")

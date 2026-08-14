@@ -616,12 +616,109 @@ LEFT JOIN PoleModels pm ON latest_pt.ModelId = pm.ModelId
 WHERE p.Id = ?
 """
 
+# The Hour-specific variant of the query below -- ALSO bounds the
+# result to a genuine 48-hour window, not just the newest N rows
+# regardless of how far back they actually reach. Confirmed as a real,
+# practical difference: Hour buckets aren't guaranteed contiguous -- a
+# pole that went offline for a stretch has GAPS in its own PeriodStart
+# sequence, so "TOP 48 rows" alone could silently reach back well past
+# 48 real hours to fill in for the missing ones. This template accepts
+# that tradeoff deliberately: fewer than 48 entries when there are real
+# gaps within the window, rather than papering over those gaps by
+# reaching further into history than the caller actually asked for.
+# TOP (?) is kept alongside the time filter (not replaced by it) so a
+# caller can still ask for fewer than whatever the 48-hour window would
+# otherwise return -- it can only further narrow the result, never widen
+# it past 48 hours.
+#
+# The 48-hour window is anchored to THIS POLE'S OWN most recent
+# PoleTelemetry reading (PoleContext's own MaxLastUpload subquery) --
+# deliberately NOT to SYSDATETIMEOFFSET()/"now". A pole that's gone
+# completely offline would otherwise return an empty "vitals" list
+# forever once its last real reading falls more than 48 hours behind
+# the actual current time -- exactly the case this anchor exists to
+# handle: still show that pole's own last 48 hours of real activity, the
+# last window it was actually working, rather than nothing at all just
+# because time has moved on since then. For a pole that's actively
+# reporting, this produces the same practical result as anchoring to
+# "now" would -- its own latest reading and the current moment are
+# closely tracking each other -- so this isn't a behavior change for the
+# common case, only for the "gone silent" one.
+#
+# The sentinel exclusion ('9999-12-31 23:59:59.999 +00:00') is a
+# hardcoded literal, not a bound parameter -- matches the same
+# established precedent in pole_daylight_flags_loader.py's own
+# _FIND_UNFLAGGED_SQL, rather than importing
+# pole_telemetry_loader._MISSING_LAST_UPLOAD_SENTINEL here (which would
+# transitively pull leadsun_client, and its own LEADSUN_CLIENT_CERT_PEM
+# requirement, into this otherwise Leadsun-independent, read-only API
+# module for a single string literal).
+#
+# A pole with NO PoleTelemetry rows at all (MaxLastUpload NULL) simply
+# matches nothing below (PeriodStart >= NULL is UNKNOWN, never TRUE) --
+# correctly empty, and consistent with that same pole having no
+# PoleVitals rows to derive from in the first place.
+#
+# 'Hour' is a hardcoded literal, not a bound parameter, here -- this
+# template is only ever selected in Python when period_type == "Hour",
+# so there's nothing to parameterize.
+#
+# Day intentionally does NOT get an equivalent fixed window here (see
+# get_pole_vitals_by_period()'s own docstring) -- it keeps using
+# _POLE_VITALS_HISTORY_SQL_TEMPLATE below, a pure row-count limit with
+# no time bound at all.
+#
+# Parameter order (forced by the CTE coming first, textually, in T-SQL):
+# pole_id (for PoleContext's own WHERE p.Id = ?), THEN limit (for the
+# main query's TOP (?)) -- the opposite order from
+# _POLE_VITALS_HISTORY_SQL_TEMPLATE's own call site below, which binds
+# limit first. Easy to get backwards; get_pole_vitals_by_period()'s own
+# call site binds these in this exact order deliberately.
+_POLE_VITALS_HOUR_HISTORY_SQL_TEMPLATE = """
+;WITH PoleContext AS (
+    SELECT
+        p.LocationId,
+        (
+            SELECT MAX(pt.LastUpload)
+            FROM PoleTelemetry pt
+            WHERE pt.LocationId = p.LocationId
+              AND pt.LastUpload <> '9999-12-31 23:59:59.999 +00:00'
+        ) AS MaxLastUpload
+    FROM Poles p
+    WHERE p.Id = ?
+)
+SELECT TOP (?)
+    pv.PeriodStart AS PeriodStart,
+    pv.PeriodEnd AS PeriodEnd,
+    pv.IsOnline AS IsOnline,
+    pv.IsLedFault AS IsLedFault,
+    pv.IsBatteryFault AS IsBatteryFault,
+    pv.IsPanelFault AS IsPanelFault,
+    pv.IsOpenIssueFault AS IsOpenIssueFault,
+    pv.IsPoleFault AS IsPoleFault,
+    pv.AvgBatteryPercentage AS AvgBatteryPercentage,
+    pv.AvgPanelPercentage AS AvgPanelPercentage,
+    pv.AvgLightPercentage AS AvgLightPercentage
+FROM PoleVitals pv
+JOIN PoleContext pc ON pv.LocationId = pc.LocationId
+WHERE pv.PeriodType = 'Hour'
+  AND pv.PeriodStart >= DATEADD(HOUR, -48, pc.MaxLastUpload)
+ORDER BY pv.PeriodStart DESC
+"""
+
 # The actual history: every PoleVitals row for this pole's LocationId and
 # the caller-specified period type, each returned exactly as stored --
 # no aggregation. PeriodStart/PeriodEnd are included specifically so each
 # entry can actually be told apart from the others. Ordered
 # most-recent-first, so a TOP(?)-bounded result still returns the most
 # current data rather than an arbitrary/oldest slice.
+#
+# Used for 'Day' only now -- 'Hour' has its own variant above with an
+# additional 48-hour wall-clock bound. No equivalent time bound here:
+# a caller asking for Day history is generally looking for a longer
+# span (weeks/months), where a fixed short window would be far more
+# restrictive than what's actually useful, unlike Hour's own
+# recent-activity use case.
 _POLE_VITALS_HISTORY_SQL_TEMPLATE = """
 SELECT TOP (?)
     pv.PeriodStart AS PeriodStart,
@@ -699,7 +796,30 @@ def get_pole_vitals_by_period(pole_id: str, period_type: str, limit: int = None)
 
     limit: max number of history entries returned, most-recent-first.
     Defaults to DEFAULT_LIMIT, capped at MAX_LIMIT (see
-    shared/api_utils.py).
+    shared/api_utils.py). For period_type='Hour' specifically, this is a
+    CEILING on top of an additional, separate 48-hour bound
+    (PeriodStart >= this pole's own latest PoleTelemetry reading - 48
+    hours) -- not a substitute for it. Hour buckets aren't guaranteed
+    contiguous (a pole that went offline for a stretch has gaps in its
+    own PeriodStart sequence), so without that bound, a plain "most
+    recent N rows" limit could silently reach back well past 48 real
+    hours to fill in for the missing ones. Fewer than `limit` entries is
+    expected and correct when there are real gaps within that window,
+    not a bug -- this deliberately doesn't paper over missing data by
+    reaching further into history than the caller actually asked for.
+
+    That 48-hour window is anchored to the POLE'S OWN latest telemetry,
+    not to the current moment -- a pole that's gone completely offline
+    still returns its own last 48 hours of real activity (the last
+    window it was actually working) rather than an empty "vitals" list
+    just because real time has since moved past that pole's own last
+    reading. For an actively-reporting pole this produces the same
+    result either way, since its latest reading and "now" are closely
+    tracking each other -- the difference only shows up for a pole
+    that's stopped reporting.
+
+    period_type='Day' has no equivalent time bound -- just the plain
+    row-count limit, unbounded by time.
 
     Returns None if no Pole exists with that id. If the pole exists but
     has no PoleTelemetry row yet, lastUpdate and the other
@@ -722,12 +842,24 @@ def get_pole_vitals_by_period(pole_id: str, period_type: str, limit: int = None)
         if pole_row is None:
             return None
 
-        cursor.execute(
-            _POLE_VITALS_HISTORY_SQL_TEMPLATE,
-            clamp_limit(limit),
-            pole_id,
-            period_type,
-        )
+        # 'Hour' gets its own template with an ADDITIONAL 48-hour bound,
+        # anchored to this pole's own latest telemetry rather than "now"
+        # (see _POLE_VITALS_HOUR_HISTORY_SQL_TEMPLATE's own comment for
+        # why); 'Day' keeps the plain row-count-only template, no time
+        # bound at all.
+        if period_type == "Hour":
+            cursor.execute(
+                _POLE_VITALS_HOUR_HISTORY_SQL_TEMPLATE,
+                pole_id,
+                clamp_limit(limit),
+            )
+        else:
+            cursor.execute(
+                _POLE_VITALS_HISTORY_SQL_TEMPLATE,
+                clamp_limit(limit),
+                pole_id,
+                period_type,
+            )
         vitals_rows = cursor.fetchall()
     finally:
         cursor.close()

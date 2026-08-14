@@ -110,12 +110,46 @@ class TestMergeSqlStructureCommon:
     @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
     def test_panel_percentage_formula_uses_sunboard_power_with_nullif_guard(self, period_type):
         sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE[period_type]
-        assert "(t.SolarBoardVoltage * t.SolarBoardElecCurrent) / NULLIF(pm.SunboardPower, 0) * 100.0" in sql
+        assert (
+            "(t.SolarBoardVoltage * t.SolarBoardElecCurrent) / NULLIF(ISNULL(pm.SunboardPower, 80), 0) * 100.0"
+            in sql
+        )
 
     @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
     def test_light_percentage_formula_uses_light_power_with_nullif_guard(self, period_type):
         sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE[period_type]
-        assert "(t.LampPower1 + t.LampPower2) / NULLIF(pm.LightPower, 0) * 100.0" in sql
+        assert "(t.LampPower1 + t.LampPower2) / NULLIF(ISNULL(pm.LightPower, 30), 0) * 100.0" in sql
+
+    @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
+    def test_sunboard_power_defaults_to_80_when_model_unmatched(self, period_type):
+        """A ModelId with no PoleModels match at all now defaults to a
+        representative rated capacity (80) instead of leaving
+        PanelPercentage NULL for that reading -- same reasoning as
+        IsPanelFaultFlag's own ISNULL(pm.BatteryChargingMin, 13.5): treat
+        an unmatched model the same as a matched one with a sensible
+        default, not "unknown"."""
+        sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE[period_type]
+        assert "ISNULL(pm.SunboardPower, 80)" in sql
+
+    @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
+    def test_light_power_defaults_to_30_when_model_unmatched(self, period_type):
+        sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE[period_type]
+        assert "ISNULL(pm.LightPower, 30)" in sql
+
+    @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
+    def test_nullif_zero_guard_still_wraps_the_defaulted_value(self, period_type):
+        """The divide-by-zero guard must wrap AROUND the ISNULL default,
+        not the other way around -- NULLIF(ISNULL(x, 80), 0), not
+        ISNULL(NULLIF(x, 0), 80) -- so it still catches a genuinely-
+        matched PoleModels row that explicitly has SunboardPower/
+        LightPower = 0 (the defaults themselves, 80/30, are never 0, so
+        this ordering doesn't change behavior for the default case, but
+        DOES matter for the explicit-zero case)."""
+        sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE[period_type]
+        assert "NULLIF(ISNULL(pm.SunboardPower, 80), 0)" in sql
+        assert "NULLIF(ISNULL(pm.LightPower, 30), 0)" in sql
+        assert "ISNULL(NULLIF(pm.SunboardPower, 0), 80)" not in sql
+        assert "ISNULL(NULLIF(pm.LightPower, 0), 30)" not in sql
 
     @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
     def test_filters_by_last_upload_cutoff(self, period_type):
@@ -1159,3 +1193,458 @@ class TestLoadPoleVitalsTopLevelFailure:
 
         mock_cursor.close.assert_called_once()
         mock_conn.close.assert_called_once()
+
+
+# --------------------------------------------------------------------------
+# backfill_latest_hour_for_all_poles() -- a GENUINELY DIFFERENT query shape
+# from load_pole_vitals()'s own Hour handling, not a parameter variation:
+# ensures every pole's "Hour" row reflects its OWN most recent telemetry,
+# no matter how old, rather than only ever looking within a global time
+# window relative to "now" (which even backfill=True still does).
+# --------------------------------------------------------------------------
+
+
+class TestBackfillLatestHourPerPoleMergeSqlStructure:
+    def test_sunboard_power_and_light_power_defaults_present(self):
+        """This copy must stay in sync with _HOUR_MERGE_SQL's own
+        ISNULL defaults, same as its fault-flag formulas -- see this
+        class's own test_fault_flag_formulas_match_the_normal_hour_merge_exactly."""
+        sql = pole_vitals_loader._BACKFILL_LATEST_HOUR_PER_POLE_MERGE_SQL
+        assert "NULLIF(ISNULL(pm.SunboardPower, 80), 0)" in sql
+        assert "NULLIF(ISNULL(pm.LightPower, 30), 0)" in sql
+
+    def test_has_no_global_last_upload_cutoff_parameter(self):
+        """The defining difference from _HOUR_MERGE_SQL: no
+        "t.LastUpload >= ?" anywhere -- each pole's own window is
+        determined entirely from its own data, not a value passed in
+        from "now"."""
+        sql = pole_vitals_loader._BACKFILL_LATEST_HOUR_PER_POLE_MERGE_SQL
+        assert "LastUpload >= ?" not in sql
+
+    def test_still_excludes_the_sentinel_last_upload_value(self):
+        sql = pole_vitals_loader._BACKFILL_LATEST_HOUR_PER_POLE_MERGE_SQL
+        assert sql.count("LastUpload <> ?") == 2  # once in each CTE that reads PoleTelemetry directly
+
+    def test_finds_each_poles_own_max_last_upload(self):
+        sql = pole_vitals_loader._BACKFILL_LATEST_HOUR_PER_POLE_MERGE_SQL
+        max_reading_cte = sql.split("MaxReadingPerPole AS (")[1].split("LatestBucketPerPole AS (")[0]
+        assert "MAX(t.LastUpload) AS MaxLastUpload" in max_reading_cte
+        assert "GROUP BY t.LocationId" in max_reading_cte
+
+    def test_converts_each_poles_max_reading_to_its_own_local_time_zone(self):
+        sql = pole_vitals_loader._BACKFILL_LATEST_HOUR_PER_POLE_MERGE_SQL
+        bucket_cte = sql.split("LatestBucketPerPole AS (")[1].split("TelemetryWithVitals AS (")[0]
+        assert "AT TIME ZONE ISNULL(ptz.WindowsTimeZone, 'Eastern Standard Time')" in bucket_cte
+        assert "LEFT JOIN PoleTimeZones ptz ON mr.LocationId = ptz.LocationId" in bucket_cte
+
+    def test_scopes_each_poles_readings_to_its_own_bucket_range(self):
+        """The per-pole equivalent of a WHERE clause -- each pole's own
+        readings are filtered against ITS OWN bucket boundaries (joined
+        in via LatestBucketPerPole), not a single, shared range."""
+        sql = pole_vitals_loader._BACKFILL_LATEST_HOUR_PER_POLE_MERGE_SQL
+        assert "JOIN LatestBucketPerPole lb ON t.LocationId = lb.LocationId" in sql
+        assert "CAST(t.LastUpload AT TIME ZONE lb.TimeZoneName AS DATETIME2(3)) >= lb.BucketStart" in sql
+        assert (
+            "CAST(t.LastUpload AT TIME ZONE lb.TimeZoneName AS DATETIME2(3)) < DATEADD(HOUR, 1, lb.BucketStart)"
+            in sql
+        )
+
+    def test_targets_the_hour_period_type(self):
+        sql = pole_vitals_loader._BACKFILL_LATEST_HOUR_PER_POLE_MERGE_SQL
+        assert "'Hour' AS PeriodType" in sql
+
+    def test_fault_flag_formulas_match_the_normal_hour_merge_exactly(self):
+        """The whole point of this being an intentional copy, not a
+        divergent reimplementation: the SAME fault-flag definitions must
+        produce the SAME classification, whether computed by the normal
+        scheduled loader or this one-off backfill."""
+        backfill_sql = pole_vitals_loader._BACKFILL_LATEST_HOUR_PER_POLE_MERGE_SQL
+        hour_sql = pole_vitals_loader._HOUR_MERGE_SQL
+
+        assert (
+            "WHEN t.IsDaylightForLedFault = 1 THEN 0" in backfill_sql
+            and "WHEN (t.LampPower1 + t.LampPower2) = 0 THEN 1" in backfill_sql
+        )
+        assert (
+            "WHEN t.IsDaylightForPanelFault = 0 THEN 0" in backfill_sql
+            and "WHEN (t.BatteryVoltage1 + t.BatteryVoltage2) / 2.0 >= ISNULL(pm.BatteryChargingMin, 13.5) THEN 0"
+            in backfill_sql
+            and "WHEN (t.SolarBoardVoltage * t.SolarBoardElecCurrent) = 0 THEN 1" in backfill_sql
+        )
+        assert "(t.BatteryElecCurrent1 + t.BatteryElecCurrent2) / 2.0 < 10 THEN 1 ELSE 0 END AS IsBatteryFaultFlag" in backfill_sql
+        # And confirm those exact same fragments are genuinely present in
+        # the normal Hour merge too, not just independently written the
+        # same way by coincidence.
+        for fragment in (
+            "WHEN t.IsDaylightForLedFault = 1 THEN 0",
+            "WHEN t.IsDaylightForPanelFault = 0 THEN 0",
+            "WHEN (t.SolarBoardVoltage * t.SolarBoardElecCurrent) = 0 THEN 1",
+        ):
+            assert fragment in hour_sql
+
+    def test_upsert_column_lists_match_the_normal_hour_merge(self):
+        """Same target table, same columns, same match key -- only the
+        USING subquery's own scoping differs."""
+        backfill_sql = pole_vitals_loader._BACKFILL_LATEST_HOUR_PER_POLE_MERGE_SQL
+        assert "MERGE PoleVitals AS target" in backfill_sql
+        assert (
+            "ON target.LocationId = source.LocationId\n"
+            "   AND target.PeriodType = source.PeriodType\n"
+            "   AND target.PeriodStart = source.PeriodStart" in backfill_sql
+        )
+
+    def test_wraps_in_ansi_warnings_off_on_like_the_normal_hour_merge(self):
+        sql = pole_vitals_loader._BACKFILL_LATEST_HOUR_PER_POLE_MERGE_SQL
+        assert sql.strip().startswith("SET ANSI_WARNINGS OFF;")
+        assert sql.strip().endswith("SET ANSI_WARNINGS ON;")
+
+
+class TestBackfillLatestHourForAllPolesSuccessFlow:
+    def test_full_success_flow_call_sequence(
+        self, patch_get_connection_pole_vitals, mock_conn, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = (99,)
+        mock_cursor.rowcount = 42
+
+        pole_vitals_loader.backfill_latest_hour_for_all_poles()
+
+        calls = mock_cursor.execute.call_args_list
+        assert len(calls) == 3
+
+        insert_sql, name, env, start_time, source = calls[0].args
+        assert "INSERT INTO SP_Execution" in insert_sql
+        assert (name, env, source) == ("backfillLatestHourPoleVitals", "Dev", "Leadsun")
+
+        merge_sql, sentinel1, sentinel2, source_name, sp_exec_id = calls[1].args
+        assert merge_sql == pole_vitals_loader._BACKFILL_LATEST_HOUR_PER_POLE_MERGE_SQL
+        assert sentinel1 == sentinel2 == pole_vitals_loader._MISSING_LAST_UPLOAD_SENTINEL
+        assert source_name == "Leadsun"
+        assert sp_exec_id == 99
+
+        update_sql, end_time, success, errors, batch_count, sp_exec_id2 = calls[2].args
+        assert "UPDATE SP_Execution" in update_sql
+        assert (success, errors, batch_count, sp_exec_id2) == (42, 0, 1, 99)
+
+        mock_cursor.close.assert_called_once()
+        mock_conn.close.assert_called_once()
+
+    def test_zero_rowcount_does_not_go_negative(
+        self, patch_get_connection_pole_vitals, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = (1,)
+        mock_cursor.rowcount = -1  # pyodbc convention for "not applicable"
+
+        pole_vitals_loader.backfill_latest_hour_for_all_poles()
+
+        final_update_args = mock_cursor.execute.call_args_list[-1].args
+        success, errors = final_update_args[2], final_update_args[3]
+        assert (success, errors) == (0, 0)
+
+
+class TestBackfillLatestHourForAllPolesBenignWarningHandling:
+    def test_sqlstate_01003_still_commits_and_reports_success(
+        self, patch_get_connection_pole_vitals, mock_conn, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = (5,)
+        benign_warning = Exception()
+        benign_warning.args = ("01003", "Warning: Null value is eliminated")
+        mock_cursor.execute.side_effect = [None, benign_warning, None]
+        mock_cursor.rowcount = 10
+
+        pole_vitals_loader.backfill_latest_hour_for_all_poles()
+
+        final_update_args = mock_cursor.execute.call_args_list[-1].args
+        success, errors = final_update_args[2], final_update_args[3]
+        assert (success, errors) == (10, 0)
+        assert mock_conn.commit.called
+
+    def test_genuine_failure_rolls_back_and_reraises(
+        self, patch_get_connection_pole_vitals, mock_conn, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = (5,)
+        mock_cursor.execute.side_effect = [None, RuntimeError("deadlock"), None]
+
+        with pytest.raises(RuntimeError, match="deadlock"):
+            pole_vitals_loader.backfill_latest_hour_for_all_poles()
+
+        mock_conn.rollback.assert_called_once()
+
+
+class TestBackfillLatestHourForAllPolesTopLevelFailure:
+    def test_sp_execution_insert_failure_reraises(
+        self, patch_get_connection_pole_vitals, mock_conn, mock_cursor
+    ):
+        mock_cursor.execute.side_effect = RuntimeError("db connection lost")
+
+        with pytest.raises(RuntimeError, match="db connection lost"):
+            pole_vitals_loader.backfill_latest_hour_for_all_poles()
+
+        mock_cursor.close.assert_called_once()
+        mock_conn.close.assert_called_once()
+
+
+class TestBackfillLatestHourFailureRecordingUsesAFreshConnection:
+    """
+    Same fix, and same reasoning, as pole_daylight_flags_loader.py/
+    pole_timezones_loader.py's own equivalent: recording a run's failure
+    in SP_Execution must not reuse a connection that may itself be the
+    thing that just failed, or that SECOND failure propagates instead of
+    the original, more useful one.
+    """
+
+    def _make_conn(self):
+        conn = MagicMock(name="conn")
+        cursor = MagicMock(name="cursor")
+        conn.cursor.return_value = cursor
+        return conn, cursor
+
+    def test_original_exception_still_raised_when_recording_succeeds(self, mocker):
+        main_conn, main_cursor = self._make_conn()
+        main_cursor.fetchone.return_value = (55,)
+        main_cursor.execute.side_effect = [None, RuntimeError("communication link failure")]
+
+        recovery_conn, recovery_cursor = self._make_conn()
+
+        mocker.patch(
+            "shared.pole_vitals_loader.get_connection",
+            side_effect=[main_conn, recovery_conn],
+        )
+
+        with pytest.raises(RuntimeError, match="communication link failure"):
+            pole_vitals_loader.backfill_latest_hour_for_all_poles()
+
+        assert recovery_cursor.execute.called
+        update_sql, end_time, error_message, success, errors, sp_exec_id = (
+            recovery_cursor.execute.call_args.args
+        )
+        assert "UPDATE SP_Execution" in update_sql
+        assert "communication link failure" in error_message
+        assert sp_exec_id == 55
+        recovery_conn.commit.assert_called_once()
+        recovery_cursor.close.assert_called_once()
+        recovery_conn.close.assert_called_once()
+        main_cursor.close.assert_called_once()
+        main_conn.close.assert_called_once()
+
+    def test_original_exception_still_raised_when_recording_also_fails(self, mocker, caplog):
+        main_conn, main_cursor = self._make_conn()
+        main_cursor.fetchone.return_value = (55,)
+        main_cursor.execute.side_effect = [None, RuntimeError("original communication failure")]
+
+        recovery_conn, recovery_cursor = self._make_conn()
+        recovery_cursor.execute.side_effect = RuntimeError("recovery also failed")
+
+        mocker.patch(
+            "shared.pole_vitals_loader.get_connection",
+            side_effect=[main_conn, recovery_conn],
+        )
+
+        with caplog.at_level("ERROR"):
+            with pytest.raises(RuntimeError, match="original communication failure"):
+                pole_vitals_loader.backfill_latest_hour_for_all_poles()
+
+        error_messages = [rec.message for rec in caplog.records if rec.levelname == "ERROR"]
+        assert any("original communication failure" in msg for msg in error_messages)
+        assert any(
+            "additionally failed to record this run's failure" in msg and "recovery also failed" in msg
+            for msg in error_messages
+        )
+
+
+# --------------------------------------------------------------------------
+# backfill_last_48_hours_of_hour_for_all_poles() -- a BROADER relative of
+# backfill_latest_hour_for_all_poles() above: up to 48 hourly buckets per
+# pole (every hour with telemetry in a 48-hour window ending at that
+# pole's own latest reading), not just the single newest one.
+# --------------------------------------------------------------------------
+
+
+class TestBackfillLast48HoursOfHourPerPoleMergeSqlStructure:
+    def test_has_no_global_last_upload_cutoff_parameter(self):
+        """Same defining property as the single-bucket variant: no
+        "t.LastUpload >= ?" anywhere -- each pole's own window is
+        determined entirely from its own data, not a value passed in
+        from "now"."""
+        sql = pole_vitals_loader._BACKFILL_LAST_48_HOURS_OF_HOUR_PER_POLE_MERGE_SQL
+        assert "LastUpload >= ?" not in sql
+
+    def test_excludes_the_sentinel_last_upload_value_twice(self):
+        """Once for MaxReadingPerPole's own MAX(LastUpload) computation,
+        once for TelemetryWithVitals' own reading-level filter -- same
+        shape as the single-bucket variant's own two sentinel
+        exclusions."""
+        sql = pole_vitals_loader._BACKFILL_LAST_48_HOURS_OF_HOUR_PER_POLE_MERGE_SQL
+        assert sql.count("LastUpload <> ?") == 2
+
+    def test_finds_each_poles_own_max_last_upload(self):
+        sql = pole_vitals_loader._BACKFILL_LAST_48_HOURS_OF_HOUR_PER_POLE_MERGE_SQL
+        max_reading_cte = sql.split("MaxReadingPerPole AS (")[1].split("TelemetryWithVitals AS (")[0]
+        assert "MAX(t.LastUpload) AS MaxLastUpload" in max_reading_cte
+        assert "GROUP BY t.LocationId" in max_reading_cte
+
+    def test_scopes_each_poles_readings_to_a_48_hour_range_ending_at_its_own_max(self):
+        """The defining difference from the single-bucket variant: a
+        RANGE of readings (up to 48 hours' worth), not just the ones
+        falling into a single hour bucket."""
+        sql = pole_vitals_loader._BACKFILL_LAST_48_HOURS_OF_HOUR_PER_POLE_MERGE_SQL
+        assert "JOIN MaxReadingPerPole mr ON t.LocationId = mr.LocationId" in sql
+        assert "WHERE t.LastUpload > DATEADD(HOUR, -48, mr.MaxLastUpload)" in sql
+        assert "AND t.LastUpload <= mr.MaxLastUpload" in sql
+
+    def test_buckets_by_local_hour_same_as_the_normal_hour_merge(self):
+        """Every reading within the 48-hour range still gets bucketed
+        into its own local hour -- same DATEADD/DATEDIFF truncation
+        expression as _HOUR_MERGE_SQL's own Bucketed CTE, not a
+        per-pole single bucket like the OTHER backfill variant."""
+        sql = pole_vitals_loader._BACKFILL_LAST_48_HOURS_OF_HOUR_PER_POLE_MERGE_SQL
+        assert (
+            "DATEADD(HOUR, DATEDIFF(HOUR, '19000101', LocalTime), '19000101') AS BucketStart" in sql
+        )
+
+    def test_targets_the_hour_period_type(self):
+        sql = pole_vitals_loader._BACKFILL_LAST_48_HOURS_OF_HOUR_PER_POLE_MERGE_SQL
+        assert "'Hour' AS PeriodType" in sql
+
+    def test_fault_flag_and_default_formulas_match_the_normal_hour_merge_exactly(self):
+        """Same reasoning as the single-bucket variant's own equivalent
+        test: an intentional copy, not a divergent reimplementation."""
+        sql = pole_vitals_loader._BACKFILL_LAST_48_HOURS_OF_HOUR_PER_POLE_MERGE_SQL
+        assert "WHEN t.IsDaylightForLedFault = 1 THEN 0" in sql
+        assert "WHEN t.IsDaylightForPanelFault = 0 THEN 0" in sql
+        assert "ISNULL(pm.BatteryChargingMin, 13.5)" in sql
+        assert "NULLIF(ISNULL(pm.SunboardPower, 80), 0)" in sql
+        assert "NULLIF(ISNULL(pm.LightPower, 30), 0)" in sql
+
+    def test_upsert_column_lists_match_the_normal_hour_merge(self):
+        sql = pole_vitals_loader._BACKFILL_LAST_48_HOURS_OF_HOUR_PER_POLE_MERGE_SQL
+        assert "MERGE PoleVitals AS target" in sql
+        assert (
+            "ON target.LocationId = source.LocationId\n"
+            "   AND target.PeriodType = source.PeriodType\n"
+            "   AND target.PeriodStart = source.PeriodStart" in sql
+        )
+
+    def test_wraps_in_ansi_warnings_off_on(self):
+        sql = pole_vitals_loader._BACKFILL_LAST_48_HOURS_OF_HOUR_PER_POLE_MERGE_SQL
+        assert sql.strip().startswith("SET ANSI_WARNINGS OFF;")
+        assert sql.strip().endswith("SET ANSI_WARNINGS ON;")
+
+
+class TestBackfillLast48HoursOfHourForAllPolesSuccessFlow:
+    def test_full_success_flow_call_sequence(
+        self, patch_get_connection_pole_vitals, mock_conn, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = (99,)
+        mock_cursor.rowcount = 420
+
+        pole_vitals_loader.backfill_last_48_hours_of_hour_for_all_poles()
+
+        calls = mock_cursor.execute.call_args_list
+        assert len(calls) == 3
+
+        insert_sql, name, env, start_time, source = calls[0].args
+        assert "INSERT INTO SP_Execution" in insert_sql
+        assert (name, env, source) == ("backfillLast48HoursOfHourPoleVitals", "Dev", "Leadsun")
+
+        merge_sql, sentinel1, sentinel2, source_name, sp_exec_id = calls[1].args
+        assert merge_sql == pole_vitals_loader._BACKFILL_LAST_48_HOURS_OF_HOUR_PER_POLE_MERGE_SQL
+        assert sentinel1 == sentinel2 == pole_vitals_loader._MISSING_LAST_UPLOAD_SENTINEL
+        assert source_name == "Leadsun"
+        assert sp_exec_id == 99
+
+        update_sql, end_time, success, errors, batch_count, sp_exec_id2 = calls[2].args
+        assert "UPDATE SP_Execution" in update_sql
+        assert (success, errors, batch_count, sp_exec_id2) == (420, 0, 1, 99)
+
+        mock_cursor.close.assert_called_once()
+        mock_conn.close.assert_called_once()
+
+    def test_zero_rowcount_does_not_go_negative(
+        self, patch_get_connection_pole_vitals, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = (1,)
+        mock_cursor.rowcount = -1  # pyodbc convention for "not applicable"
+
+        pole_vitals_loader.backfill_last_48_hours_of_hour_for_all_poles()
+
+        final_update_args = mock_cursor.execute.call_args_list[-1].args
+        success, errors = final_update_args[2], final_update_args[3]
+        assert (success, errors) == (0, 0)
+
+
+class TestBackfillLast48HoursOfHourForAllPolesBenignWarningHandling:
+    def test_sqlstate_01003_still_commits_and_reports_success(
+        self, patch_get_connection_pole_vitals, mock_conn, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = (5,)
+        benign_warning = Exception()
+        benign_warning.args = ("01003", "Warning: Null value is eliminated")
+        mock_cursor.execute.side_effect = [None, benign_warning, None]
+        mock_cursor.rowcount = 300
+
+        pole_vitals_loader.backfill_last_48_hours_of_hour_for_all_poles()
+
+        final_update_args = mock_cursor.execute.call_args_list[-1].args
+        success, errors = final_update_args[2], final_update_args[3]
+        assert (success, errors) == (300, 0)
+        assert mock_conn.commit.called
+
+    def test_genuine_failure_rolls_back_and_reraises(
+        self, patch_get_connection_pole_vitals, mock_conn, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = (5,)
+        mock_cursor.execute.side_effect = [None, RuntimeError("deadlock"), None]
+
+        with pytest.raises(RuntimeError, match="deadlock"):
+            pole_vitals_loader.backfill_last_48_hours_of_hour_for_all_poles()
+
+        mock_conn.rollback.assert_called_once()
+
+
+class TestBackfillLast48HoursOfHourForAllPolesTopLevelFailure:
+    def test_sp_execution_insert_failure_reraises(
+        self, patch_get_connection_pole_vitals, mock_conn, mock_cursor
+    ):
+        mock_cursor.execute.side_effect = RuntimeError("db connection lost")
+
+        with pytest.raises(RuntimeError, match="db connection lost"):
+            pole_vitals_loader.backfill_last_48_hours_of_hour_for_all_poles()
+
+        mock_cursor.close.assert_called_once()
+        mock_conn.close.assert_called_once()
+
+
+class TestBackfillLast48HoursOfHourFailureRecordingUsesAFreshConnection:
+    def _make_conn(self):
+        conn = MagicMock(name="conn")
+        cursor = MagicMock(name="cursor")
+        conn.cursor.return_value = cursor
+        return conn, cursor
+
+    def test_original_exception_still_raised_when_recording_succeeds(self, mocker):
+        main_conn, main_cursor = self._make_conn()
+        main_cursor.fetchone.return_value = (55,)
+        main_cursor.execute.side_effect = [None, RuntimeError("communication link failure")]
+
+        recovery_conn, recovery_cursor = self._make_conn()
+
+        mocker.patch(
+            "shared.pole_vitals_loader.get_connection",
+            side_effect=[main_conn, recovery_conn],
+        )
+
+        with pytest.raises(RuntimeError, match="communication link failure"):
+            pole_vitals_loader.backfill_last_48_hours_of_hour_for_all_poles()
+
+        assert recovery_cursor.execute.called
+        update_sql, end_time, error_message, success, errors, sp_exec_id = (
+            recovery_cursor.execute.call_args.args
+        )
+        assert "UPDATE SP_Execution" in update_sql
+        assert "communication link failure" in error_message
+        assert sp_exec_id == 55
+        recovery_conn.commit.assert_called_once()
+        recovery_cursor.close.assert_called_once()
+        recovery_conn.close.assert_called_once()
+        main_cursor.close.assert_called_once()
+        main_conn.close.assert_called_once()
