@@ -38,12 +38,42 @@ class TestPoleSummarySqlStructure:
         sql = m._POLE_SUMMARY_SQL_TEMPLATE
         assert "LightStatus" not in sql
 
-    def test_no_outer_apply_no_telemetry_fields(self):
-        """The whole point of summary mode: skip the per-pole
-        PoleTelemetry lookup entirely for the ~14K-pole case."""
+    def test_lean_outer_apply_for_last_update_only(self):
+        """summary mode now includes lastUpdate (the web frontend needs
+        it to distinguish "Disconnected" from "Unknown"), via a leaner,
+        single-column OUTER APPLY -- confirms it's genuinely lean: no
+        PoleModels join, no BatteryChargingMin, no batteryVoltage1/2 or
+        the other telemetry columns the full detail query pulls."""
         sql = m._POLE_SUMMARY_SQL_TEMPLATE
-        assert "OUTER APPLY" not in sql
-        assert "LastUpload" not in sql
+        assert "OUTER APPLY" in sql
+        assert "SELECT TOP 1 pt.LastUpload" in sql
+        assert "PoleModels" not in sql
+        assert "BatteryChargingMin" not in sql
+        assert "BatteryVoltage1" not in sql
+        assert "BatteryVoltage2" not in sql
+        assert "LampPower1" not in sql
+
+    def test_last_update_converted_to_poles_own_local_time_zone(self):
+        """Consistency with the full detail query
+        (_POLE_DETAILS_SQL_TEMPLATE): lastUpdate is converted via
+        PoleTimeZones, not returned as raw UTC -- so a frontend
+        consuming both summary and detail responses sees the same
+        format either way."""
+        sql = m._POLE_SUMMARY_SQL_TEMPLATE
+        assert "LEFT JOIN PoleTimeZones ptz ON p.LocationId = ptz.LocationId" in sql
+        assert (
+            "latest_pt.LastUpload AT TIME ZONE ISNULL(ptz.WindowsTimeZone, 'Eastern Standard Time') AS LastUpload"
+            in sql
+        )
+
+    def test_outer_apply_is_outer_not_cross(self):
+        """A pole with no LocationId, or zero matching PoleTelemetry
+        rows at all, must still appear in the summary (with LastUpload
+        NULL) -- not silently disappear from the "give me every pole"
+        result."""
+        sql = m._POLE_SUMMARY_SQL_TEMPLATE
+        assert "OUTER APPLY" in sql
+        assert "CROSS APPLY" not in sql
 
     def test_isonline_uses_a_separate_join_reverted_to_last_48_hours(self):
         """Same fix as pole_vitals_api.py's own _POLE_DETAILS_SQL_TEMPLATE:
@@ -72,6 +102,7 @@ class TestSummaryRowToDict:
         self,
         project_id="proj1", pole_id="pole1", pole_number="PN-1", location_id="LOC-1",
         install_date="2025-01-01", lat=28.0, long_=-82.0,
+        last_update="2026-08-16 08:00:00 -04:00",
         is_online=True, is_led_fault=False, is_battery_fault=False, is_panel_fault=False,
         is_open_issue_fault=False, is_pole_fault=False,
         battery_percentage=89.0, panel_percentage=45.0, light_percentage=0.0,
@@ -79,6 +110,7 @@ class TestSummaryRowToDict:
     ):
         return (
             project_id, pole_id, pole_number, location_id, install_date, lat, long_,
+            last_update,
             is_online, is_led_fault, is_battery_fault, is_panel_fault, is_open_issue_fault, is_pole_fault,
             battery_percentage, panel_percentage, light_percentage, customer_id,
         )
@@ -92,6 +124,7 @@ class TestSummaryRowToDict:
             "installDate": "2025-01-01",
             "lat": 28.0,
             "long": -82.0,
+            "lastUpdate": "2026-08-16 08:00:00 -04:00",
             "isOnline": True,
             "isLedFault": False,
             "isBatteryFault": False,
@@ -105,9 +138,12 @@ class TestSummaryRowToDict:
             "customerId": "cust1",
         }
 
-    def test_lacks_telemetry_fields(self):
+    def test_lacks_voltage_fields_but_keeps_last_update(self):
+        """batteryVoltage1/batteryVoltage2 remain excluded -- the actual
+        remaining cost tradeoff this lighter query still makes.
+        lastUpdate is now INCLUDED (the point of this turn's change)."""
         result = m._summary_row_to_dict(self._row())
-        assert "lastUpdate" not in result
+        assert "lastUpdate" in result
         assert "batteryVoltage1" not in result
         assert "batteryVoltage2" not in result
 
@@ -163,7 +199,7 @@ class TestGetPoles:
         m.get_poles(summary=True)
 
         sql, period_type, rollup_period_type, limit = mock_cursor.execute.call_args.args
-        assert "OUTER APPLY" not in sql
+        assert "OUTER APPLY" in sql  # now leaner (LastUpload only), but present
         assert limit == m._SUMMARY_MAX_LIMIT
 
     def test_custom_limit_respected_in_summary_mode(
@@ -234,6 +270,7 @@ class TestGetPoles:
     ):
         row = (
             "proj1", "pole1", "PN-1", "LOC-1", "2025-01-01", 28.0, -82.0,
+            "2026-08-16 08:00:00 -04:00",
             True, False, False, False, False, False,
             89.0, 45.0, 0.0, "cust1",
         )
@@ -242,9 +279,10 @@ class TestGetPoles:
         result = m.get_poles(pole_id="pole1", summary=True)
 
         sql = mock_cursor.execute.call_args.args[0]
-        assert "OUTER APPLY" not in sql
+        assert "PoleModels" not in sql  # still lean -- no PoleModels/BatteryChargingMin join
         assert result["id"] == "pole1"
-        assert "lastUpdate" not in result
+        assert result["lastUpdate"] == "2026-08-16 08:00:00 -04:00"
+        assert "batteryVoltage1" not in result
 
     def test_closes_cursor_and_connection(
         self, patch_get_connection_poles_api, mock_conn, mock_cursor

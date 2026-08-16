@@ -49,19 +49,27 @@ def _clamp_summary_limit(limit) -> int:
 
 # A SECOND query, alongside pole_vitals_api.py's own -- a direct LEFT
 # JOIN against PoleVitals (WHERE PeriodType = ?), same as
-# _POLE_DETAILS_SQL_TEMPLATE there, but deliberately DROPS the OUTER
-# APPLY into PoleTelemetry that query has. That OUTER APPLY runs once per
-# pole (a correlated TOP-1 lookup) -- each individual seek is cheap
-# (PoleTelemetry's own clustered index is (LocationId, LastUpload),
-# LocationId leading), but doing it ~14,000 times in one query execution
-# is a real, structural cost that a "give me every pole" consumer (e.g.
-# a map rendering all poles at once, which only needs location/status to
-# place and color a pin) doesn't actually need to pay for --
-# lastUpdate/batteryVoltage1/batteryVoltage2 are detail-view fields, not
-# needed for that. A consumer that wants that detail for one specific
-# pole (e.g. after a user clicks a pin) can still get it cheaply via
-# ?poleId=X, which uses the full _POLE_DETAILS_SQL_TEMPLATE and pays that
-# per-row cost for exactly one row, not thousands.
+# _POLE_DETAILS_SQL_TEMPLATE there, but with a deliberately LEANER
+# OUTER APPLY into PoleTelemetry than that query has -- just LastUpload,
+# not the other 8 telemetry columns (batteryVoltage1/2, lampPower1/2,
+# batteryElecCurrent1/2, solarBoardVoltage/solarBoardElecCurrent) or the
+# PoleModels join those feed into (batteryChargingMin). That OUTER APPLY
+# still runs once per pole (a correlated TOP-1 lookup) -- each individual
+# seek is cheap (PoleTelemetry's own clustered index is
+# (LocationId, LastUpload), LocationId leading), and doing it ~14,000
+# times in one query execution is a real, structural cost regardless of
+# how many columns each seek pulls back -- but a single-column row is
+# cheaper to materialize and transfer than a nine-column one, and
+# skipping the PoleModels join entirely avoids that cost altogether.
+# lastUpdate earns this cost specifically because the web frontend needs
+# it to distinguish "Disconnected" (was online, has gone quiet recently)
+# from "Unknown" (no recent-enough reading to say either way) -- a
+# distinction that can't be made from IsOnline alone. batteryVoltage1/
+# batteryVoltage2 remain excluded -- genuine detail-view fields with no
+# equivalent "give me every pole" use case, still only worth the cost
+# for one specific pole via ?poleId=X, which uses the full
+# _POLE_DETAILS_SQL_TEMPLATE and pays that fuller per-row cost for
+# exactly one row, not thousands.
 _POLE_SUMMARY_SQL_TEMPLATE = """
 SELECT
     proj.Id AS ProjectId,
@@ -71,6 +79,7 @@ SELECT
     p.InstallDate AS InstallDate,
     p.Lat AS Lat,
     p.Long AS Long,
+    latest_pt.LastUpload AT TIME ZONE ISNULL(ptz.WindowsTimeZone, 'Eastern Standard Time') AS LastUpload,
     rps_online.IsOnline AS IsOnline,
     rps.IsLedFault AS IsLedFault,
     rps.IsBatteryFault AS IsBatteryFault,
@@ -92,6 +101,18 @@ LEFT JOIN PoleVitals rps ON p.LocationId = rps.LocationId AND rps.PeriodType = ?
 -- LastKnown48Hours.IsOnline would misleadingly reflect its own LAST
 -- KNOWN state, not whether it's online RIGHT NOW.
 LEFT JOIN PoleVitals rps_online ON p.LocationId = rps_online.LocationId AND rps_online.PeriodType = ?
+LEFT JOIN PoleTimeZones ptz ON p.LocationId = ptz.LocationId
+OUTER APPLY (
+    -- TOP 1 ... ORDER BY LastUpload DESC, LastUpload alone -- the lean
+    -- part of this lean OUTER APPLY. OUTER (not CROSS): a pole with no
+    -- LocationId, or zero matching PoleTelemetry rows at all, must
+    -- still appear in results (with LastUpload NULL), not disappear
+    -- from the summary entirely.
+    SELECT TOP 1 pt.LastUpload
+    FROM PoleTelemetry pt
+    WHERE pt.LocationId = p.LocationId
+    ORDER BY pt.LastUpload DESC
+) AS latest_pt
 {where_clause}
 ORDER BY proj.Id, p.PoleNumber
 """
@@ -118,13 +139,16 @@ def _pole_row_to_dict_with_parents(row) -> dict:
 def _summary_row_to_dict(row) -> dict:
     """
     Converts one row from _POLE_SUMMARY_SQL_TEMPLATE. Same field set as
-    _pole_row_to_dict_with_parents() above, minus lastUpdate/
-    batteryVoltage1/batteryVoltage2 -- omitting exactly those three is
-    the whole point of this lighter query (see
-    _POLE_SUMMARY_SQL_TEMPLATE's own comment for why). A standalone
-    function rather than a wrapper around pole_vitals_api._pole_row_to_dict()
-    since the row shape here is genuinely different (three fewer
-    columns), not just missing a couple of fields from the same shape.
+    _pole_row_to_dict_with_parents() above, minus batteryVoltage1/
+    batteryVoltage2 -- those two remain excluded (see
+    _POLE_SUMMARY_SQL_TEMPLATE's own comment for why); lastUpdate is
+    INCLUDED here, via that same template's own leaner, single-column
+    OUTER APPLY, since the web frontend needs it to distinguish
+    "Disconnected" from "Unknown" -- a distinction IsOnline alone can't
+    make. A standalone function rather than a wrapper around
+    pole_vitals_api._pole_row_to_dict() since the row shape here is
+    genuinely different (two fewer columns), not just missing a couple
+    of fields from the same shape.
     """
     (
         project_id,
@@ -134,6 +158,7 @@ def _summary_row_to_dict(row) -> dict:
         install_date,
         lat,
         long_,
+        last_update,
         is_online,
         is_led_fault,
         is_battery_fault,
@@ -152,6 +177,7 @@ def _summary_row_to_dict(row) -> dict:
         "installDate": json_safe(install_date),
         "lat": json_safe(lat),
         "long": json_safe(long_),
+        "lastUpdate": json_safe(last_update),
         "isOnline": json_safe(is_online),
         "isLedFault": json_safe(is_led_fault),
         "isBatteryFault": json_safe(is_battery_fault),
@@ -204,17 +230,22 @@ def get_poles(
     DEFAULT_LIMIT, capped at MAX_LIMIT (see shared/api_utils.py) -- or at
     _SUMMARY_MAX_LIMIT instead, if summary=True.
     summary: if True, uses a lighter query (_POLE_SUMMARY_SQL_TEMPLATE)
-    that skips each pole's most recent PoleTelemetry lookup -- lastUpdate,
-    batteryVoltage1, and batteryVoltage2 are simply absent from each
-    returned pole, everything else is the same. Built for a "give me
-    every pole" consumer (e.g. a map rendering all ~14K poles at once)
-    that only needs location and status to plot/color a pin, not
-    per-pole telemetry detail -- that detail is still available cheaply
-    for one specific pole via pole_id, which always uses the full query
-    regardless of this flag. Also raises the unfiltered case's limit
-    ceiling to _SUMMARY_MAX_LIMIT instead of api_utils.MAX_LIMIT, since
-    summary mode's whole reason to exist is making "every pole in one
-    call" practical.
+    that skips the two heaviest per-pole telemetry fields --
+    batteryVoltage1 and batteryVoltage2 are simply absent from each
+    returned pole -- but still includes lastUpdate, via that same
+    template's own leaner, single-column PoleTelemetry lookup (see
+    _POLE_SUMMARY_SQL_TEMPLATE's own comment for why lastUpdate earns
+    that cost while the two voltage fields don't: the web frontend needs
+    lastUpdate to distinguish "Disconnected" from "Unknown", a
+    distinction IsOnline alone can't make). Built for a "give me every
+    pole" consumer (e.g. a map rendering all ~14K poles at once) that
+    needs location, status, and staleness to plot/color a pin, not full
+    per-pole telemetry detail -- that fuller detail is still available
+    cheaply for one specific pole via pole_id, which always uses the
+    full query regardless of this flag. Also raises the unfiltered
+    case's limit ceiling to _SUMMARY_MAX_LIMIT instead of
+    api_utils.MAX_LIMIT, since summary mode's whole reason to exist is
+    making "every pole in one call" practical.
     """
     if pole_id or project_id or customer_id:
         # Build up whichever of the three conditions were actually
