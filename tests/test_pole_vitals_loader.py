@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
+import pyodbc
 import pytest
 
 from shared import pole_vitals_loader
@@ -781,7 +782,7 @@ class TestLoadPoleVitalsSuccessFlow:
         pole_vitals_loader.load_pole_vitals()
 
         calls = mock_cursor.execute.call_args_list
-        assert len(calls) == 8
+        assert len(calls) == 10
 
         insert_sql, name, env, start_time, source = calls[0].args
         assert "INSERT INTO SP_Execution" in insert_sql
@@ -813,9 +814,31 @@ class TestLoadPoleVitalsSuccessFlow:
         assert last48_cleanup[1] == last48_merge_cutoff
         assert last48_cleanup[2] == pole_vitals_loader._MISSING_LAST_UPLOAD_SENTINEL
 
-        update_sql, end_time, success, errors, batch_count, sp_exec_id = calls[7].args
+        # LastKnown48Hours: copy at index 7, fresh-compute-for-offline at
+        # index 8 -- both run AFTER Last48Hours' own MERGE+cleanup above.
+        copy_call = calls[7].args
+        assert copy_call[0] == pole_vitals_loader._LAST_KNOWN_48_HOURS_COPY_FROM_LAST_48_HOURS_SQL
+        assert copy_call[1:] == ("Leadsun", 77)
+
+        fresh_compute_call = calls[8].args
+        assert (
+            fresh_compute_call[0]
+            == pole_vitals_loader._LAST_KNOWN_48_HOURS_FRESH_COMPUTE_FOR_OFFLINE_POLES_SQL
+        )
+        assert fresh_compute_call[1:] == (
+            pole_vitals_loader._MISSING_LAST_UPLOAD_SENTINEL,
+            pole_vitals_loader._MISSING_LAST_UPLOAD_SENTINEL,
+            "Leadsun",
+            77,
+        )
+
+        update_sql, end_time, success, errors, batch_count, sp_exec_id = calls[9].args
         assert "UPDATE SP_Execution" in update_sql
-        assert (success, errors, batch_count, sp_exec_id) == (15, 0, 3, 77)  # 5 rows x 3 period types
+        # 5 rows x 3 period types (Hour/Day/Last48Hours) + 5 (copy) + 5
+        # (fresh-compute) -- mock_cursor.rowcount is a single, shared
+        # value applying to every execute() call in this test, including
+        # the two new LastKnown48Hours statements.
+        assert (success, errors, batch_count, sp_exec_id) == (25, 0, 4, 77)
 
         mock_cursor.close.assert_called_once()
         mock_conn.close.assert_called_once()
@@ -882,6 +905,8 @@ class TestLoadPoleVitalsBenignWarningHandling:
             None,  # Day prune
             None,  # Last48Hours MERGE
             None,  # Last48Hours stale-row cleanup
+            None,  # LastKnown48Hours copy
+            None,  # LastKnown48Hours fresh-compute-for-offline
             None,  # final update
         ]
 
@@ -890,7 +915,10 @@ class TestLoadPoleVitalsBenignWarningHandling:
         final_update_args = mock_cursor.execute.call_args_list[-1].args
         success, errors = final_update_args[2], final_update_args[3]
         assert errors == 0  # the 01003 "failure" must not count as an error
-        assert success == 21  # 3 period types x 7 rows each, including Hour
+        # 3 period types x 7 rows each (Hour/Day/Last48Hours), plus 7
+        # (copy) + 7 (fresh-compute) -- rowcount is shared across every
+        # execute() call in this test.
+        assert success == 35
 
     def test_01003_warning_logs_as_info_not_error(
         self, patch_get_connection_pole_vitals, mock_cursor, caplog
@@ -900,7 +928,7 @@ class TestLoadPoleVitalsBenignWarningHandling:
         mock_cursor.execute.side_effect = [
             None,
             self._make_01003_exception(),
-            None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None,
         ]
 
         with caplog.at_level("INFO"):
@@ -922,8 +950,12 @@ class TestLoadPoleVitalsBenignWarningHandling:
             "22007",
             "[22007] ... Adding a value to a 'date' column caused an overflow. (517)",
         )
-        # index 0=insert, 1=Hour(ok), 2=Hour prune(ok), 3=Day(FAILS)
-        mock_cursor.execute.side_effect = [None, None, None, overflow_exc, None, None, None]
+        # index 0=insert, 1=Hour(ok), 2=Hour prune(ok), 3=Day(FAILS),
+        # 4=Last48Hours(ok), 5=Last48Hours cleanup(ok), 6=LastKnown48Hours
+        # copy(ok), 7=LastKnown48Hours fresh-compute(ok), 8=final update
+        mock_cursor.execute.side_effect = [
+            None, None, None, overflow_exc, None, None, None, None, None,
+        ]
 
         pole_vitals_loader.load_pole_vitals()  # must not raise (per-period isolation)
 
@@ -974,12 +1006,14 @@ class TestLoadPoleVitalsPerPeriodTypeCommits:
 
         # insert+commit, then (MERGE, prune, commit) for Hour, then Day,
         # then (MERGE, stale-row cleanup, commit) for Last48Hours, then
-        # final update+commit.
+        # (copy, fresh-compute, commit) for LastKnown48Hours, then final
+        # update+commit.
         assert call_order == [
             "execute", "commit",             # SP_Execution insert
             "execute", "execute", "commit",  # Hour MERGE + prune
             "execute", "execute", "commit",  # Day MERGE + prune
             "execute", "execute", "commit",  # Last48Hours MERGE + stale-row cleanup
+            "execute", "execute", "commit",  # LastKnown48Hours copy + fresh-compute
             "execute", "commit",             # SP_Execution final update
         ]
 
@@ -995,7 +1029,7 @@ class TestLoadPoleVitalsPerPeriodTypeCommits:
         pole_vitals_loader.load_pole_vitals()
 
         assert "rollback" not in call_order
-        assert call_order.count("commit") == 5  # insert + 3 period types + final update
+        assert call_order.count("commit") == 6  # insert + 3 period types + LastKnown48Hours + final update
 
     def test_genuine_failure_rolls_back_and_does_not_block_later_period_types(
         self, patch_get_connection_pole_vitals, mock_conn, mock_cursor
@@ -1012,6 +1046,7 @@ class TestLoadPoleVitalsPerPeriodTypeCommits:
             "execute", "rollback",           # Hour MERGE -- fails, rolled back (prune never runs)
             "execute", "execute", "commit",  # Day -- still attempted, succeeds
             "execute", "execute", "commit",  # Last48Hours -- still attempted, succeeds
+            "execute", "execute", "commit",  # LastKnown48Hours -- still attempted, succeeds
             "execute", "commit",             # SP_Execution final update
         ]
 
@@ -1030,6 +1065,7 @@ class TestLoadPoleVitalsPerPeriodTypeCommits:
             "execute", "execute", "commit",  # Hour -- already committed here
             "execute", "rollback",           # Day MERGE -- fails AFTER Hour's commit above
             "execute", "execute", "commit",  # Last48Hours -- still attempted, succeeds
+            "execute", "execute", "commit",  # LastKnown48Hours -- still attempted, succeeds
             "execute", "commit",             # SP_Execution final update
         ]
 
@@ -1044,7 +1080,9 @@ class TestLoadPoleVitalsPerPeriodTypeCommits:
 
         final_update_args = mock_cursor.execute.call_args_list[-1].args
         success, errors = final_update_args[2], final_update_args[3]
-        assert (success, errors) == (10, 1)  # 2 successful period types x 5 rows, 1 failed
+        # Day + Last48Hours (5 each) + LastKnown48Hours copy + fresh-compute
+        # (5 each) = 20; Hour failed, so it contributes 0 and 1 error.
+        assert (success, errors) == (20, 1)
 
 
 class TestLast48HoursStaleRowCleanup:
@@ -1152,6 +1190,8 @@ class TestLast48HoursStaleRowCleanup:
             None,  # Day prune
             None,  # Last48Hours MERGE
             None,  # Last48Hours stale-row cleanup
+            None,  # LastKnown48Hours copy
+            None,  # LastKnown48Hours fresh-compute-for-offline
             None,  # final update
         ]
         mock_cursor.rowcount = 3
@@ -1161,7 +1201,9 @@ class TestLast48HoursStaleRowCleanup:
         final_update_args = mock_cursor.execute.call_args_list[-1].args
         success, errors = final_update_args[2], final_update_args[3]
         assert errors == 1
-        assert success == 6  # 2 successful period types (Day, Last48Hours) x 3 rows
+        # 2 successful period types (Day, Last48Hours) + copy +
+        # fresh-compute, x 3 rows each
+        assert success == 12
 
     def test_logs_error_for_failed_period_type(
         self, patch_get_connection_pole_vitals, mock_cursor, caplog
@@ -1170,7 +1212,7 @@ class TestLast48HoursStaleRowCleanup:
         mock_cursor.execute.side_effect = [
             None,
             RuntimeError("boom"),
-            None, None, None, None, None,
+            None, None, None, None, None, None, None,
         ]
         mock_cursor.rowcount = 0
 
@@ -1193,6 +1235,100 @@ class TestLoadPoleVitalsTopLevelFailure:
 
         mock_cursor.close.assert_called_once()
         mock_conn.close.assert_called_once()
+
+
+class TestLoadPoleVitalsFailureRecordingUsesAFreshConnection:
+    """
+    Regression guard for a real production incident: an 08S01
+    "Communication link failure" during the new LastKnown48Hours step
+    (cursor.execute()) also broke the connection itself, so the inner
+    except block's own conn.rollback() call ALSO failed with the same
+    08S01 error -- and since that rollback failure wasn't caught by
+    anything, it escaped this loader's per-period-type error isolation
+    entirely and reached this top-level except block, which (before this
+    fix) reused that SAME, already-dead connection to try to record the
+    failure -- failing a THIRD time, uncaught, crashing the whole
+    loadLeadsunData timer invocation with SP_Execution's own row left
+    half-finished. Same fix, same reasoning, as pole_daylight_flags_loader.py/
+    pole_timezones_loader.py's own equivalent, and this module's own
+    backfill_*_for_all_poles() functions -- load_pole_vitals() itself was
+    the one loader in this project that had never had it applied.
+    """
+
+    def _make_conn(self):
+        conn = MagicMock(name="conn")
+        cursor = MagicMock(name="cursor")
+        conn.cursor.return_value = cursor
+        return conn, cursor
+
+    def test_original_exception_still_raised_when_recording_succeeds(self, mocker):
+        main_conn, main_cursor = self._make_conn()
+        main_cursor.fetchone.return_value = (55,)
+        # Reproduces the exact reported cascade: the LastKnown48Hours
+        # fresh-compute statement (the 9th execute() call -- insert,
+        # Hour MERGE+prune, Day MERGE+prune, Last48Hours MERGE+cleanup,
+        # LastKnown48Hours copy, THEN this one) fails with a
+        # communication link failure, and the inner except block's own
+        # conn.rollback() ALSO fails with the same error, escaping that
+        # block's own handling entirely.
+        main_cursor.execute.side_effect = [
+            None, None, None, None, None, None, None, None,
+            pyodbc.OperationalError("08S01", "Communication link failure (SQLExecDirectW)"),
+        ]
+        main_conn.rollback.side_effect = pyodbc.OperationalError(
+            "08S01", "Communication link failure (SQLEndTran)"
+        )
+
+        recovery_conn, recovery_cursor = self._make_conn()
+
+        mocker.patch(
+            "shared.pole_vitals_loader.get_connection",
+            side_effect=[main_conn, recovery_conn],
+        )
+
+        with pytest.raises(pyodbc.OperationalError, match="SQLEndTran"):
+            pole_vitals_loader.load_pole_vitals()
+
+        assert recovery_cursor.execute.called
+        update_sql, end_time, error_message, success, errors, sp_exec_id = (
+            recovery_cursor.execute.call_args.args
+        )
+        assert "UPDATE SP_Execution" in update_sql
+        assert "SQLEndTran" in error_message
+        assert sp_exec_id == 55
+        recovery_conn.commit.assert_called_once()
+        recovery_cursor.close.assert_called_once()
+        recovery_conn.close.assert_called_once()
+        main_cursor.close.assert_called_once()
+        main_conn.close.assert_called_once()
+
+    def test_original_exception_still_raised_when_recording_also_fails(self, mocker, caplog):
+        main_conn, main_cursor = self._make_conn()
+        main_cursor.fetchone.return_value = (55,)
+        main_cursor.execute.side_effect = [
+            None, None, None, None, None, None, None, None,
+            RuntimeError("original communication failure"),
+        ]
+        main_conn.rollback.side_effect = RuntimeError("rollback also failed")
+
+        recovery_conn, recovery_cursor = self._make_conn()
+        recovery_cursor.execute.side_effect = RuntimeError("recovery also failed")
+
+        mocker.patch(
+            "shared.pole_vitals_loader.get_connection",
+            side_effect=[main_conn, recovery_conn],
+        )
+
+        with caplog.at_level("ERROR"):
+            with pytest.raises(RuntimeError, match="rollback also failed"):
+                pole_vitals_loader.load_pole_vitals()
+
+        error_messages = [rec.message for rec in caplog.records if rec.levelname == "ERROR"]
+        assert any("rollback also failed" in msg for msg in error_messages)
+        assert any(
+            "additionally failed to record this run's failure" in msg and "recovery also failed" in msg
+            for msg in error_messages
+        )
 
 
 # --------------------------------------------------------------------------
@@ -1648,3 +1784,196 @@ class TestBackfillLast48HoursOfHourFailureRecordingUsesAFreshConnection:
         recovery_conn.close.assert_called_once()
         main_cursor.close.assert_called_once()
         main_conn.close.assert_called_once()
+
+
+# --------------------------------------------------------------------------
+# LastKnown48Hours -- a new period type: identical to Last48Hours for a
+# currently-active pole (literally copied), but a fresh per-pole-anchored
+# rollup for a pole that's gone completely silent.
+# --------------------------------------------------------------------------
+
+
+class TestLastKnown48HoursCopyFromLast48HoursSqlStructure:
+    def test_reads_directly_from_last_48_hours_rows(self):
+        sql = pole_vitals_loader._LAST_KNOWN_48_HOURS_COPY_FROM_LAST_48_HOURS_SQL
+        assert "FROM PoleVitals" in sql
+        assert "WHERE PeriodType = 'Last48Hours'" in sql
+
+    def test_writes_as_last_known_48_hours_period_type(self):
+        sql = pole_vitals_loader._LAST_KNOWN_48_HOURS_COPY_FROM_LAST_48_HOURS_SQL
+        assert "'LastKnown48Hours' AS PeriodType" in sql
+
+    def test_has_no_sql_aggregate_of_its_own(self):
+        """Confirms this really is a plain copy, not a recomputation --
+        no AVG()/MAX() anywhere, since it just selects Last48Hours'
+        already-computed columns verbatim."""
+        sql = pole_vitals_loader._LAST_KNOWN_48_HOURS_COPY_FROM_LAST_48_HOURS_SQL
+        assert "AVG(" not in sql
+        assert "MAX(" not in sql
+
+    def test_matches_on_location_id_and_period_type_alone(self):
+        """Same structural convention as _LAST_48_HOURS_MERGE_SQL's own
+        MERGE -- always exactly one row per pole."""
+        sql = pole_vitals_loader._LAST_KNOWN_48_HOURS_COPY_FROM_LAST_48_HOURS_SQL
+        assert (
+            "ON target.LocationId = source.LocationId\n"
+            "   AND target.PeriodType = source.PeriodType" in sql
+        )
+        assert "PeriodStart = source.PeriodStart" not in sql.split("ON target.LocationId")[1].split("WHEN MATCHED")[0]
+
+    def test_only_two_bound_parameters(self):
+        """Source, SP_ExecId only -- nothing else to parameterize, since
+        this reads from PoleVitals itself, not PoleTelemetry."""
+        sql = pole_vitals_loader._LAST_KNOWN_48_HOURS_COPY_FROM_LAST_48_HOURS_SQL
+        assert sql.count("?") == 2
+
+
+class TestLastKnown48HoursFreshComputeForOfflinePolesSqlStructure:
+    def test_has_no_global_last_upload_cutoff(self):
+        sql = pole_vitals_loader._LAST_KNOWN_48_HOURS_FRESH_COMPUTE_FOR_OFFLINE_POLES_SQL
+        assert "LastUpload >= ?" not in sql
+
+    def test_only_targets_poles_without_a_current_last_48_hours_row(self):
+        """The defining scoping condition: a pole with SOME telemetry,
+        but no Last48Hours row -- i.e. genuinely offline, not just any
+        pole."""
+        sql = pole_vitals_loader._LAST_KNOWN_48_HOURS_FRESH_COMPUTE_FOR_OFFLINE_POLES_SQL
+        offline_poles_cte = sql.split("OfflinePoles AS (")[1].split("MaxReadingPerOfflinePole AS (")[0]
+        assert "NOT EXISTS" in offline_poles_cte
+        assert "PoleVitals pv" in offline_poles_cte
+        assert "pv.PeriodType = 'Last48Hours'" in offline_poles_cte
+
+    def test_finds_each_offline_poles_own_max_last_upload(self):
+        sql = pole_vitals_loader._LAST_KNOWN_48_HOURS_FRESH_COMPUTE_FOR_OFFLINE_POLES_SQL
+        cte = sql.split("MaxReadingPerOfflinePole AS (")[1].split("TelemetryWithVitals AS (")[0]
+        assert "MAX(t.LastUpload) AS MaxLastUpload" in cte
+        assert "JOIN OfflinePoles op ON t.LocationId = op.LocationId" in cte
+
+    def test_scopes_readings_to_a_48_hour_range_ending_at_each_poles_own_max(self):
+        sql = pole_vitals_loader._LAST_KNOWN_48_HOURS_FRESH_COMPUTE_FOR_OFFLINE_POLES_SQL
+        assert "JOIN MaxReadingPerOfflinePole mr ON t.LocationId = mr.LocationId" in sql
+        assert "WHERE t.LastUpload > DATEADD(HOUR, -48, mr.MaxLastUpload)" in sql
+        assert "AND t.LastUpload <= mr.MaxLastUpload" in sql
+
+    def test_period_start_end_anchored_to_max_last_upload_not_now(self):
+        sql = pole_vitals_loader._LAST_KNOWN_48_HOURS_FRESH_COMPUTE_FOR_OFFLINE_POLES_SQL
+        assert "SYSDATETIMEOFFSET()" not in sql
+        assert (
+            "DATEADD(HOUR, -48, MaxLastUpload AT TIME ZONE 'Eastern Standard Time') AS PeriodStart"
+            in sql
+        )
+        assert "MaxLastUpload AT TIME ZONE 'Eastern Standard Time' AS PeriodEnd" in sql
+
+    def test_writes_as_last_known_48_hours_period_type(self):
+        sql = pole_vitals_loader._LAST_KNOWN_48_HOURS_FRESH_COMPUTE_FOR_OFFLINE_POLES_SQL
+        assert "'LastKnown48Hours' AS PeriodType" in sql
+
+    def test_fault_flag_and_default_formulas_match_the_normal_last_48_hours_merge_exactly(self):
+        """Same reasoning as this project's other per-pole-anchored
+        variants (e.g. backfill_last_48_hours_of_hour_for_all_poles()'s
+        own equivalent test): an intentional copy, not a divergent
+        reimplementation."""
+        sql = pole_vitals_loader._LAST_KNOWN_48_HOURS_FRESH_COMPUTE_FOR_OFFLINE_POLES_SQL
+        assert "WHEN t.IsDaylightForLedFault = 1 THEN 0" in sql
+        assert "WHEN t.IsDaylightForPanelFault = 0 THEN 0" in sql
+        assert "ISNULL(pm.BatteryChargingMin, 13.5)" in sql
+        assert "NULLIF(ISNULL(pm.SunboardPower, 80), 0)" in sql
+        assert "NULLIF(ISNULL(pm.LightPower, 30), 0)" in sql
+
+    def test_wraps_in_ansi_warnings_off_on(self):
+        sql = pole_vitals_loader._LAST_KNOWN_48_HOURS_FRESH_COMPUTE_FOR_OFFLINE_POLES_SQL
+        assert sql.strip().startswith("SET ANSI_WARNINGS OFF;")
+        assert sql.strip().endswith("SET ANSI_WARNINGS ON;")
+
+    def test_telemetry_with_vitals_exposes_last_upload_for_aggregated_to_reference(self):
+        """Regression guard for a real production bug: Aggregated's own
+        MAX(LastUpload) reads from TelemetryWithVitals, but that CTE's
+        SELECT list originally (copied from _LAST_48_HOURS_MERGE_SQL,
+        which never needed this) only used t.LastUpload INSIDE the
+        ROW_NUMBER() window function's own ORDER BY -- never actually
+        exposed it as an output column. That's valid SQL for the window
+        function itself, but left LastUpload unavailable to any CTE
+        downstream, causing SQL Server error 207, "Invalid column name
+        'LastUpload'", the first time this actually ran. t.LastUpload
+        must appear as its own, plain output column in
+        TelemetryWithVitals's SELECT list, not just inside the window
+        function expression."""
+        sql = pole_vitals_loader._LAST_KNOWN_48_HOURS_FRESH_COMPUTE_FOR_OFFLINE_POLES_SQL
+        telemetry_with_vitals_cte = sql.split("TelemetryWithVitals AS (")[1].split(
+            "FROM PoleTelemetry t\n    JOIN MaxReadingPerOfflinePole"
+        )[0]
+        assert "t.LastUpload," in telemetry_with_vitals_cte
+
+    def test_four_bound_parameters(self):
+        """2 sentinel exclusions (OfflinePoles, MaxReadingPerOfflinePole)
+        + Source + SP_ExecId."""
+        sql = pole_vitals_loader._LAST_KNOWN_48_HOURS_FRESH_COMPUTE_FOR_OFFLINE_POLES_SQL
+        assert sql.count("?") == 4
+
+
+class TestLoadPoleVitalsLastKnown48HoursIntegration:
+    def test_runs_after_last_48_hours_merge_and_cleanup(
+        self, patch_get_connection_pole_vitals, mock_cursor
+    ):
+        """Confirms ordering: both LastKnown48Hours statements must come
+        AFTER Last48Hours' own MERGE and stale-row cleanup, since the
+        copy reads Last48Hours' just-written rows and the offline-pole
+        query depends on seeing that table's latest, post-MERGE state."""
+        mock_cursor.fetchone.return_value = (1,)
+        mock_cursor.rowcount = 1
+
+        pole_vitals_loader.load_pole_vitals()
+
+        calls = [c.args[0] for c in mock_cursor.execute.call_args_list]
+        last48_merge_idx = calls.index(pole_vitals_loader._LAST_48_HOURS_MERGE_SQL)
+        last48_cleanup_idx = calls.index(pole_vitals_loader._LAST_48_HOURS_STALE_ROW_PRUNE_SQL)
+        copy_idx = calls.index(pole_vitals_loader._LAST_KNOWN_48_HOURS_COPY_FROM_LAST_48_HOURS_SQL)
+        fresh_compute_idx = calls.index(
+            pole_vitals_loader._LAST_KNOWN_48_HOURS_FRESH_COMPUTE_FOR_OFFLINE_POLES_SQL
+        )
+        assert last48_merge_idx < last48_cleanup_idx < copy_idx < fresh_compute_idx
+
+    def test_benign_warning_on_fresh_compute_only_counts_that_statements_rows(
+        self, patch_get_connection_pole_vitals, mock_conn, mock_cursor
+    ):
+        """The copy statement has no aggregate of its own and so can
+        never itself raise SQLSTATE 01003 -- only the fresh-compute
+        statement can. Confirms the benign-warning branch still counts
+        the copy's own (already-committed-by-the-time-of-the-exception)
+        rowcount correctly, not just the fresh-compute's."""
+        mock_cursor.fetchone.return_value = (1,)
+        benign_exc = Exception("01003", "Warning: Null value is eliminated by an aggregate...")
+        # Indices: 0=insert, 1=Hour, 2=Hour prune, 3=Day, 4=Day prune,
+        # 5=Last48Hours, 6=Last48Hours cleanup, 7=copy(ok),
+        # 8=fresh-compute(benign warning), 9=final update
+        mock_cursor.execute.side_effect = [
+            None, None, None, None, None, None, None, None, benign_exc, None,
+        ]
+        mock_cursor.rowcount = 4
+
+        pole_vitals_loader.load_pole_vitals()  # must not raise
+
+        assert mock_conn.rollback.called is False
+        final_update_args = mock_cursor.execute.call_args_list[-1].args
+        success, errors = final_update_args[2], final_update_args[3]
+        assert errors == 0
+
+    def test_genuine_failure_on_copy_statement_rolls_back_and_is_isolated(
+        self, patch_get_connection_pole_vitals, mock_conn, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = (1,)
+        mock_cursor.rowcount = 5
+        # index 7 = LastKnown48Hours copy statement
+        mock_cursor.execute.side_effect = [
+            None, None, None, None, None, None, None,
+            RuntimeError("copy failed"),
+            None, None,
+        ]
+
+        pole_vitals_loader.load_pole_vitals()  # must not raise
+
+        final_update_args = mock_cursor.execute.call_args_list[-1].args
+        success, errors = final_update_args[2], final_update_args[3]
+        # Hour/Day/Last48Hours (5 each = 15) all succeeded; LastKnown48Hours failed.
+        assert (success, errors) == (15, 1)
+        mock_conn.rollback.assert_called_once()

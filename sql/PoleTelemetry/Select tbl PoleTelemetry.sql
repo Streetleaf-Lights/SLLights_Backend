@@ -54,13 +54,15 @@ FROM PoleTelemetry t
     LEFT JOIN Poles p ON t.LocationId = p.LocationId
     LEFT JOIN PoleTimeZones ptz ON t.LocationId = ptz.LocationId
 WHERE 1 = 1
-AND p.PoleNumber = 'HIL-1700'
+AND p.PoleNumber = 'BRE-1000'
 -- AND (t.LocationId = '12101-4938')
 -- AND SP_ExecId = 442
 -- AND IsDaylight IS NOT NULL
     -- AND IsOnline = 0
     -- AND LampPower1 > 0
     -- AND LampPower2 > 0
+    -- AND IsOpenIssueFault = 1
+    
 ORDER BY LastUpload DESC;
 
 -- SELECT MAX(LastUpload) AS ActualMaxLastUpload

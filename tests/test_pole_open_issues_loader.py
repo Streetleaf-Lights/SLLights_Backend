@@ -83,12 +83,42 @@ class TestFirstLinkedValue:
 
 
 class TestMapRecordToIssue:
+    def test_pole_id_is_sourced_from_pole_record_id_not_pole_id(self):
+        """Regression guard for a real production bug: Airtable's own
+        "PoleId" field links to a synced/mirror table, NOT the real
+        Poles table this project's own Poles.Id comes from -- its record
+        ids never actually lined up with Poles.Id, despite the matching
+        name. "PoleRecordID" is the field that genuinely does, and must
+        be the one used here regardless of what "PoleId" itself holds."""
+        record = {
+            "id": "recSampleIssue002",
+            "fields": {
+                "IssueID": "some-issue-id",
+                "PoleId": ["recFromTheWrongSyncTable"],
+                "PoleRecordID": ["recFromTheRealPolesTable"],
+                "Status": "Open",
+                "Pole Status": ["Electrical Issue"],
+            },
+        }
+
+        result = m._map_record_to_issue(record)
+
+        assert result["PoleId"] == "recFromTheRealPolesTable"
+
     def test_maps_the_real_sample_shape_correctly(self):
         record = {
             "id": "recSampleIssue001",
             "fields": {
                 "IssueID": "121025-4015-BRE-1035",
-                "PoleId": ["recC8GYNmkJDei0PV"],
+                # Both fields present, matching a real Airtable record --
+                # PoleId links to a synced/mirror table (its ids don't
+                # line up with this project's own Poles.Id at all), while
+                # PoleRecordID is the one that genuinely does. Confirms
+                # the correct one is specifically chosen, not just that
+                # the new field name happens to work when the old one is
+                # absent.
+                "PoleId": ["recWrongSyncTableId"],
+                "PoleRecordID": ["recC8GYNmkJDei0PV"],
                 "Status": "Open",
                 "Pole Status": ["Electrical Issue"],
             },

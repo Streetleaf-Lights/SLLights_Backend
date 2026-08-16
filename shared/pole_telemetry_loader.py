@@ -523,3 +523,199 @@ def load_pole_telemetry() -> None:
     finally:
         cursor.close()
         conn.close()
+
+
+# One-off backfill for a real production bug: IsOpenIssueFault was
+# written incorrectly for every PoleTelemetry row ingested before
+# PoleOpenIssues.PoleId got fixed to source from Airtable's
+# "PoleRecordID" field instead of "PoleId" (see
+# pole_open_issues_loader.py's own comments on _map_record_to_issue for
+# the full history) -- "PoleId" links to a synced/mirror table, not the
+# real Poles table, so the JOIN this value depends on
+# (_fetch_location_ids_with_open_issues() above) never matched
+# correctly, meaning IsOpenIssueFault has likely been 0/False for
+# essentially every pole regardless of whether it actually had an open
+# issue, since this loader was first built.
+#
+# load_pole_telemetry() itself needs NO fix -- _fetch_location_ids_with_
+# open_issues() already re-queries PoleOpenIssues/Poles fresh on every
+# single run, so any NEW telemetry ingested after PoleOpenIssues.PoleId
+# is corrected (i.e. after loadPoleOpenIssues runs again with that fix
+# deployed) will automatically get the right IsOpenIssueFault value with
+# no further action needed. This backfill exists ONLY for EXISTING rows,
+# already ingested with the wrong value baked in, which nothing else
+# would ever revisit.
+#
+# Deliberately scoped the SAME way as
+# pole_vitals_loader.py's own backfill_last_48_hours_of_hour_for_all_
+# poles() -- each pole's own last 48 hours, ending at that SAME pole's
+# own latest reading, not a global cutoff relative to "now". This
+# matters for consistency, not just symmetry: that Hour-vitals backfill
+# reads ITS OWN 48-hour-per-pole window from PoleTelemetry.
+# IsOpenIssueFault -- if this correction used a different, narrower
+# scope (e.g. a plain "last 48 hours from now", which would miss an
+# already-offline pole's own relevant window entirely), the Hour-vitals
+# backfill would end up re-aggregating the SAME stale, uncorrected
+# values for exactly the poles that backfill was built to help.
+#
+# PoleOpenIssues only ever holds CURRENTLY open issues, not a historical
+# log of when each issue opened/closed -- there is no way to reconstruct
+# whether a GIVEN past reading's pole genuinely had an open issue AT
+# THAT EXACT MOMENT. This backfill applies TODAY's known open-issue
+# state to each pole's own recent window as the best available
+# correction, not a claim of full historical accuracy -- a real,
+# accepted limitation of PoleOpenIssues' own data model, not an
+# oversight here.
+_BACKFILL_IS_OPEN_ISSUE_FAULT_PER_POLE_SQL = """
+;WITH LocationIdsWithOpenIssues AS (
+    SELECT DISTINCT p.LocationId
+    FROM Poles p
+    JOIN PoleOpenIssues poi ON poi.PoleId = p.Id
+    WHERE p.LocationId IS NOT NULL
+),
+MaxReadingPerPole AS (
+    SELECT
+        t.LocationId,
+        MAX(t.LastUpload) AS MaxLastUpload
+    FROM PoleTelemetry t
+    WHERE t.LastUpload <> ?  -- exclude the missing-LastUpload sentinel (see _MISSING_LAST_UPLOAD_SENTINEL above)
+    GROUP BY t.LocationId
+)
+UPDATE t
+SET t.IsOpenIssueFault = CASE WHEN loi.LocationId IS NOT NULL THEN 1 ELSE 0 END
+FROM PoleTelemetry t
+JOIN MaxReadingPerPole mr ON t.LocationId = mr.LocationId
+LEFT JOIN LocationIdsWithOpenIssues loi ON t.LocationId = loi.LocationId
+WHERE t.LastUpload > DATEADD(HOUR, -48, mr.MaxLastUpload)
+  AND t.LastUpload <= mr.MaxLastUpload
+  AND ISNULL(t.IsOpenIssueFault, 0) <> CASE WHEN loi.LocationId IS NOT NULL THEN 1 ELSE 0 END;
+"""
+
+
+def backfill_is_open_issue_fault_for_all_poles() -> None:
+    """
+    One-off operation: corrects IsOpenIssueFault on EXISTING PoleTelemetry
+    rows within each pole's own last 48 hours of activity (ending at that
+    SAME pole's own latest reading, regardless of how old it is), using
+    the NOW-corrected PoleOpenIssues.PoleId -> Poles.Id join. See
+    _BACKFILL_IS_OPEN_ISSUE_FAULT_PER_POLE_SQL's own comment for the full
+    reasoning, including why this was needed at all (a real, confirmed
+    production bug) and this backfill's own real limitation (it can only
+    ever apply TODAY's known open-issue state, since PoleOpenIssues holds
+    no history of past open/closed status).
+
+    NOT needed for any telemetry ingested AFTER loadPoleOpenIssues runs
+    with the corrected field mapping -- load_pole_telemetry() itself
+    already re-resolves this fresh on every single run, so new readings
+    get the right value automatically. This is purely for rows already
+    written with the wrong value baked in before that point.
+
+    Intended to be run manually, once, as a one-off correction after
+    deploying the PoleOpenIssues.PoleId fix (and after running
+    loadPoleOpenIssues at least once with that fix in place) -- NOT part
+    of the normal, scheduled loadLeadsunData cycle. See
+    scripts/backfill_is_open_issue_fault.py for how to invoke it.
+
+    Run this BEFORE re-running
+    pole_vitals_loader.backfill_last_48_hours_of_hour_for_all_poles() --
+    that backfill only ever reads whatever IsOpenIssueFault is ALREADY
+    stored on PoleTelemetry and aggregates it into PoleVitals; it cannot
+    fix a wrong per-reading value itself. Running it before this one
+    would just re-aggregate the same, still-incorrect values.
+    """
+    start_time = _to_dto_string(_now_eastern())
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    sp_exec_id = None
+    total_success = 0
+    total_errors = 0
+
+    try:
+        # 1. Open an SP_Execution row for this run
+        cursor.execute(
+            """
+            INSERT INTO SP_Execution (Name, Environment, StartDateTime, Source, BatchCount, IsFinalBatch)
+            OUTPUT INSERTED.Id
+            VALUES (?, ?, ?, ?, 0, 0)
+            """,
+            "backfillIsOpenIssueFault",
+            ENVIRONMENT,
+            start_time,
+            SOURCE_NAME,
+        )
+        sp_exec_id = cursor.fetchone()[0]
+        conn.commit()
+
+        # 2. The single, set-based UPDATE covering every pole's own
+        # 48-hour window at once.
+        cursor.execute(_BACKFILL_IS_OPEN_ISSUE_FAULT_PER_POLE_SQL, _MISSING_LAST_UPLOAD_SENTINEL)
+        total_success = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+        conn.commit()
+        logging.info(
+            "backfillIsOpenIssueFault: %d PoleTelemetry row(s) corrected across every pole's own "
+            "last 48 hours of activity.",
+            total_success,
+        )
+
+        # 3. Close out the SP_Execution row with final counts
+        cursor.execute(
+            """
+            UPDATE SP_Execution
+            SET EndDateTime = ?,
+                TotalSuccessfulRecords = ?,
+                TotalErrorRecords = ?,
+                BatchCount = ?,
+                IsFinalBatch = 1
+            WHERE Id = ?
+            """,
+            _to_dto_string(_now_eastern()),
+            total_success,
+            total_errors,
+            1,
+            sp_exec_id,
+        )
+        conn.commit()
+
+    except Exception as ex:
+        logging.error("backfillIsOpenIssueFault: run failed: %s", ex)
+        if sp_exec_id:
+            # Fresh connection for recording the failure -- same fix,
+            # same reasoning, as pole_vitals_loader.py's own backfill
+            # functions (the exception that got us here might BE a
+            # connection-level failure, in which case reusing the same
+            # connection/cursor to record it would just raise a SECOND
+            # time, masking the original, more useful error).
+            try:
+                recovery_conn = get_connection()
+                recovery_cursor = recovery_conn.cursor()
+                try:
+                    recovery_cursor.execute(
+                        """
+                        UPDATE SP_Execution
+                        SET EndDateTime = ?, ErrorMessage = ?, TotalSuccessfulRecords = ?, TotalErrorRecords = ?
+                        WHERE Id = ?
+                        """,
+                        _to_dto_string(_now_eastern()),
+                        str(ex),
+                        total_success,
+                        total_errors,
+                        sp_exec_id,
+                    )
+                    recovery_conn.commit()
+                finally:
+                    recovery_cursor.close()
+                    recovery_conn.close()
+            except Exception as recording_error:
+                logging.error(
+                    "backfillIsOpenIssueFault: additionally failed to record this run's failure "
+                    "in SP_Execution (Id=%s): %s -- that row will be left with EndDateTime still "
+                    "NULL. The ORIGINAL failure (%s) is what's actually raised below, not this one.",
+                    sp_exec_id,
+                    recording_error,
+                    ex,
+                )
+        raise
+    finally:
+        cursor.close()
+        conn.close()

@@ -61,8 +61,9 @@ def _first_linked_value(value):
     Airtable linked-record/lookup/multi-select fields all come back as a
     list, even when there's only ever one relevant value -- same
     "first element taken" convention poles_loader.py/projects_loader.py
-    already use for their own linked fields. Used here for both PoleId
-    (a genuine linked-record field -> an Airtable record id) and
+    already use for their own linked fields. Used here for both this
+    table's own PoleRecordID field (a genuine linked-record field -> an
+    Airtable record id, mapped to the PoleId column/dict key below) and
     Pole Status (a lookup/multi-select field -> a plain category string,
     not a record id) -- the list-unwrapping is identical either way, only
     the kind of value inside the list differs.
@@ -78,9 +79,13 @@ def _map_record_to_issue(record: dict) -> dict:
     return {
         "Id": record["id"],  # Airtable's own record id, e.g. "recAbCdEfGh12345"
         "IssueId": fields.get("IssueID"),
-        # Linked-record field -- list of ids, first taken. Should line up
-        # with Poles.Id.
-        "PoleId": _first_linked_value(fields.get("PoleId")),
+        # Linked-record field -- list of ids, first taken. Deliberately
+        # NOT Airtable's "PoleId" field, despite the matching name --
+        # confirmed that field links to a SYNCED/mirror table, not the
+        # real Poles table this project's own Poles.Id comes from, so
+        # its record ids don't actually line up with Poles.Id at all.
+        # "PoleRecordID" is the field that genuinely does.
+        "PoleId": _first_linked_value(fields.get("PoleRecordID")),
         "Status": fields.get("Status"),
         # Lookup/multi-select field -- list of plain category strings
         # (not record ids), first taken.

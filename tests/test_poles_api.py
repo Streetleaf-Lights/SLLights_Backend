@@ -44,6 +44,21 @@ class TestPoleSummarySqlStructure:
         sql = m._POLE_SUMMARY_SQL_TEMPLATE
         assert "OUTER APPLY" not in sql
         assert "LastUpload" not in sql
+
+    def test_isonline_uses_a_separate_join_reverted_to_last_48_hours(self):
+        """Same fix as pole_vitals_api.py's own _POLE_DETAILS_SQL_TEMPLATE:
+        every other field reads rps (LastKnown48Hours), but IsOnline
+        specifically reads a SECOND join, rps_online (Last48Hours) --
+        a silent pole's LastKnown48Hours.IsOnline would misleadingly
+        reflect its own last-known state, not whether it's online RIGHT
+        NOW."""
+        sql = m._POLE_SUMMARY_SQL_TEMPLATE
+        assert "rps_online.IsOnline AS IsOnline" in sql
+        assert "rps.IsOnline" not in sql
+        assert (
+            "LEFT JOIN PoleVitals rps_online ON p.LocationId = rps_online.LocationId "
+            "AND rps_online.PeriodType = ?" in sql
+        )
         assert "BatteryVoltage1" not in sql
         assert "BatteryVoltage2" not in sql
 
@@ -125,9 +140,20 @@ class TestGetPoles:
 
         m.get_poles()
 
-        sql, period_type, limit = mock_cursor.execute.call_args.args
+        sql, period_type, rollup_period_type, limit = mock_cursor.execute.call_args.args
         assert "OUTER APPLY" in sql  # full template, not summary
-        assert period_type == "Last48Hours"
+        # LastKnown48Hours, not Last48Hours -- getPoles reuses
+        # pole_vitals_api.py's own per-pole DETAIL query/period type
+        # (_POLE_DETAIL_PERIOD_TYPE), not its rollup one
+        # (_ROLLUP_PERIOD_TYPE) -- there's no rollup concept here at
+        # all, only per-pole detail fields, same reasoning as
+        # pole_vitals_api.py's own getPoleVitals "poles" list entries.
+        assert period_type == "LastKnown48Hours"
+        # EXCEPT isOnline specifically, which still reads
+        # _ROLLUP_PERIOD_TYPE (Last48Hours) via the query's own second
+        # PoleVitals join (rps_online) -- see _POLE_SUMMARY_SQL_TEMPLATE/
+        # _POLE_DETAILS_SQL_TEMPLATE's own comments on rps_online for why.
+        assert rollup_period_type == "Last48Hours"
 
     def test_summary_true_uses_summary_template_and_higher_limit(
         self, patch_get_connection_poles_api, mock_cursor
@@ -136,7 +162,7 @@ class TestGetPoles:
 
         m.get_poles(summary=True)
 
-        sql, period_type, limit = mock_cursor.execute.call_args.args
+        sql, period_type, rollup_period_type, limit = mock_cursor.execute.call_args.args
         assert "OUTER APPLY" not in sql
         assert limit == m._SUMMARY_MAX_LIMIT
 
@@ -147,7 +173,7 @@ class TestGetPoles:
 
         m.get_poles(summary=True, limit=100)
 
-        limit = mock_cursor.execute.call_args.args[2]
+        limit = mock_cursor.execute.call_args.args[3]
         assert limit == 100
 
     def test_pole_id_filters_by_id_and_returns_single_dict(
@@ -164,7 +190,7 @@ class TestGetPoles:
 
         result = m.get_poles(pole_id="pole1")
 
-        sql, period_type, pole_id = mock_cursor.execute.call_args.args
+        sql, period_type, rollup_period_type, pole_id = mock_cursor.execute.call_args.args
         assert "p.Id = ?" in sql
         assert pole_id == "pole1"
         assert isinstance(result, dict)
@@ -190,7 +216,7 @@ class TestGetPoles:
 
         m.get_poles(pole_id="pole1", project_id="proj1")
 
-        sql, period_type, pole_id, project_id = mock_cursor.execute.call_args.args
+        sql, period_type, rollup_period_type, pole_id, project_id = mock_cursor.execute.call_args.args
         assert "p.Id = ? AND proj.Id = ?" in sql
 
     def test_pole_id_project_id_customer_id_all_combine(

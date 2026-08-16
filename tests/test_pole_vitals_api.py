@@ -381,6 +381,45 @@ class TestGetPoleVitalsUnfiltered:
         agg_call = mock_cursor.execute.call_args_list[0]
         assert agg_call.args[1] == "Last48Hours"
 
+    def test_pole_detail_query_uses_last_known_48_hours_not_last_48_hours(
+        self, patch_get_connection_pole_vitals_api, mock_cursor
+    ):
+        """The actual behavior change this pair of tests exists to pin
+        down: the ROLLUP query (totalLights/connectedLights/
+        percentWorking, checked above) keeps reading Last48Hours -- a
+        silent pole is deliberately NOT counted as currently connected.
+        But the per-pole DETAIL query (isPoleFault/isPanelFault/
+        avgBatteryPercentage/etc., checked here) reads LastKnown48Hours
+        instead, so those same silent poles still show their last-known
+        state in the "poles" list rather than NULL."""
+        mock_cursor.fetchall.side_effect = [[], []]
+
+        m.get_pole_vitals()
+
+        detail_call = mock_cursor.execute.call_args_list[1]
+        assert detail_call.args[1] == "LastKnown48Hours"
+
+    def test_pole_detail_query_isonline_specifically_reverts_to_last_48_hours(
+        self, patch_get_connection_pole_vitals_api, mock_cursor
+    ):
+        """A carve-out from the test above: isOnline is the ONE field
+        that does NOT follow the rest of the per-pole detail fields onto
+        LastKnown48Hours -- it reads Last48Hours instead (via the
+        query's own second PoleVitals join, rps_online), same period
+        type as the rollup query, since a silent pole's
+        LastKnown48Hours.IsOnline would misleadingly reflect its own
+        last-known state rather than whether it's online RIGHT NOW."""
+        mock_cursor.fetchall.side_effect = [[], []]
+
+        m.get_pole_vitals()
+
+        detail_call = mock_cursor.execute.call_args_list[1]
+        # args[0]=sql, args[1]=LastKnown48Hours (rps), args[2]=Last48Hours
+        # (rps_online, for IsOnline specifically)
+        assert detail_call.args[2] == "Last48Hours"
+        assert "LEFT JOIN PoleVitals rps_online" in detail_call.args[0]
+        assert "rps_online.IsOnline AS IsOnline" in detail_call.args[0]
+
     def test_unfiltered_uses_subquery_limit_on_customers(
         self, patch_get_connection_pole_vitals_api, mock_cursor
     ):

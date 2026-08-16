@@ -22,8 +22,9 @@ unlikely to be used by anything outside this codebase.
 
 from shared.api_utils import clamp_limit, json_safe
 from shared.pole_vitals_api import (
+    _POLE_DETAIL_PERIOD_TYPE,
     _POLE_DETAILS_SQL_TEMPLATE,
-    _STATUS_PERIOD_TYPE,
+    _ROLLUP_PERIOD_TYPE,
     _pole_row_to_dict,
 )
 from shared.sql_client import get_connection
@@ -70,7 +71,7 @@ SELECT
     p.InstallDate AS InstallDate,
     p.Lat AS Lat,
     p.Long AS Long,
-    rps.IsOnline AS IsOnline,
+    rps_online.IsOnline AS IsOnline,
     rps.IsLedFault AS IsLedFault,
     rps.IsBatteryFault AS IsBatteryFault,
     rps.IsPanelFault AS IsPanelFault,
@@ -84,6 +85,13 @@ FROM Poles p
 JOIN Projects proj ON p.ProjectId = proj.Id
 JOIN Customers c ON proj.CustomerId = c.Id
 LEFT JOIN PoleVitals rps ON p.LocationId = rps.LocationId AND rps.PeriodType = ?
+-- Second join, same reasoning as pole_vitals_api.py's own
+-- _POLE_DETAILS_SQL_TEMPLATE: IsOnline specifically reverts to
+-- Last48Hours (_ROLLUP_PERIOD_TYPE) while every other field above stays
+-- on LastKnown48Hours (_POLE_DETAIL_PERIOD_TYPE) -- a silent pole's
+-- LastKnown48Hours.IsOnline would misleadingly reflect its own LAST
+-- KNOWN state, not whether it's online RIGHT NOW.
+LEFT JOIN PoleVitals rps_online ON p.LocationId = rps_online.LocationId AND rps_online.PeriodType = ?
 {where_clause}
 ORDER BY proj.Id, p.PoleNumber
 """
@@ -214,7 +222,15 @@ def get_poles(
         # means "this pole, AND verify it belongs to this project",
         # not "poleId wins, projectId is silently ignored".
         conditions = []
-        params = [_STATUS_PERIOD_TYPE]
+        # Both templates below now have TWO period-type placeholders,
+        # not one -- rps (LastKnown48Hours, first) for most fields,
+        # rps_online (Last48Hours, second) for IsOnline specifically --
+        # see _POLE_DETAILS_SQL_TEMPLATE's own comment on rps_online (and
+        # _POLE_SUMMARY_SQL_TEMPLATE's matching one) for why that one
+        # field reverts to the rollup's own period type. Both templates
+        # share this exact same two-parameter prefix, so this single
+        # params list serves either one.
+        params = [_POLE_DETAIL_PERIOD_TYPE, _ROLLUP_PERIOD_TYPE]
         if pole_id:
             conditions.append("p.Id = ?")
             params.append(pole_id)
@@ -238,7 +254,7 @@ def get_poles(
         # shape ever changes to produce more than one row per pole again.
         where_clause = "WHERE p.Id IN (SELECT TOP (?) Id FROM Poles ORDER BY PoleNumber)"
         row_limit = _clamp_summary_limit(limit) if summary else clamp_limit(limit)
-        params = (_STATUS_PERIOD_TYPE, row_limit)
+        params = (_POLE_DETAIL_PERIOD_TYPE, _ROLLUP_PERIOD_TYPE, row_limit)
 
     sql_template = _POLE_SUMMARY_SQL_TEMPLATE if summary else _POLE_DETAILS_SQL_TEMPLATE
     row_to_dict = _summary_row_to_dict if summary else _pole_row_to_dict_with_parents

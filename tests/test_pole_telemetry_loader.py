@@ -2,6 +2,7 @@
 
 import json
 import re
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -448,3 +449,185 @@ class TestLoadPoleTelemetryTopLevelFailure:
 
         mock_cursor.close.assert_called_once()
         mock_conn.close.assert_called_once()
+
+
+# --------------------------------------------------------------------------
+# backfill_is_open_issue_fault_for_all_poles() -- one-off correction for
+# IsOpenIssueFault values already written wrong on existing PoleTelemetry
+# rows, before PoleOpenIssues.PoleId was fixed to source from Airtable's
+# "PoleRecordID" field.
+# --------------------------------------------------------------------------
+
+
+class TestBackfillIsOpenIssueFaultPerPoleSqlStructure:
+    def test_has_no_global_last_upload_cutoff(self):
+        """Same defining property as pole_vitals_loader.py's own
+        backfill_last_48_hours_of_hour_for_all_poles(): no
+        "t.LastUpload >= ?" anywhere -- each pole's own window is
+        determined entirely from its own data, not a value relative to
+        "now"."""
+        sql = pole_telemetry_loader._BACKFILL_IS_OPEN_ISSUE_FAULT_PER_POLE_SQL
+        assert "LastUpload >= ?" not in sql
+
+    def test_excludes_the_sentinel_last_upload_value(self):
+        sql = pole_telemetry_loader._BACKFILL_IS_OPEN_ISSUE_FAULT_PER_POLE_SQL
+        assert "WHERE t.LastUpload <> ?" in sql
+
+    def test_finds_each_poles_own_max_last_upload(self):
+        sql = pole_telemetry_loader._BACKFILL_IS_OPEN_ISSUE_FAULT_PER_POLE_SQL
+        max_reading_cte = sql.split("MaxReadingPerPole AS (")[1].split(")\nUPDATE")[0]
+        assert "MAX(t.LastUpload) AS MaxLastUpload" in max_reading_cte
+        assert "GROUP BY t.LocationId" in max_reading_cte
+
+    def test_scopes_each_poles_correction_to_a_48_hour_range_ending_at_its_own_max(self):
+        sql = pole_telemetry_loader._BACKFILL_IS_OPEN_ISSUE_FAULT_PER_POLE_SQL
+        assert "JOIN MaxReadingPerPole mr ON t.LocationId = mr.LocationId" in sql
+        assert "WHERE t.LastUpload > DATEADD(HOUR, -48, mr.MaxLastUpload)" in sql
+        assert "AND t.LastUpload <= mr.MaxLastUpload" in sql
+
+    def test_joins_pole_open_issues_via_the_corrected_pole_id_column(self):
+        """This is exactly the join that was broken -- confirms the
+        backfill uses the SAME (now-corrected) column
+        pole_telemetry_loader.py's own
+        _fetch_location_ids_with_open_issues() does, not some
+        independently-written path that could disagree with it."""
+        sql = pole_telemetry_loader._BACKFILL_IS_OPEN_ISSUE_FAULT_PER_POLE_SQL
+        assert "JOIN PoleOpenIssues poi ON poi.PoleId = p.Id" in sql
+
+    def test_only_updates_rows_where_the_value_would_actually_change(self):
+        """Avoids rewriting rows that already have the correct value --
+        same "don't touch what's already right" convention as this
+        project's own MERGE-based upserts elsewhere."""
+        sql = pole_telemetry_loader._BACKFILL_IS_OPEN_ISSUE_FAULT_PER_POLE_SQL
+        assert (
+            "AND ISNULL(t.IsOpenIssueFault, 0) <> CASE WHEN loi.LocationId IS NOT NULL THEN 1 ELSE 0 END"
+            in sql
+        )
+
+    def test_sets_one_when_matched_zero_when_not(self):
+        sql = pole_telemetry_loader._BACKFILL_IS_OPEN_ISSUE_FAULT_PER_POLE_SQL
+        assert (
+            "SET t.IsOpenIssueFault = CASE WHEN loi.LocationId IS NOT NULL THEN 1 ELSE 0 END" in sql
+        )
+
+
+class TestBackfillIsOpenIssueFaultForAllPolesSuccessFlow:
+    def test_full_success_flow_call_sequence(
+        self, patch_get_connection_pole_telemetry, mock_conn, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = (99,)
+        mock_cursor.rowcount = 137
+
+        pole_telemetry_loader.backfill_is_open_issue_fault_for_all_poles()
+
+        calls = mock_cursor.execute.call_args_list
+        assert len(calls) == 3
+
+        insert_sql, name, env, start_time, source = calls[0].args
+        assert "INSERT INTO SP_Execution" in insert_sql
+        assert (name, env, source) == ("backfillIsOpenIssueFault", "Dev", "Leadsun")
+
+        update_sql, sentinel = calls[1].args
+        assert update_sql == pole_telemetry_loader._BACKFILL_IS_OPEN_ISSUE_FAULT_PER_POLE_SQL
+        assert sentinel == pole_telemetry_loader._MISSING_LAST_UPLOAD_SENTINEL
+
+        final_sql, end_time, success, errors, batch_count, sp_exec_id = calls[2].args
+        assert "UPDATE SP_Execution" in final_sql
+        assert (success, errors, batch_count, sp_exec_id) == (137, 0, 1, 99)
+
+        mock_cursor.close.assert_called_once()
+        mock_conn.close.assert_called_once()
+
+    def test_zero_rowcount_does_not_go_negative(
+        self, patch_get_connection_pole_telemetry, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = (1,)
+        mock_cursor.rowcount = -1  # pyodbc convention for "not applicable"
+
+        pole_telemetry_loader.backfill_is_open_issue_fault_for_all_poles()
+
+        final_update_args = mock_cursor.execute.call_args_list[-1].args
+        success, errors = final_update_args[2], final_update_args[3]
+        assert (success, errors) == (0, 0)
+
+
+class TestBackfillIsOpenIssueFaultForAllPolesTopLevelFailure:
+    def test_sp_execution_insert_failure_reraises(
+        self, patch_get_connection_pole_telemetry, mock_conn, mock_cursor
+    ):
+        mock_cursor.execute.side_effect = RuntimeError("db connection lost")
+
+        with pytest.raises(RuntimeError, match="db connection lost"):
+            pole_telemetry_loader.backfill_is_open_issue_fault_for_all_poles()
+
+        mock_cursor.close.assert_called_once()
+        mock_conn.close.assert_called_once()
+
+    def test_genuine_update_failure_reraises(
+        self, patch_get_connection_pole_telemetry, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = (5,)
+        mock_cursor.execute.side_effect = [None, RuntimeError("deadlock")]
+
+        with pytest.raises(RuntimeError, match="deadlock"):
+            pole_telemetry_loader.backfill_is_open_issue_fault_for_all_poles()
+
+
+class TestBackfillIsOpenIssueFaultFailureRecordingUsesAFreshConnection:
+    def _make_conn(self):
+        conn = MagicMock(name="conn")
+        cursor = MagicMock(name="cursor")
+        conn.cursor.return_value = cursor
+        return conn, cursor
+
+    def test_original_exception_still_raised_when_recording_succeeds(self, mocker):
+        main_conn, main_cursor = self._make_conn()
+        main_cursor.fetchone.return_value = (55,)
+        main_cursor.execute.side_effect = [None, RuntimeError("communication link failure")]
+
+        recovery_conn, recovery_cursor = self._make_conn()
+
+        mocker.patch(
+            "shared.pole_telemetry_loader.get_connection",
+            side_effect=[main_conn, recovery_conn],
+        )
+
+        with pytest.raises(RuntimeError, match="communication link failure"):
+            pole_telemetry_loader.backfill_is_open_issue_fault_for_all_poles()
+
+        assert recovery_cursor.execute.called
+        update_sql, end_time, error_message, success, errors, sp_exec_id = (
+            recovery_cursor.execute.call_args.args
+        )
+        assert "UPDATE SP_Execution" in update_sql
+        assert "communication link failure" in error_message
+        assert sp_exec_id == 55
+        recovery_conn.commit.assert_called_once()
+        recovery_cursor.close.assert_called_once()
+        recovery_conn.close.assert_called_once()
+        main_cursor.close.assert_called_once()
+        main_conn.close.assert_called_once()
+
+    def test_original_exception_still_raised_when_recording_also_fails(self, mocker, caplog):
+        main_conn, main_cursor = self._make_conn()
+        main_cursor.fetchone.return_value = (55,)
+        main_cursor.execute.side_effect = [None, RuntimeError("original communication failure")]
+
+        recovery_conn, recovery_cursor = self._make_conn()
+        recovery_cursor.execute.side_effect = RuntimeError("recovery also failed")
+
+        mocker.patch(
+            "shared.pole_telemetry_loader.get_connection",
+            side_effect=[main_conn, recovery_conn],
+        )
+
+        with caplog.at_level("ERROR"):
+            with pytest.raises(RuntimeError, match="original communication failure"):
+                pole_telemetry_loader.backfill_is_open_issue_fault_for_all_poles()
+
+        error_messages = [rec.message for rec in caplog.records if rec.levelname == "ERROR"]
+        assert any("original communication failure" in msg for msg in error_messages)
+        assert any(
+            "additionally failed to record this run's failure" in msg and "recovery also failed" in msg
+            for msg in error_messages
+        )
