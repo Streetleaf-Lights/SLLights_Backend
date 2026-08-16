@@ -711,18 +711,32 @@ WHEN NOT MATCHED THEN
 # project's other per-pole-anchored backfills -- see this file's own
 # backfill_last_48_hours_of_hour_for_all_poles() and
 # pole_telemetry_loader.py's backfill_is_open_issue_fault_for_all_poles()
-# for the established precedent) -- the ONLY structural differences are
-# new OfflinePoles/MaxReadingPerOfflinePole CTEs feeding a per-pole,
+# for the established precedent) -- the structural differences are new
+# CandidateOfflinePoles/MaxReadingPerCandidatePole/
+# OfflinePolesNeedingRecompute CTEs feeding a per-pole,
 # relative-to-its-own-data WHERE clause and PeriodStart/PeriodEnd,
 # replacing _LAST_48_HOURS_MERGE_SQL's own global cutoff relative to
 # "now", plus the PeriodType literal itself.
+#
+# OfflinePolesNeedingRecompute is a real, load-bearing performance fix,
+# not just naming -- see its own comment further down for the full
+# reasoning: without it, this recomputes EVERY pole that has EVER gone
+# silent across the whole retention window, on EVERY single run,
+# forever, confirmed in practice as the cause of loadPoleVitals slowing
+# down substantially once LastKnown48Hours was introduced. With it, a
+# pole whose LastKnown48Hours row already correctly reflects its own
+# (unchanging, since it's dead) latest reading is skipped entirely on
+# every subsequent run.
 _LAST_KNOWN_48_HOURS_FRESH_COMPUTE_FOR_OFFLINE_POLES_SQL = """
 SET ANSI_WARNINGS OFF;
-;WITH OfflinePoles AS (
+;WITH CandidateOfflinePoles AS (
     -- Every LocationId with real telemetry that DOESN'T currently have a
     -- Last48Hours row -- i.e. genuinely offline (no telemetry within the
     -- last 48 hours from now at all), since _LAST_48_HOURS_MERGE_SQL's
     -- own MERGE only ever produces/keeps a row for a pole that DOES.
+    -- "Candidate" -- NOT yet the final set this actually recomputes for;
+    -- see OfflinePolesNeedingRecompute below for the second, narrowing
+    -- filter that matters for performance.
     SELECT DISTINCT t.LocationId
     FROM PoleTelemetry t
     WHERE t.LastUpload <> ?  -- exclude the missing-LastUpload sentinel (see pole_telemetry_loader.py)
@@ -731,14 +745,53 @@ SET ANSI_WARNINGS OFF;
           WHERE pv.LocationId = t.LocationId AND pv.PeriodType = 'Last48Hours'
       )
 ),
-MaxReadingPerOfflinePole AS (
+MaxReadingPerCandidatePole AS (
     SELECT
         t.LocationId,
         MAX(t.LastUpload) AS MaxLastUpload
     FROM PoleTelemetry t
-    JOIN OfflinePoles op ON t.LocationId = op.LocationId
+    JOIN CandidateOfflinePoles cop ON t.LocationId = cop.LocationId
     WHERE t.LastUpload <> ?  -- exclude the missing-LastUpload sentinel (see pole_telemetry_loader.py)
     GROUP BY t.LocationId
+),
+OfflinePolesNeedingRecompute AS (
+    -- A REAL performance fix, not a cosmetic rename: without this
+    -- second filter, EVERY pole that has EVER gone silent -- across the
+    -- entire retention window, potentially many months of history --
+    -- gets its full 48-hour rollup recomputed from scratch on EVERY
+    -- single loadPoleVitals run, forever, even though a truly dead
+    -- pole's own telemetry never changes again once it's stopped
+    -- reporting. Confirmed in practice as the actual cause of
+    -- loadPoleVitals slowing down substantially after LastKnown48Hours
+    -- was introduced.
+    --
+    -- This filters that candidate set down to only poles whose EXISTING
+    -- LastKnown48Hours row (if any) does NOT already reflect this exact
+    -- same MaxLastUpload -- i.e. either no LastKnown48Hours row exists
+    -- yet at all (newly silent, or never computed before), or this
+    -- pole's own latest reading has actually advanced since the last
+    -- time this ran (it came back online briefly, or simply got one
+    -- more reading before going quiet again). A pole that's been dead
+    -- for months, whose LastKnown48Hours row was already computed
+    -- correctly once, matches neither of those conditions on every
+    -- subsequent run and is correctly skipped from here on -- reducing
+    -- the ongoing, steady-state cost of this query to roughly "how many
+    -- poles went newly silent since last time", not "how many poles
+    -- have EVER been silent".
+    --
+    -- lk.PeriodEnd = mr.MaxLastUpload compares two DATETIMEOFFSET values
+    -- directly -- valid and correct despite PeriodEnd being stored
+    -- AT TIME ZONE 'Eastern Standard Time' for display, since
+    -- DATETIMEOFFSET equality compares the underlying UTC instant, not
+    -- the display offset.
+    SELECT mr.LocationId, mr.MaxLastUpload
+    FROM MaxReadingPerCandidatePole mr
+    WHERE NOT EXISTS (
+        SELECT 1 FROM PoleVitals lk
+        WHERE lk.LocationId = mr.LocationId
+          AND lk.PeriodType = 'LastKnown48Hours'
+          AND lk.PeriodEnd = mr.MaxLastUpload
+    )
 ),
 TelemetryWithVitals AS (
     SELECT
@@ -881,7 +934,7 @@ TelemetryWithVitals AS (
         -- window, for IsOpenIssueFault's "take the last telemetry" rule.
         ROW_NUMBER() OVER (PARTITION BY t.LocationId ORDER BY t.LastUpload DESC) AS LatestOverall
     FROM PoleTelemetry t
-    JOIN MaxReadingPerOfflinePole mr ON t.LocationId = mr.LocationId
+    JOIN OfflinePolesNeedingRecompute mr ON t.LocationId = mr.LocationId
     LEFT JOIN PoleModels pm ON t.ModelId = pm.ModelId
     -- Bounded to THIS OFFLINE POLE'S OWN last 48 hours of real
     -- activity, ending at its own most recent reading -- NOT the

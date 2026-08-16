@@ -1838,20 +1838,41 @@ class TestLastKnown48HoursFreshComputeForOfflinePolesSqlStructure:
         but no Last48Hours row -- i.e. genuinely offline, not just any
         pole."""
         sql = pole_vitals_loader._LAST_KNOWN_48_HOURS_FRESH_COMPUTE_FOR_OFFLINE_POLES_SQL
-        offline_poles_cte = sql.split("OfflinePoles AS (")[1].split("MaxReadingPerOfflinePole AS (")[0]
-        assert "NOT EXISTS" in offline_poles_cte
-        assert "PoleVitals pv" in offline_poles_cte
-        assert "pv.PeriodType = 'Last48Hours'" in offline_poles_cte
+        # ";WITH CandidateOfflinePoles AS (" -- the leading ";WITH "
+        # anchor matters here: plain "OfflinePoles AS (" is also a
+        # substring of "CandidateOfflinePoles AS (" itself, so without
+        # this more specific anchor this split silently isolates the
+        # wrong (much larger) slice instead of raising -- a real false
+        # positive this exact test previously had after the CandidateOfflinePoles rename.
+        candidate_offline_poles_cte = sql.split(";WITH CandidateOfflinePoles AS (")[1].split(
+            "MaxReadingPerCandidatePole AS ("
+        )[0]
+        assert "NOT EXISTS" in candidate_offline_poles_cte
+        assert "PoleVitals pv" in candidate_offline_poles_cte
+        assert "pv.PeriodType = 'Last48Hours'" in candidate_offline_poles_cte
 
-    def test_finds_each_offline_poles_own_max_last_upload(self):
+    def test_finds_each_candidate_poles_own_max_last_upload(self):
         sql = pole_vitals_loader._LAST_KNOWN_48_HOURS_FRESH_COMPUTE_FOR_OFFLINE_POLES_SQL
-        cte = sql.split("MaxReadingPerOfflinePole AS (")[1].split("TelemetryWithVitals AS (")[0]
+        cte = sql.split("MaxReadingPerCandidatePole AS (")[1].split("OfflinePolesNeedingRecompute AS (")[0]
         assert "MAX(t.LastUpload) AS MaxLastUpload" in cte
-        assert "JOIN OfflinePoles op ON t.LocationId = op.LocationId" in cte
+        assert "JOIN CandidateOfflinePoles cop ON t.LocationId = cop.LocationId" in cte
+
+    def test_only_recomputes_poles_whose_last_known_48_hours_is_not_already_up_to_date(self):
+        """The real performance fix: a pole whose existing
+        LastKnown48Hours.PeriodEnd already matches this SAME
+        MaxLastUpload is excluded here -- nothing has changed since the
+        last time this ran, so recomputing would just reproduce an
+        identical result. Without this, every pole that has ever gone
+        silent gets recomputed on every single run, forever."""
+        sql = pole_vitals_loader._LAST_KNOWN_48_HOURS_FRESH_COMPUTE_FOR_OFFLINE_POLES_SQL
+        cte = sql.split("OfflinePolesNeedingRecompute AS (")[1].split("TelemetryWithVitals AS (")[0]
+        assert "NOT EXISTS" in cte
+        assert "lk.PeriodType = 'LastKnown48Hours'" in cte
+        assert "lk.PeriodEnd = mr.MaxLastUpload" in cte
 
     def test_scopes_readings_to_a_48_hour_range_ending_at_each_poles_own_max(self):
         sql = pole_vitals_loader._LAST_KNOWN_48_HOURS_FRESH_COMPUTE_FOR_OFFLINE_POLES_SQL
-        assert "JOIN MaxReadingPerOfflinePole mr ON t.LocationId = mr.LocationId" in sql
+        assert "JOIN OfflinePolesNeedingRecompute mr ON t.LocationId = mr.LocationId" in sql
         assert "WHERE t.LastUpload > DATEADD(HOUR, -48, mr.MaxLastUpload)" in sql
         assert "AND t.LastUpload <= mr.MaxLastUpload" in sql
 

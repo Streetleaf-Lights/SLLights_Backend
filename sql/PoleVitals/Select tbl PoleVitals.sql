@@ -24,10 +24,10 @@ WHERE 1 = 1
 -- AND IsOnline = 0
 -- AND PeriodStart >= '2026-08-14 19:00:00'
 -- AND IsPoleFault = 0
-AND PoleNumber = 'BRE-1000'
+AND PoleNumber = 'PAS-3005'
 -- AND IsOpenIssueFault = 1
-AND (PeriodType = 'Last48Hours' OR PeriodType = 'Hour' OR PeriodType = 'LastKnown48Hours')
-ORDER BY LocationId, PeriodStart DESC;
+AND (PeriodType = 'Last48Hours')
+ORDER BY PoleNumber, LocationId, PeriodStart DESC;
 
 -- SELECT LocationId, COUNT(*)
 -- FROM PoleVitals

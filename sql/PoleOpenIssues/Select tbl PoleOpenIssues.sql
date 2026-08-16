@@ -11,7 +11,8 @@ SELECT TOP (1000) PoleOpenIssues.[Id]
 --   AND p.PoleNumber = 'HIL-1322'
     -- AND PoleOpenIssues.[Id] = 'recXUFnjXiVszvreV'
     -- AND PoleOpenIssues.[PoleId] = 'reccrYpcKacWPvsvL'
-    AND PoleOpenIssues.[IssueId] LIKE '%BRE-1014%'
+    -- AND PoleOpenIssues.[IssueId] LIKE '%BRE-1014%'
+    ORDER BY P.PoleNumber;
 
 -- -- Quick summary: how many poles currently have an open issue, vs how
 -- -- many actually show IsOpenIssueFault=1 anywhere in their recent
