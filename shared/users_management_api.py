@@ -1,13 +1,16 @@
 """
-The seven user-management operations: invite (= admin-initiated
-"create"), register (an invitee completing their own setup), sign in,
-sign out, forgot password, reset password, and delete (a real row
-removal -- see delete_user()'s own docstring for the earlier
-soft-delete design this replaced, and why the change isn't reversible).
+The eight user-management operations: invite (= admin-initiated
+"create"), resend invite (refresh an existing Pending user's invite link
+in place, without creating a new user record), register (an invitee
+completing their own setup), sign in, sign out, forgot password, reset
+password, and delete (a real row removal -- see delete_user()'s own
+docstring for the earlier soft-delete design this replaced, and why the
+change isn't reversible).
 
-Role model: 'Streetleaf Admin' can invite and delete users; 'Customer
-Admin' cannot do either (an explicit requirement) -- both are enforced
-via shared/auth_utils.py's require_role(), not re-implemented here.
+Role model: 'Streetleaf Admin' can invite, resend invite, and delete
+users; 'Customer Admin' cannot do any of the three (an explicit
+requirement) -- all are enforced via shared/auth_utils.py's
+require_role(), not re-implemented here.
 
 Anti-enumeration note, worth being explicit about: sign_in() and
 forgot_password() are both deliberately designed so their behavior
@@ -17,10 +20,10 @@ and forgot_password() never raises for a nonexistent email at all (the
 HTTP layer always returns the same generic "if that email exists..."
 message regardless of what actually happened internally). This is a
 deliberate, standard security practice for these two flows specifically
--- it does NOT apply to invite_user(), where an existing email SHOULD
-produce a clear, specific error, since that endpoint is only reachable
-by an already-authenticated Streetleaf Admin, not a public/anonymous
-caller.
+-- it does NOT apply to invite_user()/resend_invite(), where a
+nonexistent/wrong-status target SHOULD produce a clear, specific error,
+since those endpoints are only reachable by an already-authenticated
+Streetleaf Admin, not a public/anonymous caller.
 """
 
 import logging
@@ -76,6 +79,36 @@ def _reset_link(token: str) -> str:
     return f"{base_url}/reset-password?token={token}"
 
 
+def _send_invite_email(user_id, name: str, email: str, token: str, operation_name: str) -> bool:
+    """
+    Shared by invite_user() and resend_invite() -- both need to send the
+    exact same invite email shape (a registration link, valid for
+    TOKEN_LIFETIME), just with a different token bound to it each time.
+    A failed send here is deliberately non-fatal to the caller: the
+    Users row (created by invite_user(), or refreshed in place by
+    resend_invite()) is already committed by the time this runs, so an
+    email delivery hiccup shouldn't undo that -- just be visible via the
+    returned emailSent=False so it can be investigated/retried, not
+    silently swallowed. operation_name is purely for the log line, so a
+    failure here is traceable to which of the two callers produced it.
+    """
+    try:
+        send_email(
+            to_address=email,
+            subject="You've been invited to LightsApp",
+            body_html=(
+                f"<p>Hi {name},</p>"
+                f"<p>You've been invited to LightsApp. "
+                f'<a href="{_registration_link(token)}">Click here to set up your account</a>.</p>'
+                f"<p>This link expires in 48 hours.</p>"
+            ),
+        )
+        return True
+    except EmailSendError as ex:
+        logging.error("%s: user %s's invite email failed to send: %s", operation_name, user_id, ex)
+        return False
+
+
 def invite_user(
     inviter: AuthContext, name: str, email: str, role: str, customer_id: str = None
 ) -> dict:
@@ -83,6 +116,13 @@ def invite_user(
     Creates a Pending user record and emails an invite link (the
     admin-initiated "create"). Only a Streetleaf Admin may call this --
     an explicit requirement, not an incidental default.
+
+    If a Pending invite already exists for this email and just needs a
+    fresh link (e.g. the original expired, or the email got lost), use
+    resend_invite() instead -- this function's own existence check below
+    doesn't distinguish Pending from Active, so calling this again for
+    an email that's already Pending fails with 409, by design (see
+    resend_invite()'s own docstring for the full reasoning).
     """
     require_role(inviter, ["Streetleaf Admin"])
 
@@ -130,29 +170,70 @@ def invite_user(
         cursor.close()
         conn.close()
 
-    email_sent = True
-    try:
-        send_email(
-            to_address=email,
-            subject="You've been invited to LightsApp",
-            body_html=(
-                f"<p>Hi {name},</p>"
-                f"<p>You've been invited to LightsApp. "
-                f'<a href="{_registration_link(token)}">Click here to set up your account</a>.</p>'
-                f"<p>This link expires in 48 hours.</p>"
-            ),
-        )
-    except EmailSendError as ex:
-        # The Pending user row is already committed above -- an email
-        # delivery hiccup shouldn't undo a successful invite, just be
-        # visible to the caller so it can be resent/investigated rather
-        # than silently swallowed.
-        email_sent = False
-        logging.error("invite_user: user %s created but invite email failed: %s", user_id, ex)
+    email_sent = _send_invite_email(user_id, name, email, token, "invite_user")
 
     # str(user_id): a raw uuid.UUID isn't JSON-serializable -- json.dumps()
     # would raise on it at the HTTP layer.
     return {"userId": str(user_id), "email": email, "emailSent": email_sent}
+
+
+def resend_invite(caller: AuthContext, target_user_id: str) -> dict:
+    """
+    Re-sends an invite email to an existing Pending user, refreshing
+    their invite token/expiry IN PLACE -- the same Users row, same Id,
+    same CreatedAt -- rather than a delete_user()-then-invite_user()
+    round trip, which would generate a brand new Id and discard any
+    history tied to the original one. Restricted to Streetleaf Admin,
+    same as invite_user()/delete_user().
+
+    Only valid for a user CURRENTLY Status = 'Pending' -- raises 409 for
+    an Active user (there's no invite link left to resend for them; use
+    forgot_password() instead if they need a new password-reset link)
+    and 404 for a user that doesn't exist at all. Deliberately does NOT
+    touch Name/Email/Role/CustomerId -- if any of those genuinely need
+    to change, that's outside this function's own scope (delete and
+    re-invite, or a separate "edit pending user" operation, not this
+    one).
+    """
+    require_role(caller, ["Streetleaf Admin"])
+    target_user_id_uuid = _parse_uuid(target_user_id, "user not found")
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "SELECT Name, Email, Status FROM Users WHERE Id = ?",
+            target_user_id_uuid,
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise AuthError("user not found", status_code=404)
+
+        name, email, status = row
+        if status != "Pending":
+            raise AuthError("only a Pending user's invite can be resent", status_code=409)
+
+        token = generate_token()
+        expires_at = datetime.now(timezone.utc) + TOKEN_LIFETIME
+
+        cursor.execute(
+            """
+            UPDATE Users
+            SET ResetToken = ?, ResetTokenExpiresAt = ?
+            WHERE Id = ?
+            """,
+            token,
+            _to_dto_string(expires_at),
+            target_user_id_uuid,
+        )
+        conn.commit()
+    finally:
+        cursor.close()
+        conn.close()
+
+    email_sent = _send_invite_email(target_user_id_uuid, name, email, token, "resend_invite")
+
+    return {"userId": str(target_user_id_uuid), "email": email, "emailSent": email_sent}
 
 
 def register_user(token: str, password: str) -> dict:

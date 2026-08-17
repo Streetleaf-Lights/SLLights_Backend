@@ -26,6 +26,7 @@ from shared.users_management_api import (
     forgot_password,
     invite_user,
     register_user,
+    resend_invite,
     reset_password,
     sign_in,
     sign_out,
@@ -669,6 +670,35 @@ def inviteUser(req: func.HttpRequest) -> func.HttpResponse:
     )
 
 
+@app.route(route="resendInvite", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def resendInvite(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Streetleaf-Admin-only: re-sends an invite email to an existing
+    Pending user, refreshing their token/expiry in place (see
+    resend_invite()'s own docstring for why this is preferred over a
+    deleteUser()-then-inviteUser() round trip). 409 if the target user
+    is already Active (nothing left to resend), 404 if the user doesn't
+    exist at all. Body: {"userId": ...}.
+    """
+    try:
+        ctx = require_auth(req)
+        body = req.get_json()
+        result = resend_invite(ctx, target_user_id=body.get("userId"))
+    except AuthError as ex:
+        return _auth_error_response(ex)
+    except Exception as ex:
+        logging.error("resendInvite: failed: %s", ex)
+        return func.HttpResponse(
+            json.dumps({"error": "internal error"}),
+            status_code=500,
+            mimetype="application/json",
+        )
+
+    return func.HttpResponse(
+        json.dumps(result), status_code=200, mimetype="application/json"
+    )
+
+
 @app.route(route="registerUser", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
 def registerUser(req: func.HttpRequest) -> func.HttpResponse:
     """
@@ -801,9 +831,11 @@ def resetPassword(req: func.HttpRequest) -> func.HttpResponse:
 @app.route(route="deleteUser", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
 def deleteUser(req: func.HttpRequest) -> func.HttpResponse:
     """
-    Streetleaf-Admin-only: deactivates a user (soft delete -- see
-    delete_user()'s own docstring) and revokes their active sessions.
-    Query param: ?userId=X.
+    Streetleaf-Admin-only: PERMANENTLY removes a user (a hard delete,
+    not a deactivation -- see delete_user()'s own docstring for the
+    earlier soft-delete design this replaced, and why it's not
+    reversible) and revokes their active sessions. Query param:
+    ?userId=X.
     """
     try:
         ctx = require_auth(req)

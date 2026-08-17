@@ -105,6 +105,110 @@ class TestInviteUser:
         assert result["emailSent"] is False
 
 
+class TestResendInvite:
+    def test_customer_admin_cannot_resend(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        """Role check happens before UUID parsing -- this must be
+        rejected on that basis alone, regardless of whether "user1"
+        would also fail as a malformed id."""
+        with pytest.raises(auth_utils.AuthError) as exc_info:
+            users_management_api.resend_invite(CUSTOMER_ADMIN, "user1")
+        assert exc_info.value.status_code == 403
+        mock_cursor.execute.assert_not_called()
+
+    def test_malformed_user_id_is_rejected_without_querying_the_database(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        with pytest.raises(auth_utils.AuthError) as exc_info:
+            users_management_api.resend_invite(STREETLEAF_ADMIN, "not-a-real-uuid")
+        assert exc_info.value.status_code == 400
+        mock_cursor.execute.assert_not_called()
+
+    def test_nonexistent_user_raises_404(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = None
+
+        with pytest.raises(auth_utils.AuthError) as exc_info:
+            users_management_api.resend_invite(STREETLEAF_ADMIN, str(_uuid()))
+        assert exc_info.value.status_code == 404
+
+    def test_already_active_user_is_rejected_with_409(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        """The defining restriction this function has that invite_user()
+        doesn't: only a CURRENTLY Pending user's invite can be resent --
+        an Active user has no invite link left to refresh."""
+        mock_cursor.fetchone.return_value = ("Jane Doe", "jane@example.com", "Active")
+
+        with pytest.raises(auth_utils.AuthError, match="only a Pending user's invite can be resent"):
+            users_management_api.resend_invite(STREETLEAF_ADMIN, str(_uuid()))
+
+    def test_successful_resend_refreshes_token_and_sends_email(
+        self, patch_get_connection_users_management, mock_cursor, mocker
+    ):
+        mock_cursor.fetchone.return_value = ("Jane Doe", "jane@example.com", "Pending")
+        mock_send = mocker.patch("shared.users_management_api.send_email")
+        target_user_id = str(_uuid())
+
+        result = users_management_api.resend_invite(STREETLEAF_ADMIN, target_user_id)
+
+        update_call = mock_cursor.execute.call_args_list[-1]
+        assert "UPDATE Users" in update_call.args[0]
+        assert "ResetToken = ?" in update_call.args[0]
+        assert "ResetTokenExpiresAt = ?" in update_call.args[0]
+        mock_send.assert_called_once()
+        assert result["userId"] == target_user_id  # SAME id -- not a new user record
+        assert result["email"] == "jane@example.com"
+        assert result["emailSent"] is True
+
+    def test_resend_does_not_touch_name_email_role_or_customer_id(
+        self, patch_get_connection_users_management, mock_cursor, mocker
+    ):
+        """Deliberately out of scope for this function -- only
+        ResetToken/ResetTokenExpiresAt are refreshed."""
+        mock_cursor.fetchone.return_value = ("Jane Doe", "jane@example.com", "Pending")
+        mocker.patch("shared.users_management_api.send_email")
+
+        users_management_api.resend_invite(STREETLEAF_ADMIN, str(_uuid()))
+
+        update_call = mock_cursor.execute.call_args_list[-1]
+        update_sql = update_call.args[0]
+        assert "Name" not in update_sql
+        assert "Email" not in update_sql
+        assert "Role" not in update_sql
+        assert "CustomerId" not in update_sql
+
+    def test_does_not_create_a_new_users_row(
+        self, patch_get_connection_users_management, mock_cursor, mocker
+    ):
+        """The whole point of this function existing, versus the
+        delete_user()-then-invite_user() workaround it replaces: no
+        INSERT anywhere in the call sequence."""
+        mock_cursor.fetchone.return_value = ("Jane Doe", "jane@example.com", "Pending")
+        mocker.patch("shared.users_management_api.send_email")
+
+        users_management_api.resend_invite(STREETLEAF_ADMIN, str(_uuid()))
+
+        calls = mock_cursor.execute.call_args_list
+        assert not any("INSERT" in c.args[0].upper() for c in calls)
+
+    def test_email_failure_does_not_undo_the_token_refresh(
+        self, patch_get_connection_users_management, mock_conn, mock_cursor, mocker
+    ):
+        mock_cursor.fetchone.return_value = ("Jane Doe", "jane@example.com", "Pending")
+        mocker.patch(
+            "shared.users_management_api.send_email",
+            side_effect=EmailSendError("smtp is down"),
+        )
+
+        result = users_management_api.resend_invite(STREETLEAF_ADMIN, str(_uuid()))
+
+        mock_conn.commit.assert_called_once()  # the token UPDATE was still committed
+        assert result["emailSent"] is False
+
+
 class TestRegisterUser:
     def test_malformed_token_is_rejected_without_querying_the_database(
         self, patch_get_connection_users_management, mock_cursor
