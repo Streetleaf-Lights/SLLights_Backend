@@ -1,11 +1,12 @@
 """
-The eight user-management operations: invite (= admin-initiated
+The nine user-management operations: invite (= admin-initiated
 "create"), resend invite (refresh an existing Pending user's invite link
 in place, without creating a new user record), register (an invitee
 completing their own setup), sign in, sign out, forgot password, reset
-password, and delete (a real row removal -- see delete_user()'s own
+password, delete (a real row removal -- see delete_user()'s own
 docstring for the earlier soft-delete design this replaced, and why the
-change isn't reversible).
+change isn't reversible), and change role (toggles Admin <-> 'User'
+within the same organization -- see change_role()'s own docstring).
 
 Role model, three roles: 'Streetleaf Admin' (broad access, not scoped to
 one customer), 'Customer Admin' (restricted to their own CustomerId's
@@ -16,16 +17,17 @@ not re-litigated here). Invite permissions specifically (see
 invite_user()'s own docstring for the full reasoning): Streetleaf Admin
 can invite any of the three; Customer Admin can invite Customer
 Admin/User (but not Streetleaf Admin), and only for their own
-CustomerId; User cannot invite at all. Delete permissions (see
-delete_user()'s own docstring for the full reasoning) are structurally
-similar: Streetleaf Admin can delete any Streetleaf Admin/Customer
-Admin/User except itself; Customer Admin can delete a Customer
-Admin/User within their own CustomerId only, never a Streetleaf Admin;
-User cannot delete anyone. No caller, of any role, can ever delete their
-own account. resend_invite() remains Streetleaf-Admin-only for now --
-see its own docstring for why that's narrower than invite_user()'s (and
-now delete_user()'s) own model, and how to widen it later if that turns
-out to be wanted too.
+CustomerId; User cannot invite at all. Delete and change-role
+permissions (see delete_user()'s and change_role()'s own docstrings for
+the full reasoning) are structurally IDENTICAL to each other: Streetleaf
+Admin can act on any Streetleaf Admin/Customer Admin/User except itself;
+Customer Admin can act on a Customer Admin/User within their own
+CustomerId only, never a Streetleaf Admin; User can do neither to
+anyone. No caller, of any role, can ever delete or change the role of
+their own account. resend_invite() remains Streetleaf-Admin-only for now
+-- see its own docstring for why that's narrower than invite_user()'s
+(and now delete_user()'s/change_role()'s) own model, and how to widen it
+later if that turns out to be wanted too.
 
 Anti-enumeration note, worth being explicit about: sign_in() and
 forgot_password() are both deliberately designed so their behavior
@@ -288,11 +290,11 @@ def resend_invite(caller: AuthContext, target_user_id: str) -> dict:
     same CreatedAt -- rather than a delete_user()-then-invite_user()
     round trip, which would generate a brand new Id and discard any
     history tied to the original one. Restricted to Streetleaf Admin --
-    narrower than both invite_user()'s own model (which permits Customer
-    Admin) and delete_user()'s own model (which now also permits
-    Customer Admin, within their own CustomerId) -- see either
-    function's own docstring; widen this the same way if resending is
-    ever wanted for a Customer Admin caller too.
+    narrower than invite_user()'s own model (which permits Customer
+    Admin) and delete_user()'s/change_role()'s own model (which now also
+    permit Customer Admin, within their own CustomerId) -- see any of
+    those functions' own docstrings; widen this the same way if
+    resending is ever wanted for a Customer Admin caller too.
 
     Only valid for a user CURRENTLY Status = 'Pending' -- raises 409 for
     an Active user (there's no invite link left to resend for them; use
@@ -651,3 +653,119 @@ def delete_user(caller: AuthContext, target_user_id: str) -> None:
     finally:
         cursor.close()
         conn.close()
+
+
+def _toggle_role(current_role: str, customer_id) -> str:
+    """
+    Toggles between an Admin role and 'User', WITHIN the same
+    organization the target already belongs to -- CustomerId itself is
+    never touched by this, only Role. A target with customer_id=None
+    (Streetleaf Admin or a "Streetleaf User" -- see invite_user()'s own
+    docstring for that concept) toggles between 'Streetleaf Admin' and
+    'User', staying unscoped either way. A target with a real
+    customer_id (Customer Admin or a customer-side User) toggles between
+    'Customer Admin' and 'User', staying within that SAME customer
+    either way -- this is what "keeping the same organization" means in
+    practice: which organization a user belongs to is entirely a
+    function of their own customer_id, not their Role, so leaving
+    customer_id untouched IS what keeps them in place.
+    """
+    if current_role == "User":
+        return "Streetleaf Admin" if customer_id is None else "Customer Admin"
+    return "User"
+
+
+def change_role(caller: AuthContext, target_user_id: str) -> dict:
+    """
+    Toggles a user's role between an Admin role and 'User', keeping them
+    within the SAME organization (Streetleaf if they currently have no
+    CustomerId, or that same Customer if they do) -- see
+    _toggle_role()'s own docstring for exactly how the new role is
+    determined; CustomerId itself is never changed by this operation,
+    only Role.
+
+    Permission model -- identical in STRUCTURE to delete_user()'s own
+    (see that function's docstring for the parallel, including the exact
+    reasoning behind each restriction, not re-litigated here):
+    'Streetleaf Admin' can change the role of any other Streetleaf
+    Admin, any Customer Admin, and any User -- but never itself.
+    'Customer Admin' can change the role of a Customer Admin or User
+    belonging to their OWN CustomerId only -- never a Streetleaf Admin
+    (any CustomerId), and never a Customer Admin/User belonging to a
+    DIFFERENT CustomerId. 'User' cannot change anyone's role at all --
+    require_role() below rejects that caller before anything else runs.
+
+    Self-role-change is rejected for EVERY role uniformly, not just
+    Streetleaf Admin -- same reasoning as delete_user()'s own equivalent
+    restriction: changing your own role mid-session has no sensible,
+    safe in-place outcome (your own privileges would shift under you
+    while your existing session/JWT still reflects the old ones), and
+    there's no legitimate reason any caller would need to self-promote
+    or self-demote through this same admin-facing operation.
+
+    Also revokes the target's active sessions, same as delete_user() --
+    a role change is a privilege change, and an existing JWT/session
+    issued under the OLD role would otherwise keep granting (or keep
+    denying) access based on stale information until it naturally
+    expires, regardless of which direction the change went. Forcing a
+    fresh sign-in makes the new role take effect immediately rather than
+    "eventually".
+
+    Returns {"userId": ..., "role": <the NEW role>, "customerId": ...}
+    -- customerId echoed back unchanged, confirming this operation
+    didn't touch it.
+    """
+    require_role(caller, ["Streetleaf Admin", "Customer Admin"])
+    target_user_id_uuid = _parse_uuid(target_user_id, "user not found")
+
+    # Checked BEFORE any database round trip -- same reasoning, same
+    # placement, as delete_user()'s own equivalent check.
+    if target_user_id_uuid == uuid.UUID(caller.user_id):
+        raise AuthError("cannot change your own role", status_code=403)
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "SELECT Role, CustomerId FROM Users WHERE Id = ?",
+            target_user_id_uuid,
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise AuthError("user not found", status_code=404)
+        target_role, target_customer_id = row
+
+        if caller.role == "Customer Admin":
+            if target_role == "Streetleaf Admin":
+                raise AuthError(
+                    "a Customer Admin cannot change the role of a Streetleaf Admin", status_code=403
+                )
+            if target_customer_id != caller.customer_id:
+                raise AuthError(
+                    "a Customer Admin can only change the role of users for their own customer",
+                    status_code=403,
+                )
+
+        new_role = _toggle_role(target_role, target_customer_id)
+
+        cursor.execute(
+            "UPDATE Users SET Role = ? WHERE Id = ?",
+            new_role,
+            target_user_id_uuid,
+        )
+        conn.commit()
+
+        # Same UserSessions revocation as delete_user()'s own -- see
+        # that function's own comment on binding target_user_id (the
+        # original string) rather than target_user_id_uuid here.
+        cursor.execute(
+            "UPDATE UserSessions SET RevokedAt = ? WHERE UserId = ? AND RevokedAt IS NULL",
+            _to_dto_string(datetime.now(timezone.utc)),
+            target_user_id,
+        )
+        conn.commit()
+    finally:
+        cursor.close()
+        conn.close()
+
+    return {"userId": str(target_user_id_uuid), "role": new_role, "customerId": target_customer_id}

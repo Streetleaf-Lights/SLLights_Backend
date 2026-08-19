@@ -89,9 +89,27 @@ class TestFetchSqlStructure:
         assert "GROUP BY" not in recent_pole_stats
 
     def test_total_lights_formula(self):
+        """totalLights now counts EVERY pole, unconditionally -- no
+        IsOnline/IsOpenIssueFault filtering at all, unlike the OLD
+        definition this replaced (which required IsOnline OR
+        IsOpenIssueFault)."""
+        sql = m._FETCH_SQL_TEMPLATE
+        assert "COUNT(*) AS TotalLights" in sql
+        # The old, narrower expression must be genuinely gone from
+        # TotalLights' own line, not just superseded -- confirms this
+        # wasn't a partial edit that left both present somehow.
+        total_lights_line = next(line for line in sql.splitlines() if "AS TotalLights" in line)
+        assert "IsOnline" not in total_lights_line
+        assert "IsOpenIssueFault" not in total_lights_line
+
+    def test_total_faults_still_scoped_to_the_old_narrower_population(self):
+        """DELIBERATELY not updated to match totalLights' own new,
+        broader "every pole" scope, by explicit request -- totalLights
+        and totalFaults are now computed over two different
+        populations, not one shared one."""
         sql = m._FETCH_SQL_TEMPLATE
         assert (
-            "SUM(CASE WHEN IsOnline = 1 OR IsOpenIssueFault = 1 THEN 1 ELSE 0 END) AS TotalLights"
+            "CASE WHEN (IsOnline = 1 OR IsOpenIssueFault = 1) AND IsPoleFault = 1 THEN 1 ELSE 0 END"
             in sql
         )
 
@@ -100,9 +118,12 @@ class TestFetchSqlStructure:
         assert "SUM(CASE WHEN IsOnline = 1 THEN 1 ELSE 0 END) AS ConnectedLights" in sql
 
     def test_total_faults_formula_requires_population_membership(self):
-        """A pole outside the population (not online, no open issue)
-        can't count as a fault either, by construction -- the formula
-        must check BOTH conditions, not just IsPoleFault alone."""
+        """A pole outside totalFaults' OWN (still-narrower) population
+        (not online, no open issue) can't count as a fault either, by
+        construction -- the formula must check BOTH conditions, not just
+        IsPoleFault alone. Note this is now a DIFFERENT, narrower
+        population than totalLights' own -- see
+        test_total_faults_still_scoped_to_the_old_narrower_population."""
         sql = m._FETCH_SQL_TEMPLATE
         faults_section = sql.split("AS TotalFaults")[0].split("SUM(")[-1]
         assert "IsOnline = 1 OR IsOpenIssueFault = 1" in faults_section

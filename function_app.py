@@ -22,6 +22,7 @@ from shared.poles_api import get_poles
 from shared.users_api import get_users
 from shared.auth_utils import AuthError, require_auth
 from shared.users_management_api import (
+    change_role,
     delete_user,
     forgot_password,
     invite_user,
@@ -866,6 +867,40 @@ def deleteUser(req: func.HttpRequest) -> func.HttpResponse:
 
     return func.HttpResponse(
         json.dumps({"success": True}), status_code=200, mimetype="application/json"
+    )
+
+
+@app.route(route="changeRole", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def changeRole(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Toggles a user's role between an Admin role and 'User', keeping them
+    within the same organization (Streetleaf or a specific Customer) --
+    see change_role()'s own docstring for exactly how the new role is
+    determined and revokes the target's active sessions immediately.
+    Streetleaf Admin or Customer Admin only -- see change_role()'s own
+    docstring for the full permission model (identical in structure to
+    deleteUser's own: Streetleaf Admin can change any Streetleaf
+    Admin/Customer Admin/User except itself; Customer Admin can change a
+    Customer Admin/User within their own customer only, never a
+    Streetleaf Admin; no caller can ever change their own role). Body:
+    {"userId": ...}.
+    """
+    try:
+        ctx = require_auth(req)
+        body = req.get_json()
+        result = change_role(ctx, target_user_id=body.get("userId"))
+    except AuthError as ex:
+        return _auth_error_response(ex)
+    except Exception as ex:
+        logging.error("changeRole: failed: %s", ex)
+        return func.HttpResponse(
+            json.dumps({"error": "internal error"}),
+            status_code=500,
+            mimetype="application/json",
+        )
+
+    return func.HttpResponse(
+        json.dumps(result), status_code=200, mimetype="application/json"
     )
 
 

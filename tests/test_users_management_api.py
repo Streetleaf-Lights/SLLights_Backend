@@ -780,3 +780,214 @@ class TestDeleteUser:
         assert not any(
             "UPDATE Users" in c.args[0] and "Status" in c.args[0] for c in calls
         )
+
+
+class TestToggleRole:
+    def test_streetleaf_admin_toggles_to_user(self):
+        assert users_management_api._toggle_role("Streetleaf Admin", None) == "User"
+
+    def test_customer_admin_toggles_to_user(self):
+        assert users_management_api._toggle_role("Customer Admin", "cust1") == "User"
+
+    def test_streetleaf_user_toggles_to_streetleaf_admin(self):
+        """A "Streetleaf User" -- role='User', customerId=None -- toggles
+        back to 'Streetleaf Admin', staying unscoped either way."""
+        assert users_management_api._toggle_role("User", None) == "Streetleaf Admin"
+
+    def test_customer_user_toggles_to_customer_admin(self):
+        """A customer-side User -- role='User', a real customerId --
+        toggles to 'Customer Admin', staying within that SAME customer
+        either way."""
+        assert users_management_api._toggle_role("User", "cust1") == "Customer Admin"
+
+
+class TestChangeRole:
+    def test_user_role_cannot_change_anyone_at_all(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        with pytest.raises(auth_utils.AuthError) as exc_info:
+            users_management_api.change_role(USER_ROLE, str(_uuid()))
+        assert exc_info.value.status_code == 403
+        mock_cursor.execute.assert_not_called()
+
+    def test_malformed_user_id_is_rejected_without_querying_the_database(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        with pytest.raises(auth_utils.AuthError) as exc_info:
+            users_management_api.change_role(STREETLEAF_ADMIN, "not-a-real-uuid")
+        assert exc_info.value.status_code == 400
+        mock_cursor.execute.assert_not_called()
+
+    def test_streetleaf_admin_cannot_change_its_own_role(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        """Checked before any database round trip -- a pure comparison
+        of already-known values, so no query should even run."""
+        with pytest.raises(auth_utils.AuthError, match="cannot change your own role") as exc_info:
+            users_management_api.change_role(STREETLEAF_ADMIN, STREETLEAF_ADMIN.user_id)
+        assert exc_info.value.status_code == 403
+        mock_cursor.execute.assert_not_called()
+
+    def test_customer_admin_cannot_change_its_own_role(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        with pytest.raises(auth_utils.AuthError, match="cannot change your own role") as exc_info:
+            users_management_api.change_role(CUSTOMER_ADMIN, CUSTOMER_ADMIN.user_id)
+        assert exc_info.value.status_code == 403
+        mock_cursor.execute.assert_not_called()
+
+    def test_streetleaf_admin_can_change_another_streetleaf_admin(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = ("Streetleaf Admin", None)
+
+        result = users_management_api.change_role(STREETLEAF_ADMIN, str(_uuid()))
+
+        assert result["role"] == "User"
+        assert result["customerId"] is None
+
+    def test_streetleaf_admin_can_change_any_customer_admin(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = ("Customer Admin", "some-other-customer")
+
+        result = users_management_api.change_role(STREETLEAF_ADMIN, str(_uuid()))
+
+        assert result["role"] == "User"
+        assert result["customerId"] == "some-other-customer"
+
+    def test_streetleaf_admin_can_change_any_user(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = ("User", "some-other-customer")
+
+        result = users_management_api.change_role(STREETLEAF_ADMIN, str(_uuid()))
+
+        assert result["role"] == "Customer Admin"
+        assert result["customerId"] == "some-other-customer"
+
+    def test_streetleaf_admin_can_promote_a_streetleaf_user(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        """A "Streetleaf User" (role='User', customerId=None) promotes
+        back to 'Streetleaf Admin', not 'Customer Admin' -- staying
+        unscoped, the organization it already belonged to."""
+        mock_cursor.fetchone.return_value = ("User", None)
+
+        result = users_management_api.change_role(STREETLEAF_ADMIN, str(_uuid()))
+
+        assert result["role"] == "Streetleaf Admin"
+        assert result["customerId"] is None
+
+    def test_customer_admin_cannot_change_a_streetleaf_admin(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = ("Streetleaf Admin", None)
+
+        with pytest.raises(
+            auth_utils.AuthError, match="a Customer Admin cannot change the role of a Streetleaf Admin"
+        ) as exc_info:
+            users_management_api.change_role(CUSTOMER_ADMIN, str(_uuid()))
+        assert exc_info.value.status_code == 403
+
+    def test_customer_admin_can_change_customer_admin_of_own_customer(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = ("Customer Admin", CUSTOMER_ADMIN.customer_id)
+
+        result = users_management_api.change_role(CUSTOMER_ADMIN, str(_uuid()))
+
+        assert result["role"] == "User"
+        assert result["customerId"] == CUSTOMER_ADMIN.customer_id
+
+    def test_customer_admin_cannot_change_customer_admin_of_other_customer(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = ("Customer Admin", "some-other-customer")
+
+        with pytest.raises(
+            auth_utils.AuthError, match="only change the role of users for their own customer"
+        ) as exc_info:
+            users_management_api.change_role(CUSTOMER_ADMIN, str(_uuid()))
+        assert exc_info.value.status_code == 403
+
+    def test_customer_admin_can_change_user_of_own_customer(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = ("User", CUSTOMER_ADMIN.customer_id)
+
+        result = users_management_api.change_role(CUSTOMER_ADMIN, str(_uuid()))
+
+        assert result["role"] == "Customer Admin"
+        assert result["customerId"] == CUSTOMER_ADMIN.customer_id
+
+    def test_customer_admin_cannot_change_user_of_other_customer(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = ("User", "some-other-customer")
+
+        with pytest.raises(
+            auth_utils.AuthError, match="only change the role of users for their own customer"
+        ) as exc_info:
+            users_management_api.change_role(CUSTOMER_ADMIN, str(_uuid()))
+        assert exc_info.value.status_code == 403
+
+    def test_wellformed_but_nonexistent_user_raises_404(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = None
+
+        with pytest.raises(auth_utils.AuthError) as exc_info:
+            users_management_api.change_role(STREETLEAF_ADMIN, str(_uuid()))
+        assert exc_info.value.status_code == 404
+
+    def test_successful_change_updates_role_and_revokes_sessions(
+        self, patch_get_connection_users_management, mock_conn, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = ("User", "cust1")
+
+        users_management_api.change_role(STREETLEAF_ADMIN, str(_uuid()))
+
+        calls = mock_cursor.execute.call_args_list
+        update_call = next(c for c in calls if c.args[0].strip().upper().startswith("UPDATE USERS"))
+        assert update_call.args[1] == "Customer Admin"  # the new, toggled role
+        assert any("UPDATE UserSessions" in c.args[0] for c in calls)
+        assert mock_conn.commit.call_count == 2  # once for the role UPDATE, once for the session revoke
+
+    def test_user_sessions_update_binds_the_original_string_not_a_uuid_object(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        """UserSessions.UserId is VARCHAR -- the incoming string form of
+        target_user_id belongs there, not the uuid.UUID object parsed
+        out for the Users-table UPDATE just above it."""
+        mock_cursor.fetchone.return_value = ("User", "cust1")
+        target_user_id = str(_uuid())
+
+        users_management_api.change_role(STREETLEAF_ADMIN, target_user_id)
+
+        sessions_call = next(
+            c for c in mock_cursor.execute.call_args_list if "UPDATE UserSessions" in c.args[0]
+        )
+        bound_user_id = sessions_call.args[2]
+        assert bound_user_id == target_user_id
+        assert isinstance(bound_user_id, str)
+
+    def test_does_not_touch_name_email_or_customer_id(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        """Deliberately out of scope for this function -- only Role is
+        ever written; CustomerId (and everything else) stays untouched,
+        which is the entire mechanism behind "keeping the same
+        organization"."""
+        mock_cursor.fetchone.return_value = ("User", "cust1")
+
+        users_management_api.change_role(STREETLEAF_ADMIN, str(_uuid()))
+
+        update_call = next(
+            c for c in mock_cursor.execute.call_args_list
+            if c.args[0].strip().upper().startswith("UPDATE USERS")
+        )
+        update_sql = update_call.args[0]
+        assert "Name" not in update_sql
+        assert "Email" not in update_sql
+        assert "CustomerId" not in update_sql

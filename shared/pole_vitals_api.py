@@ -12,12 +12,14 @@ from shared.sql_client import get_connection
 # Deliberately NOT LastKnown48Hours, unlike _POLE_DETAIL_PERIOD_TYPE
 # below -- a silent pole's LastKnown48Hours.IsOnline reflects whether it
 # was online during its own LAST KNOWN window, not whether it's online
-# RIGHT NOW, so counting that toward connectedLights/totalLights would
-# silently resurrect a long-silent pole into the "currently connected"
-# population it's specifically meant to exclude from. This is a
-# deliberate choice, made explicitly for this rollup -- see
-# _POLE_DETAIL_PERIOD_TYPE's own comment for why the per-pole detail
-# fields make the opposite choice.
+# RIGHT NOW, so counting that toward connectedLights/totalFaults would
+# silently resurrect a long-silent pole into the "currently connected"/
+# "currently faulty" status it's specifically meant to exclude from
+# (totalLights itself no longer depends on this at all -- see
+# _FETCH_SQL_TEMPLATE's own comment -- but connectedLights/totalFaults
+# both still do). This is a deliberate choice, made explicitly for this
+# rollup -- see _POLE_DETAIL_PERIOD_TYPE's own comment for why the
+# per-pole detail fields make the opposite choice.
 _ROLLUP_PERIOD_TYPE = "Last48Hours"
 
 # Which PoleVitals period type drives the PER-POLE detail fields
@@ -49,33 +51,57 @@ _POLE_DETAIL_PERIOD_TYPE = "LastKnown48Hours"
 # Population/rollup design (replaces the earlier LightStatus-based
 # workingPercentage/optimisticWorkingPercentage/totalNonTelemetryAvailable
 # entirely):
-#   totalLights (population) = poles that are IsOnline, PLUS poles that
-#     are NOT online but DO have an open issue (IsOpenIssueFault) -- a
-#     pole that's neither online nor known to have an issue is excluded
-#     from the population entirely, not counted as "not working". This
-#     is a deliberate redefinition: such a pole (never reported, or gone
-#     silent with nothing filed against it) is treated as outside the
-#     currently-relevant fleet, not as a broken one.
-#   connectedLights = poles that are IsOnline (a strict subset of
-#     totalLights above).
-#   totalFaults = poles WITHIN the population above whose IsPoleFault is
-#     true -- a pole excluded from the population can't be a "fault"
-#     either, by construction.
+#   totalLights (population) = EVERY pole belonging to the project,
+#     full stop -- no IsOnline/IsOpenIssueFault filtering at all. This
+#     was previously a narrower definition (IsOnline poles, PLUS poles
+#     that are NOT online but DO have an open issue -- a pole neither
+#     online nor known to have an issue was excluded from the
+#     population entirely); changed to simply mean "every pole", by
+#     explicit request.
+#   connectedLights = poles that are IsOnline. Unchanged by the above --
+#     no longer a strict subset of totalLights by construction the way
+#     it used to be (a pole with IsOnline=0 no longer implies it's
+#     excluded from totalLights the way it once did, since totalLights
+#     doesn't exclude anything anymore), though every IsOnline pole is
+#     still, naturally, also counted in totalLights.
+#   totalFaults = poles satisfying the OLD population definition above
+#     (IsOnline OR IsOpenIssueFault) whose IsPoleFault is also true --
+#     DELIBERATELY NOT updated to match totalLights' own new, broader
+#     "every pole" scope, by explicit request. This means totalLights
+#     and totalFaults are now computed over two DIFFERENT populations,
+#     not one shared one -- worth being explicit about, since it's easy
+#     to assume otherwise from the variable names alone. A pole that's
+#     neither online nor has an open issue can never contribute to
+#     totalFaults, regardless of its own IsPoleFault value, exactly as
+#     before this change.
 #   percentWorking = (totalLights - totalFaults) / totalLights * 100 --
-#     computed in Python (_percent_working()), not SQL, same reasoning
-#     as everywhere else numeric rollups are computed here.
+#     the FORMULA itself is unchanged, computed in Python
+#     (_percent_working()), not SQL, same reasoning as everywhere else
+#     numeric rollups are computed here. Its own RESULT changes as a
+#     direct consequence of totalLights' own redefinition above, though:
+#     every pole now folded into totalLights that ISN'T also captured by
+#     totalFaults' own narrower population (e.g. a silent pole with no
+#     open issue, previously excluded from both entirely) enlarges the
+#     denominator without enlarging the numerator's subtraction,
+#     pushing percentWorking upward for a project with such poles,
+#     purely as a byproduct of the population mismatch above -- not a
+#     claim that those specific poles are actually confirmed working.
 #
-# "IsOnline = 1 OR IsOpenIssueFault = 1" needs no explicit NULL-handling:
-# a pole with no Last48Hours row at all gets NULL for both columns via
-# the LEFT JOIN below, and "NULL = 1" is UNKNOWN (not TRUE) in T-SQL, so
-# it naturally falls through to "not in the population" without an
-# ISNULL() guard.
+# "IsOnline = 1 OR IsOpenIssueFault = 1" (in TotalFaults' own CASE
+# below) needs no explicit NULL-handling: a pole with no Last48Hours row
+# at all gets NULL for both columns via the LEFT JOIN below, and
+# "NULL = 1" is UNKNOWN (not TRUE) in T-SQL, so it naturally falls
+# through to "not counted toward TotalFaults" without an ISNULL() guard.
+# TotalLights itself no longer needs any such condition at all -- COUNT(*)
+# counts every row in PoleWithStatus regardless of which of its columns
+# are NULL, which is exactly "every pole" now.
 #
 # LEFT JOIN Poles->RecentPoleStats (not INNER): a pole with no
 # Last48Hours row yet (installed, but no telemetry processed for it, or
 # none recent enough to be in the rolling window) must still be
-# considered -- it just won't satisfy the population condition above
-# unless it has an open issue.
+# considered -- it's now unconditionally counted in totalLights either
+# way, and still won't satisfy TotalFaults' own population condition
+# unless it has an open issue, same as before.
 #
 # LEFT JOIN Projects->ProjectAgg (not INNER): a project with zero poles
 # must still appear, with every count column at 0, rather than being
@@ -99,7 +125,7 @@ PoleWithStatus AS (
 ProjectAgg AS (
     SELECT
         ProjectId,
-        SUM(CASE WHEN IsOnline = 1 OR IsOpenIssueFault = 1 THEN 1 ELSE 0 END) AS TotalLights,
+        COUNT(*) AS TotalLights,
         SUM(CASE WHEN IsOnline = 1 THEN 1 ELSE 0 END) AS ConnectedLights,
         SUM(
             CASE WHEN (IsOnline = 1 OR IsOpenIssueFault = 1) AND IsPoleFault = 1 THEN 1 ELSE 0 END
@@ -503,14 +529,17 @@ def get_pole_vitals(customer_id: str = None, project_id: str = None, limit: int 
     types are structured that way; no window-aggregation happens at
     this API layer at all anymore).
 
-    Rollup design: totalLights (population) counts poles that are
-    IsOnline, PLUS poles that aren't online but DO have an open issue
-    (IsOpenIssueFault) -- a pole that's neither online nor known to have
-    an issue is excluded from the population entirely, not counted as
-    broken. connectedLights is just the IsOnline poles. totalFaults is
-    poles WITHIN that population whose IsPoleFault is true. percentWorking
-    is (totalLights - totalFaults) / totalLights * 100. See
-    _FETCH_SQL_TEMPLATE's own comment for the full reasoning.
+    Rollup design: totalLights counts EVERY pole belonging to the
+    project, full stop -- no IsOnline/IsOpenIssueFault filtering.
+    connectedLights is just the IsOnline poles. totalFaults is
+    DELIBERATELY still scoped to the OLD, narrower population (IsOnline
+    poles, plus poles that aren't online but DO have an open issue) --
+    not updated to match totalLights' own broader "every pole" scope, by
+    explicit request, so the two are now computed over different
+    populations. percentWorking is (totalLights - totalFaults) /
+    totalLights * 100. See _FETCH_SQL_TEMPLATE's own comment for the
+    full reasoning, including the practical consequence of totalLights
+    and totalFaults no longer sharing one population.
 
     installDate/lat/long come straight from Poles -- static, unrelated to
     any telemetry or vitals data (present even for a pole with neither).

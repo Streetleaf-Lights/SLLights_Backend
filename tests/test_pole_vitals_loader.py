@@ -1253,6 +1253,17 @@ class TestLoadPoleVitalsFailureRecordingUsesAFreshConnection:
     pole_timezones_loader.py's own equivalent, and this module's own
     backfill_*_for_all_poles() functions -- load_pole_vitals() itself was
     the one loader in this project that had never had it applied.
+
+    The ORIGINAL trigger for this class (execute() fails, then
+    conn.rollback() ALSO fails, within an inner except block) no longer
+    reaches this top-level handler at all -- _safe_rollback() now
+    contains that failure locally (see TestSafeRollback and
+    TestLoadPoleVitalsRollbackFailureIsContained below), which is a
+    genuine improvement, not a regression: one period type's rollback
+    failing no longer crashes the entire run. This class's own tests
+    below use a DIFFERENT, still-valid trigger instead -- the final,
+    step-3 SP_Execution UPDATE itself failing, which isn't preceded by
+    any rollback and so still reaches this exact handler unchanged.
     """
 
     def _make_conn(self):
@@ -1264,20 +1275,17 @@ class TestLoadPoleVitalsFailureRecordingUsesAFreshConnection:
     def test_original_exception_still_raised_when_recording_succeeds(self, mocker):
         main_conn, main_cursor = self._make_conn()
         main_cursor.fetchone.return_value = (55,)
-        # Reproduces the exact reported cascade: the LastKnown48Hours
-        # fresh-compute statement (the 9th execute() call -- insert,
-        # Hour MERGE+prune, Day MERGE+prune, Last48Hours MERGE+cleanup,
-        # LastKnown48Hours copy, THEN this one) fails with a
-        # communication link failure, and the inner except block's own
-        # conn.rollback() ALSO fails with the same error, escaping that
-        # block's own handling entirely.
+        main_cursor.rowcount = 5  # a real int -- avoids a TypeError from the rowcount-tracking comparison itself
+        # All 9 recompute-phase calls succeed (insert, Hour MERGE+prune,
+        # Day MERGE+prune, Last48Hours MERGE+cleanup, LastKnown48Hours
+        # copy+fresh-compute); the 10th call -- step 3's own final
+        # SP_Execution UPDATE -- is what fails here. Not preceded by any
+        # rollback, so this reaches the top-level except block directly,
+        # unrelated to _safe_rollback() entirely.
         main_cursor.execute.side_effect = [
-            None, None, None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None,
             pyodbc.OperationalError("08S01", "Communication link failure (SQLExecDirectW)"),
         ]
-        main_conn.rollback.side_effect = pyodbc.OperationalError(
-            "08S01", "Communication link failure (SQLEndTran)"
-        )
 
         recovery_conn, recovery_cursor = self._make_conn()
 
@@ -1286,7 +1294,7 @@ class TestLoadPoleVitalsFailureRecordingUsesAFreshConnection:
             side_effect=[main_conn, recovery_conn],
         )
 
-        with pytest.raises(pyodbc.OperationalError, match="SQLEndTran"):
+        with pytest.raises(pyodbc.OperationalError, match="SQLExecDirectW"):
             pole_vitals_loader.load_pole_vitals()
 
         assert recovery_cursor.execute.called
@@ -1294,7 +1302,7 @@ class TestLoadPoleVitalsFailureRecordingUsesAFreshConnection:
             recovery_cursor.execute.call_args.args
         )
         assert "UPDATE SP_Execution" in update_sql
-        assert "SQLEndTran" in error_message
+        assert "SQLExecDirectW" in error_message
         assert sp_exec_id == 55
         recovery_conn.commit.assert_called_once()
         recovery_cursor.close.assert_called_once()
@@ -1305,11 +1313,11 @@ class TestLoadPoleVitalsFailureRecordingUsesAFreshConnection:
     def test_original_exception_still_raised_when_recording_also_fails(self, mocker, caplog):
         main_conn, main_cursor = self._make_conn()
         main_cursor.fetchone.return_value = (55,)
+        main_cursor.rowcount = 5
         main_cursor.execute.side_effect = [
-            None, None, None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None,
             RuntimeError("original communication failure"),
         ]
-        main_conn.rollback.side_effect = RuntimeError("rollback also failed")
 
         recovery_conn, recovery_cursor = self._make_conn()
         recovery_cursor.execute.side_effect = RuntimeError("recovery also failed")
@@ -1320,15 +1328,93 @@ class TestLoadPoleVitalsFailureRecordingUsesAFreshConnection:
         )
 
         with caplog.at_level("ERROR"):
-            with pytest.raises(RuntimeError, match="rollback also failed"):
+            with pytest.raises(RuntimeError, match="original communication failure"):
                 pole_vitals_loader.load_pole_vitals()
 
         error_messages = [rec.message for rec in caplog.records if rec.levelname == "ERROR"]
-        assert any("rollback also failed" in msg for msg in error_messages)
+        assert any("original communication failure" in msg for msg in error_messages)
         assert any(
             "additionally failed to record this run's failure" in msg and "recovery also failed" in msg
             for msg in error_messages
         )
+
+
+class TestSafeRollback:
+    def test_successful_rollback_does_nothing_extra(self, caplog):
+        conn = MagicMock()
+
+        with caplog.at_level("WARNING"):
+            pole_vitals_loader._safe_rollback(conn, "someContext")
+
+        conn.rollback.assert_called_once()
+        assert not any(rec.levelname == "WARNING" for rec in caplog.records)
+
+    def test_failed_rollback_is_caught_and_logged_as_a_warning_not_reraised(self, caplog):
+        conn = MagicMock()
+        conn.rollback.side_effect = RuntimeError("connection already broken")
+
+        with caplog.at_level("WARNING"):
+            pole_vitals_loader._safe_rollback(conn, "someContext")  # must not raise
+
+        warning_messages = [rec.message for rec in caplog.records if rec.levelname == "WARNING"]
+        assert any("someContext" in msg and "connection already broken" in msg for msg in warning_messages)
+
+
+class TestLoadPoleVitalsRollbackFailureIsContained:
+    """
+    Confirms the actual fix for the originally-reported incident: when
+    LastKnown48Hours' own execute() fails AND the subsequent rollback
+    ALSO fails, load_pole_vitals() no longer crashes the entire run --
+    _safe_rollback() contains it, the ORIGINAL error (not the rollback's
+    own) gets logged with full context, and the run completes normally,
+    recording this as one counted error rather than an uncaught,
+    "n/a"-style crash with no useful message anywhere in the logs.
+    """
+
+    def test_run_completes_without_raising(
+        self, patch_get_connection_pole_vitals, mock_conn, mock_cursor, caplog
+    ):
+        mock_cursor.fetchone.return_value = (1,)
+        mock_cursor.rowcount = 5
+        # index 7 = LastKnown48Hours copy (ok), index 8 = fresh-compute (fails)
+        mock_cursor.execute.side_effect = [
+            None, None, None, None, None, None, None, None,
+            pyodbc.OperationalError("08S01", "Communication link failure (SQLExecDirectW)"),
+            None,
+        ]
+        mock_conn.rollback.side_effect = pyodbc.OperationalError(
+            "08S01", "Communication link failure (SQLEndTran)"
+        )
+
+        with caplog.at_level("ERROR"):
+            pole_vitals_loader.load_pole_vitals()  # must NOT raise
+
+        error_messages = [rec.message for rec in caplog.records if rec.levelname == "ERROR"]
+        assert any(
+            "failed to recompute LastKnown48Hours" in msg and "SQLExecDirectW" in msg
+            for msg in error_messages
+        )
+
+    def test_final_update_still_counts_this_as_one_error(
+        self, patch_get_connection_pole_vitals, mock_conn, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = (1,)
+        mock_cursor.rowcount = 5
+        mock_cursor.execute.side_effect = [
+            None, None, None, None, None, None, None, None,
+            RuntimeError("original failure"),
+            None,
+        ]
+        mock_conn.rollback.side_effect = RuntimeError("rollback also failed")
+
+        pole_vitals_loader.load_pole_vitals()
+
+        final_update_args = mock_cursor.execute.call_args_list[-1].args
+        success, errors = final_update_args[2], final_update_args[3]
+        # Hour/Day/Last48Hours (5 each = 15) succeeded; LastKnown48Hours
+        # counted as exactly 1 error, same as any other period type's
+        # own isolated failure.
+        assert (success, errors) == (15, 1)
 
 
 # --------------------------------------------------------------------------

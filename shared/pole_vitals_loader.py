@@ -1831,6 +1831,43 @@ def _is_benign_null_aggregate_warning(exc: Exception) -> bool:
     return bool(args) and args[0] == "01003"
 
 
+def _safe_rollback(conn, context: str) -> None:
+    """
+    Attempts conn.rollback(), but never lets a FAILED rollback itself
+    replace/mask whatever original exception the caller is already
+    handling. Confirmed in practice as a real production incident: if
+    the connection is already broken (e.g. the same class of 08S01
+    "Communication link failure" this project has already hit once, in
+    load_pole_vitals()'s own top-level except block, before that one got
+    its own fresh-connection fix), conn.rollback() can ITSELF raise --
+    and since every caller of this helper originally called
+    conn.rollback() BEFORE its own logging.error() describing the REAL
+    problem, that logging.error() call never ran at all. The original,
+    useful error message (which period type, which step, what actually
+    failed) was silently lost, replaced by an uninformative
+    connection-level exception with no context -- exactly the shape of
+    the "n/a" / no-descriptive-message failures this was built to
+    prevent going forward.
+
+    A failed rollback here isn't a NEW problem needing its own separate
+    handling or its own error-level log entry -- the connection is
+    already on its way to being closed in the caller's own top-level
+    `finally` block regardless (nothing further to protect by rolling
+    back successfully), so this is logged as a warning, not re-raised.
+    context is purely for that log line, so it's traceable to which
+    caller's own rollback attempt this was.
+    """
+    try:
+        conn.rollback()
+    except Exception as rollback_error:
+        logging.warning(
+            "%s: rollback itself failed (connection likely already broken, same underlying "
+            "cause as whatever the ORIGINAL failure being handled was) -- %s",
+            context,
+            rollback_error,
+        )
+
+
 def load_pole_vitals(backfill: bool = False) -> None:
     """
     Recomputes PoleVitals from PoleTelemetry + PoleModels + PoleTimeZones.
@@ -1964,7 +2001,11 @@ def load_pole_vitals(backfill: bool = False) -> None:
                     # whatever ambiguous uncommitted state the failed
                     # statement left behind) before moving on to the
                     # next period type in the same connection/transaction.
-                    conn.rollback()
+                    # _safe_rollback (not conn.rollback() directly) --
+                    # see that helper's own docstring for why: a FAILED
+                    # rollback here must not prevent the logging.error()
+                    # right below from actually running.
+                    _safe_rollback(conn, f"loadPoleVitals ({period_type})")
                     total_errors += 1
                     logging.error(
                         "loadPoleVitals: failed to recompute %s period (rolled back, other "
@@ -2024,7 +2065,21 @@ def load_pole_vitals(backfill: bool = False) -> None:
                     freshly_computed,
                 )
             else:
-                conn.rollback()
+                # _safe_rollback (not conn.rollback() directly) -- see
+                # that helper's own docstring for why: a FAILED rollback
+                # here must not prevent the logging.error() right below
+                # from actually running. Confirmed in practice as the
+                # likely cause of a real production incident: a
+                # generic, undescriptive "n/a" failure with NEITHER this
+                # step's own success message NOR this specific error
+                # message appearing anywhere in the logs -- exactly what
+                # happens when conn.rollback() itself fails first
+                # (because the connection was already broken, e.g. by
+                # the same class of 08S01 failure this project has
+                # already hit once elsewhere) and its own exception
+                # silently replaces last_known_error before this
+                # logging.error() call ever gets a chance to run.
+                _safe_rollback(conn, "loadPoleVitals (LastKnown48Hours)")
                 total_errors += 1
                 logging.error(
                     "loadPoleVitals: failed to recompute LastKnown48Hours (rolled back, other "
@@ -2199,7 +2254,7 @@ def backfill_latest_hour_for_all_poles() -> None:
                     total_success,
                 )
             else:
-                conn.rollback()
+                _safe_rollback(conn, "backfillLatestHourPoleVitals")
                 total_errors = 1
                 logging.error(
                     "backfillLatestHourPoleVitals: MERGE failed (rolled back): %s", merge_error
@@ -2368,7 +2423,7 @@ def backfill_last_48_hours_of_hour_for_all_poles() -> None:
                     total_success,
                 )
             else:
-                conn.rollback()
+                _safe_rollback(conn, "backfillLast48HoursOfHourPoleVitals")
                 total_errors = 1
                 logging.error(
                     "backfillLast48HoursOfHourPoleVitals: MERGE failed (rolled back): %s", merge_error

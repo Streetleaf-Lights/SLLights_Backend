@@ -21,12 +21,12 @@ LEFT JOIN Poles p ON t.LocationId = p.LocationId
 WHERE 1 = 1
 -- AND t.LocationId LIKE '%12057-1398%'
 -- and PeriodStart not like '%-04:%'
--- AND IsOnline = 0
--- AND PeriodStart >= '2026-08-14 19:00:00'
+AND IsOnline = 0
+-- AND PeriodStart >= '2026-08-17 19:00:00'
 -- AND IsPoleFault = 0
-AND PoleNumber = 'PAS-4938'
+-- AND PoleNumber = 'PAS-4938'
 -- AND IsOpenIssueFault = 1
--- AND (PeriodType = 'Last48Hours')
+AND (PeriodType = 'Last48Hours')
 ORDER BY PoleNumber, LocationId, PeriodStart DESC;
 
 -- SELECT LocationId, COUNT(*)
