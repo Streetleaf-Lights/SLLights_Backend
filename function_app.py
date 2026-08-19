@@ -640,10 +640,19 @@ def _auth_error_response(ex: AuthError) -> func.HttpResponse:
 @app.route(route="inviteUser", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
 def inviteUser(req: func.HttpRequest) -> func.HttpResponse:
     """
-    Streetleaf-Admin-only: creates a Pending user and emails them an
-    invite link. Body: {"name": ..., "email": ..., "role": "Customer
-    Admin" | "Streetleaf Admin", "customerId": ... (required iff role is
-    "Customer Admin")}.
+    Creates a Pending user and emails them an invite link. Streetleaf
+    Admin or Customer Admin only (see invite_user()'s own docstring for
+    the full permission model: Streetleaf Admin can invite any role;
+    Customer Admin can invite "Customer Admin"/"User" but not
+    "Streetleaf Admin", and only for their own customer -- customerId is
+    forced to their own regardless of what's passed, and an explicitly
+    passed, mismatched one is rejected). Body: {"name": ..., "email":
+    ..., "role": "Streetleaf Admin" | "Customer Admin" | "User",
+    "customerId": ... (required for "Customer Admin"; optional for
+    "User" -- present means a customer-side user, absent means a
+    "Streetleaf User" with no customer association, same as Streetleaf
+    Admin itself; ignored/forced to the caller's own for a Customer
+    Admin caller either way, see above)}.
     """
     try:
         ctx = require_auth(req)
@@ -831,11 +840,15 @@ def resetPassword(req: func.HttpRequest) -> func.HttpResponse:
 @app.route(route="deleteUser", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
 def deleteUser(req: func.HttpRequest) -> func.HttpResponse:
     """
-    Streetleaf-Admin-only: PERMANENTLY removes a user (a hard delete,
-    not a deactivation -- see delete_user()'s own docstring for the
-    earlier soft-delete design this replaced, and why it's not
-    reversible) and revokes their active sessions. Query param:
-    ?userId=X.
+    PERMANENTLY removes a user (a hard delete, not a deactivation -- see
+    delete_user()'s own docstring for the earlier soft-delete design
+    this replaced, and why it's not reversible) and revokes their active
+    sessions. Streetleaf Admin or Customer Admin only -- see
+    delete_user()'s own docstring for the full permission model
+    (Streetleaf Admin can delete any Streetleaf Admin/Customer Admin/
+    User except itself; Customer Admin can delete a Customer Admin/User
+    within their own customer only, never a Streetleaf Admin; no caller
+    can ever delete their own account). Query param: ?userId=X.
     """
     try:
         ctx = require_auth(req)

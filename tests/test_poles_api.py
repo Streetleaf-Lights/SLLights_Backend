@@ -156,7 +156,8 @@ class TestPoleRowToDictWithParents:
     def test_adds_project_and_customer_id_to_the_shared_dict(self):
         row = (
             "proj1", "pole1", "PN-1", "LOC-1", "2025-01-01", 28.0, -82.0,
-            "2026-07-31 08:00:00 -04:00", 12.6, 12.4,
+            "2026-07-31 08:00:00 -04:00", "CC-100", 7, "PROD-42", "jdoe",
+            12.6, 12.4,
             8.7, 8.6, 15.0, 15.2, 18.0, 2.0, 13.5,
             True, False, False, False, False, False,
             89.0, 45.0, 0.0, "cust1",
@@ -217,7 +218,8 @@ class TestGetPoles:
     ):
         row = (
             "proj1", "pole1", "PN-1", "LOC-1", "2025-01-01", 28.0, -82.0,
-            "2026-07-31 08:00:00 -04:00", 12.6, 12.4,
+            "2026-07-31 08:00:00 -04:00", "CC-100", 7, "PROD-42", "jdoe",
+            12.6, 12.4,
             8.7, 8.6, 15.0, 15.2, 18.0, 2.0, 13.5,
             True, False, False, False, False, False,
             89.0, 45.0, 0.0, "cust1",

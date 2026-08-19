@@ -7,10 +7,25 @@ password, and delete (a real row removal -- see delete_user()'s own
 docstring for the earlier soft-delete design this replaced, and why the
 change isn't reversible).
 
-Role model: 'Streetleaf Admin' can invite, resend invite, and delete
-users; 'Customer Admin' cannot do any of the three (an explicit
-requirement) -- all are enforced via shared/auth_utils.py's
-require_role(), not re-implemented here.
+Role model, three roles: 'Streetleaf Admin' (broad access, not scoped to
+one customer), 'Customer Admin' (restricted to their own CustomerId's
+data), and 'User' (also restricted to their own CustomerId's data, with
+narrower permissions than Customer Admin within it -- the specific
+differences are enforced wherever else in this project reads ctx.role,
+not re-litigated here). Invite permissions specifically (see
+invite_user()'s own docstring for the full reasoning): Streetleaf Admin
+can invite any of the three; Customer Admin can invite Customer
+Admin/User (but not Streetleaf Admin), and only for their own
+CustomerId; User cannot invite at all. Delete permissions (see
+delete_user()'s own docstring for the full reasoning) are structurally
+similar: Streetleaf Admin can delete any Streetleaf Admin/Customer
+Admin/User except itself; Customer Admin can delete a Customer
+Admin/User within their own CustomerId only, never a Streetleaf Admin;
+User cannot delete anyone. No caller, of any role, can ever delete their
+own account. resend_invite() remains Streetleaf-Admin-only for now --
+see its own docstring for why that's narrower than invite_user()'s (and
+now delete_user()'s) own model, and how to widen it later if that turns
+out to be wanted too.
 
 Anti-enumeration note, worth being explicit about: sign_in() and
 forgot_password() are both deliberately designed so their behavior
@@ -23,7 +38,7 @@ deliberate, standard security practice for these two flows specifically
 -- it does NOT apply to invite_user()/resend_invite(), where a
 nonexistent/wrong-status target SHOULD produce a clear, specific error,
 since those endpoints are only reachable by an already-authenticated
-Streetleaf Admin, not a public/anonymous caller.
+caller with real invite permissions, not a public/anonymous caller.
 """
 
 import logging
@@ -45,7 +60,7 @@ from shared.datetime_utils import to_dto_string as _to_dto_string
 from shared.email_client import EmailSendError, send_email
 from shared.sql_client import get_connection
 
-_VALID_ROLES = ("Streetleaf Admin", "Customer Admin")
+_VALID_ROLES = ("Streetleaf Admin", "Customer Admin", "User")
 
 
 def _parse_uuid(value, error_message: str) -> uuid.UUID:
@@ -109,13 +124,63 @@ def _send_invite_email(user_id, name: str, email: str, token: str, operation_nam
         return False
 
 
+def _normalize_customer_id(value):
+    """
+    Treats None, an empty/whitespace-only string, and the literal string
+    "null" (case-insensitive) as all meaning the exact same thing: "no
+    customerId was actually given" -- not three different
+    representations of it. Defends against a caller (or a buggy
+    frontend) sending customerId as "" or the string "null" instead of
+    genuinely omitting the key or sending JSON null -- either of those
+    would otherwise slip straight past a plain `if customer_id` check,
+    since both are non-empty, truthy strings in Python. Returns the
+    ORIGINAL, unmodified value for anything that isn't one of these --
+    doesn't strip/alter a genuine customerId's own content, only decides
+    whether it counts as "missing" at all.
+    """
+    if value is None:
+        return None
+    stripped = value.strip()
+    if not stripped or stripped.lower() == "null":
+        return None
+    return value
+
+
 def invite_user(
     inviter: AuthContext, name: str, email: str, role: str, customer_id: str = None
 ) -> dict:
     """
     Creates a Pending user record and emails an invite link (the
-    admin-initiated "create"). Only a Streetleaf Admin may call this --
-    an explicit requirement, not an incidental default.
+    admin-initiated "create").
+
+    Permission model -- an explicit requirement, not an incidental
+    default: 'Streetleaf Admin' can invite any of the three roles.
+    'Customer Admin' can invite 'Customer Admin'/'User' but NOT
+    'Streetleaf Admin' (can't create a role with more privilege than
+    their own), and -- critically, since 'Customer Admin' wasn't
+    permitted to invite AT ALL before this -- only ever for their OWN
+    CustomerId, never an arbitrary one: customer_id is silently forced
+    to inviter.customer_id for a Customer Admin caller (an explicitly
+    passed, MISMATCHED customer_id is rejected outright, rather than
+    silently overridden, so a caller relying on it being honored finds
+    out immediately rather than getting a quietly different result than
+    what they asked for). Without this, any Customer Admin could invite
+    a Customer Admin/User for a DIFFERENT customer entirely -- a genuine
+    cross-tenant privilege-escalation hole, not a hypothetical one.
+    'User' cannot invite at all -- require_role() below rejects that
+    caller before anything else runs.
+
+    'User' is legitimately valid with EITHER a customerId (a
+    customer-side user) or WITHOUT one (a "Streetleaf User" -- e.g.
+    Streetleaf's own staff who need ordinary, non-admin access, the same
+    way Streetleaf Admin itself has no customerId). Only a Streetleaf
+    Admin caller can actually produce the unscoped case -- a Customer
+    Admin caller's own customer_id is always forced to their own value
+    per the paragraph above, so they can never create an unscoped user
+    even if they wanted to. This is genuinely different from 'Customer
+    Admin', which DOES always require a customerId (there's no
+    equivalent "unscoped Customer Admin" concept) -- see the check
+    itself, further down, for exactly where these two diverge.
 
     If a Pending invite already exists for this email and just needs a
     fresh link (e.g. the original expired, or the email got lost), use
@@ -123,11 +188,50 @@ def invite_user(
     doesn't distinguish Pending from Active, so calling this again for
     an email that's already Pending fails with 409, by design (see
     resend_invite()'s own docstring for the full reasoning).
+
+    customer_id is normalized via _normalize_customer_id() before any of
+    the checks below run -- None, "", whitespace-only, and the literal
+    string "null" are all treated identically as "not given", not three
+    separately-handled cases.
     """
-    require_role(inviter, ["Streetleaf Admin"])
+    require_role(inviter, ["Streetleaf Admin", "Customer Admin"])
+    customer_id = _normalize_customer_id(customer_id)
 
     if role not in _VALID_ROLES:
         raise AuthError(f"role must be one of: {', '.join(_VALID_ROLES)}", status_code=400)
+
+    if inviter.role == "Customer Admin":
+        if role == "Streetleaf Admin":
+            raise AuthError("a Customer Admin cannot invite a Streetleaf Admin", status_code=403)
+        if customer_id and customer_id != inviter.customer_id:
+            raise AuthError(
+                "a Customer Admin can only invite users for their own customer", status_code=403
+            )
+        # role is now known to be 'Customer Admin' or 'User' (the only
+        # two not already rejected above). A Customer Admin caller can
+        # never create an unscoped user (there's no such thing as an
+        # "unscoped Customer Admin" invite, and this caller specifically
+        # isn't permitted to create an unscoped "Streetleaf User"
+        # either -- only a Streetleaf Admin can do that, see below), so
+        # the only customer_id that can ever be correct here is the
+        # inviter's own. Set unconditionally (not just when customer_id
+        # was omitted) so an explicitly-passed, MATCHING value and an
+        # omitted one behave identically -- this is the single point
+        # that actually enforces the scoping, not just the rejection
+        # check above.
+        customer_id = inviter.customer_id
+
+    # 'User' deliberately has NO equivalent check -- unlike 'Customer
+    # Admin', which always needs a customerId (there's no such thing as
+    # a Customer Admin unscoped from any customer), 'User' is
+    # legitimately valid EITHER way: WITH a customerId (a customer-side
+    # user) or WITHOUT one (a "Streetleaf User" -- e.g. Streetleaf's own
+    # staff who need normal-user-level access without admin privileges,
+    # analogous to how Streetleaf Admin itself has no customerId). Only
+    # a Streetleaf Admin caller can actually produce the unscoped case in
+    # practice -- a Customer Admin caller's own customer_id is already
+    # forced to their own (non-None) value above, before this check ever
+    # runs.
     if role == "Customer Admin" and not customer_id:
         raise AuthError("customerId is required when role is 'Customer Admin'", status_code=400)
     if role == "Streetleaf Admin" and customer_id:
@@ -183,8 +287,12 @@ def resend_invite(caller: AuthContext, target_user_id: str) -> dict:
     their invite token/expiry IN PLACE -- the same Users row, same Id,
     same CreatedAt -- rather than a delete_user()-then-invite_user()
     round trip, which would generate a brand new Id and discard any
-    history tied to the original one. Restricted to Streetleaf Admin,
-    same as invite_user()/delete_user().
+    history tied to the original one. Restricted to Streetleaf Admin --
+    narrower than both invite_user()'s own model (which permits Customer
+    Admin) and delete_user()'s own model (which now also permits
+    Customer Admin, within their own CustomerId) -- see either
+    function's own docstring; widen this the same way if resending is
+    ever wanted for a Customer Admin caller too.
 
     Only valid for a user CURRENTLY Status = 'Pending' -- raises 409 for
     an Active user (there's no invite link left to resend for them; use
@@ -468,26 +576,66 @@ def delete_user(caller: AuthContext, target_user_id: str) -> None:
     database -- an unused, allowed Status value is harmless, and wasn't
     worth a separate migration to revert.
 
-    Restricted to Streetleaf Admin, same as invite_user() -- this wasn't
-    spelled out as explicitly as invite's restriction was, but is treated
-    as the safer default given user management as a whole was described
-    as something Customer Admin is restricted from. Loosen this (e.g. to
-    let a Customer Admin delete users within their own CustomerId) if
-    that turns out to be wanted instead -- it's a small, contained change
-    here.
+    Permission model -- an explicit requirement, not an incidental
+    default, and structurally similar to invite_user()'s own (see that
+    function's docstring for the parallel): 'Streetleaf Admin' can
+    delete any other Streetleaf Admin, any Customer Admin, and any User
+    -- but never itself (self-deletion is rejected regardless of role,
+    not just for Streetleaf Admin -- see below). 'Customer Admin' can
+    delete a Customer Admin or User belonging to their OWN CustomerId
+    only -- never a Streetleaf Admin (any CustomerId), and never a
+    Customer Admin/User belonging to a DIFFERENT CustomerId, even though
+    'Customer Admin' itself has no comparable "own record" concept
+    protecting THOSE targets beyond the ordinary CustomerId-matching
+    check. 'User' cannot delete anyone at all -- require_role() below
+    rejects that caller before anything else runs.
+
+    Self-deletion is rejected for EVERY role uniformly, not just
+    Streetleaf Admin -- deleting your own account through this same
+    endpoint you're calling it from has no sensible recovery path (your
+    own session would be revoked mid-request), and there's no
+    legitimate reason any caller would need to self-delete through an
+    admin-facing operation rather than some other, deliberate account-
+    closure flow.
     """
-    require_role(caller, ["Streetleaf Admin"])
+    require_role(caller, ["Streetleaf Admin", "Customer Admin"])
     target_user_id_uuid = _parse_uuid(target_user_id, "user not found")
+
+    # Checked BEFORE any database round trip -- a pure comparison of two
+    # already-known values, so there's nothing to gain from querying
+    # first. caller.user_id comes from an already-verified JWT (not
+    # untrusted input the way target_user_id is), so it's parsed
+    # directly rather than through _parse_uuid()'s own defensive error
+    # handling -- a malformed value here would mean something is wrong
+    # with session issuance itself, not with what this caller passed in.
+    if target_user_id_uuid == uuid.UUID(caller.user_id):
+        raise AuthError("cannot delete your own account", status_code=403)
 
     conn = get_connection()
     cursor = conn.cursor()
     try:
         cursor.execute(
+            "SELECT Role, CustomerId FROM Users WHERE Id = ?",
+            target_user_id_uuid,
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise AuthError("user not found", status_code=404)
+        target_role, target_customer_id = row
+
+        if caller.role == "Customer Admin":
+            if target_role == "Streetleaf Admin":
+                raise AuthError("a Customer Admin cannot delete a Streetleaf Admin", status_code=403)
+            if target_customer_id != caller.customer_id:
+                raise AuthError(
+                    "a Customer Admin can only delete users for their own customer", status_code=403
+                )
+
+        cursor.execute(
             "DELETE FROM Users WHERE Id = ?",
             target_user_id_uuid,
         )
-        if cursor.rowcount == 0:
-            raise AuthError("user not found", status_code=404)
+        conn.commit()
 
         # UserSessions.UserId is VARCHAR -- the original string form of
         # target_user_id (not the UUID object used just above for the

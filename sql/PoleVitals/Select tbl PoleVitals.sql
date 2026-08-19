@@ -24,9 +24,9 @@ WHERE 1 = 1
 -- AND IsOnline = 0
 -- AND PeriodStart >= '2026-08-14 19:00:00'
 -- AND IsPoleFault = 0
-AND PoleNumber = 'PAS-3005'
+AND PoleNumber = 'PAS-4938'
 -- AND IsOpenIssueFault = 1
-AND (PeriodType = 'Last48Hours')
+-- AND (PeriodType = 'Last48Hours')
 ORDER BY PoleNumber, LocationId, PeriodStart DESC;
 
 -- SELECT LocationId, COUNT(*)

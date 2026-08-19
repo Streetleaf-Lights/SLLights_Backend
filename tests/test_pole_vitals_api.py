@@ -147,6 +147,20 @@ class TestPoleDetailsSqlStructure:
         sql = m._POLE_DETAILS_SQL_TEMPLATE
         assert "LightStatus" not in sql
 
+    def test_device_identity_columns_pulled_from_same_outer_apply_as_last_update(self):
+        """ControllerCode/GroupId/ProductId/UserName are sourced from the
+        SAME latest PoleTelemetry row as lastUpdate/batteryVoltage1/etc.
+        -- one seek into PoleTelemetry already returns this same row, no
+        reason for a second one just for these four columns."""
+        sql = m._POLE_DETAILS_SQL_TEMPLATE
+        apply_block = sql.split("OUTER APPLY (")[1].split(") AS latest_pt")[0]
+        for col in ("pt.ControllerCode", "pt.GroupId", "pt.ProductId", "pt.UserName"):
+            assert col in apply_block
+        assert "latest_pt.ControllerCode AS ControllerCode" in sql
+        assert "latest_pt.GroupId AS GroupId" in sql
+        assert "latest_pt.ProductId AS ProductId" in sql
+        assert "latest_pt.UserName AS UserName" in sql
+
     def test_last_update_converted_to_pole_local_time_zone(self):
         """The core new requirement: lastUpdate must reflect the pole's
         own local time, not UTC -- via AT TIME ZONE on the already-
@@ -223,6 +237,10 @@ class TestPoleRowToDict:
         lat=28.0,
         long_=-82.0,
         last_update="2026-07-31 08:00:00 -04:00",
+        controller_code="CC-100",
+        group_id=7,
+        product_id="PROD-42",
+        user_name="jdoe",
         battery_voltage_1=12.6,
         battery_voltage_2=12.4,
         lamp_power_1=8.7,
@@ -245,7 +263,8 @@ class TestPoleRowToDict:
     ):
         return (
             project_id, pole_id, pole_number, location_id, install_date, lat, long_,
-            last_update, battery_voltage_1, battery_voltage_2,
+            last_update, controller_code, group_id, product_id, user_name,
+            battery_voltage_1, battery_voltage_2,
             lamp_power_1, lamp_power_2, battery_elec_current_1, battery_elec_current_2,
             solar_board_voltage, solar_board_elec_current, battery_charging_min,
             is_online, is_led_fault, is_battery_fault, is_panel_fault, is_open_issue_fault, is_pole_fault,
@@ -262,6 +281,10 @@ class TestPoleRowToDict:
             "lat": 28.0,
             "long": -82.0,
             "lastUpdate": "2026-07-31 08:00:00 -04:00",
+            "controllerCode": "CC-100",
+            "groupId": 7,
+            "productId": "PROD-42",
+            "userName": "jdoe",
             "batteryVoltage1": 12.6,
             "batteryVoltage2": 12.4,
             "lampPower1": 8.7,
@@ -311,7 +334,9 @@ class TestPoleRowToDict:
         back a real number even with no telemetry to source a ModelId
         from at all -- see _POLE_DETAILS_SQL_TEMPLATE's own comment."""
         row = self._row(
-            last_update=None, battery_voltage_1=None, battery_voltage_2=None,
+            last_update=None, controller_code=None, group_id=None, product_id=None,
+            user_name=None,
+            battery_voltage_1=None, battery_voltage_2=None,
             lamp_power_1=None, lamp_power_2=None,
             battery_elec_current_1=None, battery_elec_current_2=None,
             solar_board_voltage=None, solar_board_elec_current=None,
@@ -319,6 +344,10 @@ class TestPoleRowToDict:
         )
         result = m._pole_row_to_dict(row)
         assert result["lastUpdate"] is None
+        assert result["controllerCode"] is None
+        assert result["groupId"] is None
+        assert result["productId"] is None
+        assert result["userName"] is None
         assert result["batteryVoltage1"] is None
         assert result["batteryVoltage2"] is None
         assert result["lampPower1"] is None
@@ -444,7 +473,8 @@ class TestGetPoleVitalsUnfiltered:
         pole_rows = [
             (
                 "proj1", "pole1", "PN-1", "LOC-1", "2025-01-01", 28.0, -82.0,
-                "2026-07-31 08:00:00 -04:00", 12.6, 12.4,
+                "2026-07-31 08:00:00 -04:00", "CC-100", 7, "PROD-42", "jdoe",
+                12.6, 12.4,
                 8.7, 8.6, 15.0, 15.2, 18.0, 2.0, 13.5,
                 True, False, True, False, False, True,
                 89.0, 45.0, 0.0, "cust1",
@@ -468,6 +498,10 @@ class TestGetPoleVitalsUnfiltered:
         assert project["poles"][0]["isPoleFault"] is True
         assert project["poles"][0]["lampPower1"] == 8.7
         assert project["poles"][0]["batteryElecCurrent1"] == 15.0
+        assert project["poles"][0]["controllerCode"] == "CC-100"
+        assert project["poles"][0]["groupId"] == 7
+        assert project["poles"][0]["productId"] == "PROD-42"
+        assert project["poles"][0]["userName"] == "jdoe"
         assert project["poles"][0]["solarBoardVoltage"] == 18.0
         assert project["poles"][0]["batteryChargingMin"] == 13.5
 
@@ -657,15 +691,20 @@ class TestGetPoleVitalsByPeriod:
         assert "ISNULL(pm.BatteryChargingMin, 13.5) AS BatteryChargingMin" in sql
         assert "LEFT JOIN PoleModels pm ON latest_pt.ModelId = pm.ModelId" in sql
 
-    def test_hour_history_query_has_a_48_hour_bound_anchored_to_latest_telemetry(self):
+    def test_hour_history_query_has_a_bound_anchored_to_latest_telemetry(self):
         """The whole point of this specific change: anchored to this
         pole's own latest PoleTelemetry reading (via PoleContext's own
         MaxLastUpload), NOT to SYSDATETIMEOFFSET()/"now" -- so a pole
-        that's gone completely offline still returns its own last 48
-        hours of real activity instead of an empty list."""
+        that's gone completely offline still returns its own last known
+        activity instead of an empty list. Bound to limit hours back
+        (via a bound parameter), not a fixed 48 -- a real bug an earlier
+        version of this query had (limit=168 would still only ever
+        return up to 48 hours' worth back, no matter how much more was
+        actually available)."""
         sql = m._POLE_VITALS_HOUR_HISTORY_SQL_TEMPLATE
-        assert "AND pv.PeriodStart >= DATEADD(HOUR, -48, pc.MaxLastUpload)" in sql
+        assert "AND pv.PeriodStart >= DATEADD(HOUR, -1 * ?, pc.MaxLastUpload)" in sql
         assert "SYSDATETIMEOFFSET" not in sql
+        assert "-48" not in sql
 
     def test_hour_history_query_resolves_latest_telemetry_via_pole_context_cte(self):
         sql = m._POLE_VITALS_HOUR_HISTORY_SQL_TEMPLATE
@@ -683,10 +722,31 @@ class TestGetPoleVitalsByPeriod:
 
     def test_hour_history_query_hardcodes_hour_not_a_bound_parameter(self):
         """This template is only ever selected when period_type == 'Hour'
-        -- nothing to parameterize, so it's a literal, not a third '?'."""
+        -- nothing to parameterize, so it's a literal, not a bound '?'."""
         sql = m._POLE_VITALS_HOUR_HISTORY_SQL_TEMPLATE
         assert "pv.PeriodType = 'Hour'" in sql
-        assert sql.count("?") == 2  # TOP (?) and p.Id = ? only -- no period_type parameter
+        # p.Id = ?, TOP (?), and the DATEADD's own -1 * ? -- three, not two.
+        assert sql.count("?") == 3
+
+    def test_hour_history_query_window_bound_reuses_the_same_limit_as_top(
+        self, patch_get_connection_pole_vitals_api, mock_cursor
+    ):
+        """Regression guard for the actual reported bug: limit must be
+        bound TWICE with the SAME value (once for TOP (?), once for the
+        DATEADD window) -- not a fixed 48 that ignores whatever limit
+        the caller actually passed."""
+        mock_cursor.fetchone.return_value = (
+            "pole1", "PN-1", "LOC-1", "2025-01-01", 28.0, -82.0, "2026-07-31 08:00:00 -04:00",
+            8.7, 8.6, 15.0, 15.2, 18.0, 2.0, 13.5,
+        )
+        mock_cursor.fetchall.return_value = []
+
+        m.get_pole_vitals_by_period("pole1", "Hour", limit=168)
+
+        history_call = mock_cursor.execute.call_args_list[-1]
+        # (sql, pole_id, top_limit, dateadd_limit) -- top_limit and
+        # dateadd_limit must be the SAME value (168), not 168 and 48.
+        assert history_call.args == (m._POLE_VITALS_HOUR_HISTORY_SQL_TEMPLATE, "pole1", 168, 168)
 
     def test_hour_history_query_keeps_the_row_count_limit_too(self):
         """TOP (?) is kept ALONGSIDE the new time bound, not replaced by
@@ -716,11 +776,13 @@ class TestGetPoleVitalsByPeriod:
 
         history_call = mock_cursor.execute.call_args_list[-1]
         assert history_call.args[0] == m._POLE_VITALS_HOUR_HISTORY_SQL_TEMPLATE
-        # pole_id THEN limit -- the opposite order from the Day template
-        # below, forced by PoleContext's own CTE (which needs pole_id to
-        # resolve LocationId) coming textually before the main query's
-        # own TOP (?).
-        assert history_call.args == (m._POLE_VITALS_HOUR_HISTORY_SQL_TEMPLATE, "pole1", 10)
+        # pole_id, THEN limit TWICE (once for TOP (?), once for the
+        # DATEADD window bound -- the SAME value, not two different
+        # ones) -- the opposite order, and one extra parameter, from the
+        # Day template below, forced by PoleContext's own CTE (which
+        # needs pole_id to resolve LocationId) coming textually before
+        # the main query's own TOP (?).
+        assert history_call.args == (m._POLE_VITALS_HOUR_HISTORY_SQL_TEMPLATE, "pole1", 10, 10)
 
     def test_day_period_type_uses_the_original_template(
         self, patch_get_connection_pole_vitals_api, mock_cursor

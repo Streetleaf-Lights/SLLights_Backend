@@ -18,7 +18,9 @@ def _uuid() -> uuid.UUID:
 
 
 class _Ctx:
-    def __init__(self, role, customer_id=None, user_id="caller1", session_id="sess1"):
+    def __init__(
+        self, role, customer_id=None, user_id="11111111-1111-1111-1111-111111111111", session_id="sess1"
+    ):
         self.role = role
         self.customer_id = customer_id
         self.user_id = user_id
@@ -27,15 +29,198 @@ class _Ctx:
 
 STREETLEAF_ADMIN = _Ctx("Streetleaf Admin")
 CUSTOMER_ADMIN = _Ctx("Customer Admin", customer_id="cust1")
+USER_ROLE = _Ctx("User", customer_id="cust1")
+
+
+class TestNormalizeCustomerId:
+    def test_none_stays_none(self):
+        assert users_management_api._normalize_customer_id(None) is None
+
+    def test_empty_string_becomes_none(self):
+        assert users_management_api._normalize_customer_id("") is None
+
+    def test_whitespace_only_becomes_none(self):
+        assert users_management_api._normalize_customer_id("   ") is None
+
+    def test_literal_null_string_becomes_none_case_insensitive(self):
+        for value in ("null", "NULL", "Null", "  null  "):
+            assert users_management_api._normalize_customer_id(value) is None
+
+    def test_genuine_customer_id_passes_through_unmodified(self):
+        """Confirms this doesn't strip/alter valid input -- only decides
+        whether it counts as missing at all."""
+        assert users_management_api._normalize_customer_id("cust1") == "cust1"
+        assert users_management_api._normalize_customer_id(" cust1 ") == " cust1 "
 
 
 class TestInviteUser:
-    def test_customer_admin_cannot_invite(self, patch_get_connection_users_management, mock_cursor):
+    def test_streetleaf_admin_inviting_user_without_customer_id_creates_a_streetleaf_user(
+        self, patch_get_connection_users_management, mock_cursor, mocker
+    ):
+        """The corrected understanding of the originally-reported
+        scenario: a Streetleaf Admin inviting role='User' with the
+        customerId key omitted entirely (function_app.py's own
+        body.get("customerId") then passes None here, same as calling
+        this directly without that argument at all) is a VALID,
+        INTENTIONAL case -- a "Streetleaf User", with no customer
+        association, the same way Streetleaf Admin itself has none. Not
+        an error."""
+        mock_cursor.fetchone.return_value = None
+        mocker.patch("shared.users_management_api.send_email")
+
+        users_management_api.invite_user(
+            STREETLEAF_ADMIN, "Minh Tran", "minh+7@streetleaf.com", "User"
+        )  # must not raise
+
+        insert_call = mock_cursor.execute.call_args_list[-1]
+        bound_customer_id = insert_call.args[5]
+        assert bound_customer_id is None
+
+    def test_empty_or_null_string_customer_id_also_creates_a_streetleaf_user(
+        self, patch_get_connection_users_management, mock_cursor, mocker
+    ):
+        """The additional defensive hardening: "" and the literal string
+        "null" are normalized to None the same as a genuinely omitted
+        customerId, so they ALSO produce a Streetleaf User -- not
+        silently stored as a literal "null"/"" CustomerId value, which
+        would be worse than NULL since it looks like real data but
+        isn't."""
+        mock_cursor.fetchone.return_value = None
+        mocker.patch("shared.users_management_api.send_email")
+
+        for customer_id_value in ("", "null", "NULL", "   "):
+            users_management_api.invite_user(
+                STREETLEAF_ADMIN, "Minh Tran", "minh+7@streetleaf.com", "User", customer_id_value
+            )  # must not raise
+            insert_call = mock_cursor.execute.call_args_list[-1]
+            bound_customer_id = insert_call.args[5]
+            assert bound_customer_id is None
+
+    def test_user_role_cannot_invite_at_all(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        """Blocked at the very first require_role() check -- never even
+        reaches the role-being-invited logic below."""
         with pytest.raises(auth_utils.AuthError) as exc_info:
             users_management_api.invite_user(
-                CUSTOMER_ADMIN, "Jane Doe", "jane@example.com", "Customer Admin", "cust1"
+                USER_ROLE, "Jane Doe", "jane@example.com", "User", "cust1"
             )
         assert exc_info.value.status_code == 403
+        mock_cursor.execute.assert_not_called()
+
+    def test_customer_admin_cannot_invite_a_streetleaf_admin(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        """The privilege-escalation guard: a Customer Admin can't create
+        a role with MORE privilege than their own."""
+        with pytest.raises(
+            auth_utils.AuthError, match="a Customer Admin cannot invite a Streetleaf Admin"
+        ) as exc_info:
+            users_management_api.invite_user(
+                CUSTOMER_ADMIN, "Jane Doe", "jane@example.com", "Streetleaf Admin"
+            )
+        assert exc_info.value.status_code == 403
+        mock_cursor.execute.assert_not_called()
+
+    def test_customer_admin_can_invite_customer_admin_for_their_own_customer(
+        self, patch_get_connection_users_management, mock_cursor, mocker
+    ):
+        mock_cursor.fetchone.return_value = None
+        mocker.patch("shared.users_management_api.send_email")
+
+        result = users_management_api.invite_user(
+            CUSTOMER_ADMIN, "Jane Doe", "jane@example.com", "Customer Admin", "cust1"
+        )
+
+        insert_call = mock_cursor.execute.call_args_list[-1]
+        assert "INSERT INTO Users" in insert_call.args[0]
+        assert result["email"] == "jane@example.com"
+
+    def test_customer_admin_can_invite_user_role_for_their_own_customer(
+        self, patch_get_connection_users_management, mock_cursor, mocker
+    ):
+        mock_cursor.fetchone.return_value = None
+        mocker.patch("shared.users_management_api.send_email")
+
+        result = users_management_api.invite_user(
+            CUSTOMER_ADMIN, "Jane Doe", "jane@example.com", "User", "cust1"
+        )
+
+        insert_call = mock_cursor.execute.call_args_list[-1]
+        assert "INSERT INTO Users" in insert_call.args[0]
+        assert result["email"] == "jane@example.com"
+
+    def test_customer_admin_omitting_customer_id_defaults_to_their_own(
+        self, patch_get_connection_users_management, mock_cursor, mocker
+    ):
+        """A Customer Admin doesn't need to pass customerId at all --
+        it's implicitly their own either way. Distinct from a Streetleaf
+        Admin inviter, for whom omitting customerId on a 'User' role
+        produces an intentionally UNSCOPED "Streetleaf User" instead --
+        a Customer Admin caller can never produce that unscoped case,
+        precisely because this forcing happens unconditionally."""
+        mock_cursor.fetchone.return_value = None
+        mocker.patch("shared.users_management_api.send_email")
+
+        users_management_api.invite_user(CUSTOMER_ADMIN, "Jane Doe", "jane@example.com", "User")
+
+        insert_call = mock_cursor.execute.call_args_list[-1]
+        # INSERT INTO Users (Id, Name, Email, Role, Status, CustomerId, ...)
+        # VALUES (?, ?, ?, ?, 'Pending', ?, ...) -- CustomerId is the 5th bound param.
+        bound_customer_id = insert_call.args[5]
+        assert bound_customer_id == "cust1"  # CUSTOMER_ADMIN's own customer_id
+
+    def test_customer_admin_cannot_invite_for_a_different_customer(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        """The actual security fix this permission model exists to
+        enforce: a Customer Admin explicitly passing a DIFFERENT
+        customerId than their own is rejected outright, not silently
+        overridden -- without this, any Customer Admin could invite a
+        Customer Admin/User for an arbitrary OTHER customer, a genuine
+        cross-tenant privilege-escalation hole."""
+        with pytest.raises(
+            auth_utils.AuthError, match="only invite users for their own customer"
+        ) as exc_info:
+            users_management_api.invite_user(
+                CUSTOMER_ADMIN, "Jane Doe", "jane@example.com", "Customer Admin", "some-other-cust"
+            )
+        assert exc_info.value.status_code == 403
+        mock_cursor.execute.assert_not_called()
+
+    def test_streetleaf_admin_can_invite_all_three_roles(
+        self, patch_get_connection_users_management, mock_cursor, mocker
+    ):
+        mock_cursor.fetchone.return_value = None
+        mocker.patch("shared.users_management_api.send_email")
+
+        for role, customer_id in (
+            ("Streetleaf Admin", None),
+            ("Customer Admin", "cust1"),
+            ("User", "cust1"),  # a customer-side User
+            ("User", None),  # a "Streetleaf User" -- also valid
+        ):
+            users_management_api.invite_user(
+                STREETLEAF_ADMIN, "Jane Doe", "jane@example.com", role, customer_id
+            )  # must not raise for any of these
+
+    def test_user_role_does_not_require_customer_id_unlike_customer_admin(
+        self, patch_get_connection_users_management, mock_cursor, mocker
+    ):
+        """The actual distinction this permission model draws: 'Customer
+        Admin' always needs a customerId (there's no "unscoped Customer
+        Admin" concept), but 'User' doesn't -- it's valid either way."""
+        mock_cursor.fetchone.return_value = None
+        mocker.patch("shared.users_management_api.send_email")
+
+        users_management_api.invite_user(
+            STREETLEAF_ADMIN, "Jane Doe", "jane@example.com", "User"
+        )  # must not raise
+
+        with pytest.raises(auth_utils.AuthError, match="customerId is required"):
+            users_management_api.invite_user(
+                STREETLEAF_ADMIN, "Jane Doe", "jane@example.com", "Customer Admin"
+            )
 
     def test_invalid_role_is_rejected(self, patch_get_connection_users_management, mock_cursor):
         with pytest.raises(auth_utils.AuthError) as exc_info:
@@ -430,14 +615,11 @@ class TestResetPassword:
 
 
 class TestDeleteUser:
-    def test_customer_admin_cannot_delete_users(
+    def test_user_role_cannot_delete_at_all(
         self, patch_get_connection_users_management, mock_cursor
     ):
-        """Role check happens before UUID parsing -- this must be
-        rejected on that basis alone, regardless of whether "user1"
-        would also fail as a malformed id."""
         with pytest.raises(auth_utils.AuthError) as exc_info:
-            users_management_api.delete_user(CUSTOMER_ADMIN, "user1")
+            users_management_api.delete_user(USER_ROLE, str(_uuid()))
         assert exc_info.value.status_code == 403
         mock_cursor.execute.assert_not_called()
 
@@ -449,10 +631,101 @@ class TestDeleteUser:
         assert exc_info.value.status_code == 400
         mock_cursor.execute.assert_not_called()
 
+    def test_streetleaf_admin_cannot_delete_itself(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        """Checked before any database round trip -- a pure comparison
+        of already-known values, so no query should even run."""
+        with pytest.raises(auth_utils.AuthError, match="cannot delete your own account") as exc_info:
+            users_management_api.delete_user(STREETLEAF_ADMIN, STREETLEAF_ADMIN.user_id)
+        assert exc_info.value.status_code == 403
+        mock_cursor.execute.assert_not_called()
+
+    def test_customer_admin_cannot_delete_itself(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        with pytest.raises(auth_utils.AuthError, match="cannot delete your own account") as exc_info:
+            users_management_api.delete_user(CUSTOMER_ADMIN, CUSTOMER_ADMIN.user_id)
+        assert exc_info.value.status_code == 403
+        mock_cursor.execute.assert_not_called()
+
+    def test_streetleaf_admin_can_delete_another_streetleaf_admin(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = ("Streetleaf Admin", None)
+        mock_cursor.rowcount = 1
+
+        users_management_api.delete_user(STREETLEAF_ADMIN, str(_uuid()))  # must not raise
+
+    def test_streetleaf_admin_can_delete_any_customer_admin(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = ("Customer Admin", "some-other-customer")
+        mock_cursor.rowcount = 1
+
+        users_management_api.delete_user(STREETLEAF_ADMIN, str(_uuid()))  # must not raise
+
+    def test_streetleaf_admin_can_delete_any_user(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = ("User", "some-other-customer")
+        mock_cursor.rowcount = 1
+
+        users_management_api.delete_user(STREETLEAF_ADMIN, str(_uuid()))  # must not raise
+
+    def test_customer_admin_cannot_delete_a_streetleaf_admin(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = ("Streetleaf Admin", None)
+
+        with pytest.raises(
+            auth_utils.AuthError, match="a Customer Admin cannot delete a Streetleaf Admin"
+        ) as exc_info:
+            users_management_api.delete_user(CUSTOMER_ADMIN, str(_uuid()))
+        assert exc_info.value.status_code == 403
+
+    def test_customer_admin_can_delete_customer_admin_of_own_customer(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = ("Customer Admin", CUSTOMER_ADMIN.customer_id)
+        mock_cursor.rowcount = 1
+
+        users_management_api.delete_user(CUSTOMER_ADMIN, str(_uuid()))  # must not raise
+
+    def test_customer_admin_cannot_delete_customer_admin_of_other_customer(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = ("Customer Admin", "some-other-customer")
+
+        with pytest.raises(
+            auth_utils.AuthError, match="only delete users for their own customer"
+        ) as exc_info:
+            users_management_api.delete_user(CUSTOMER_ADMIN, str(_uuid()))
+        assert exc_info.value.status_code == 403
+
+    def test_customer_admin_can_delete_user_of_own_customer(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = ("User", CUSTOMER_ADMIN.customer_id)
+        mock_cursor.rowcount = 1
+
+        users_management_api.delete_user(CUSTOMER_ADMIN, str(_uuid()))  # must not raise
+
+    def test_customer_admin_cannot_delete_user_of_other_customer(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = ("User", "some-other-customer")
+
+        with pytest.raises(
+            auth_utils.AuthError, match="only delete users for their own customer"
+        ) as exc_info:
+            users_management_api.delete_user(CUSTOMER_ADMIN, str(_uuid()))
+        assert exc_info.value.status_code == 403
+
     def test_wellformed_but_nonexistent_user_raises_404(
         self, patch_get_connection_users_management, mock_cursor
     ):
-        mock_cursor.rowcount = 0
+        mock_cursor.fetchone.return_value = None
 
         with pytest.raises(auth_utils.AuthError) as exc_info:
             users_management_api.delete_user(STREETLEAF_ADMIN, str(_uuid()))
@@ -461,6 +734,7 @@ class TestDeleteUser:
     def test_successful_delete_removes_user_and_revokes_sessions(
         self, patch_get_connection_users_management, mock_conn, mock_cursor
     ):
+        mock_cursor.fetchone.return_value = ("User", "cust1")
         mock_cursor.rowcount = 1
 
         users_management_api.delete_user(STREETLEAF_ADMIN, str(_uuid()))
@@ -468,7 +742,7 @@ class TestDeleteUser:
         calls = mock_cursor.execute.call_args_list
         assert any(c.args[0].strip().upper().startswith("DELETE FROM USERS") for c in calls)
         assert any("UPDATE UserSessions" in c.args[0] for c in calls)
-        mock_conn.commit.assert_called_once()
+        assert mock_conn.commit.call_count == 2  # once for the DELETE, once for the session revoke
 
     def test_user_sessions_update_binds_the_original_string_not_a_uuid_object(
         self, patch_get_connection_users_management, mock_cursor
@@ -476,6 +750,7 @@ class TestDeleteUser:
         """UserSessions.UserId is VARCHAR -- the incoming string form of
         target_user_id belongs there, not the uuid.UUID object parsed
         out for the Users-table DELETE just above it."""
+        mock_cursor.fetchone.return_value = ("User", "cust1")
         mock_cursor.rowcount = 1
         target_user_id = str(_uuid())
 
@@ -495,6 +770,7 @@ class TestDeleteUser:
         explicit request -- confirms the Users-table statement is a
         genuine DELETE, not an UPDATE ... SET Status = 'Deactivated'
         (the previous design this replaced)."""
+        mock_cursor.fetchone.return_value = ("User", "cust1")
         mock_cursor.rowcount = 1
 
         users_management_api.delete_user(STREETLEAF_ADMIN, str(_uuid()))

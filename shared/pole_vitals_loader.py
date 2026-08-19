@@ -22,7 +22,18 @@ PERIOD_TYPES = ("Hour", "Day", "Last48Hours")
 # alone, not PeriodStart -- see _LAST_48_HOURS_MERGE_SQL's own comment),
 # so there's structurally never more than one row per pole to prune.
 _RETENTION_LIMITS = {
-    "Hour": 168,
+    # 720 = 30 days of hourly buckets, no gaps -- raised from an earlier
+    # 168 (7 days) specifically so getPoleVitalsByPeriod(period_type=
+    # 'Hour', limit=...) can actually serve up to 30 days back (see
+    # pole_vitals_api.py's own _POLE_VITALS_HOUR_HISTORY_SQL_TEMPLATE,
+    # whose window bound is now derived from the caller's own limit
+    # rather than a fixed 48). Raising this cap is NOT retroactive --
+    # any row already pruned under the OLD, smaller cap is gone for
+    # good (a genuine DELETE, not an archive/soft-delete -- see
+    # _RETENTION_PRUNE_SQL below), so the full 30-day window won't
+    # actually be AVAILABLE until that much new data has accumulated
+    # under this new cap going forward.
+    "Hour": 720,
     "Day": 7,
 }
 
@@ -1475,7 +1486,7 @@ SET ANSI_WARNINGS ON;
 # single, continuously-updated ROLLING window per pole ("the last 48
 # hours as of whenever this loader last ran"), not one of a sequence of
 # discrete, non-overlapping historical buckets. There's no per-pole
-# "history" of Last48Hours rows the way Hour has 168 of them -- only ever
+# "history" of Last48Hours rows the way Hour has 720 of them -- only ever
 # one, matching the explicit "only 1 of Last48Hours period" retention
 # rule (see load_pole_vitals()'s own docstring).
 #
@@ -1844,11 +1855,11 @@ def load_pole_vitals(backfill: bool = False) -> None:
     reading -- deliberately the one period type that PERSISTS for an
     offline pole rather than disappearing, unlike Last48Hours itself.
 
-    Retention: Hour keeps the newest 168 rows per pole, Day keeps 7 --
-    this table had no pruning at all before this change, so it will
-    shrink (once) the first time this runs against an existing,
-    unpruned table. Last48Hours doesn't need count-based retention (it's
-    structurally always exactly one row per pole -- see
+    Retention: Hour keeps the newest 720 rows per pole (30 days, no
+    gaps), Day keeps 7 -- this table had no pruning at all before this
+    change, so it will shrink (once) the first time this runs against
+    an existing, unpruned table. Last48Hours doesn't need count-based
+    retention (it's structurally always exactly one row per pole -- see
     _LAST_48_HOURS_MERGE_SQL's own comment for why its MERGE is built
     that way), but DOES get its own different cleanup: any existing row
     for a pole that's gone completely silent (no telemetry at all within

@@ -17,10 +17,14 @@ request, no rotation logic -- appropriate for a B2B admin tool rather
 than a mass-market consumer product with much higher-stakes session
 theft scenarios.
 
-Roles: 'Streetleaf Admin' (broad access, not scoped to one customer) and
-'Customer Admin' (restricted to their own CustomerId's data -- and,
-per an explicit requirement, NOT permitted to invite other users; see
-users_management_api.invite_user()'s own role check).
+Roles: 'Streetleaf Admin' (broad access, not scoped to one customer),
+'Customer Admin' (restricted to their own CustomerId's data), and 'User'
+(also restricted to their own CustomerId's data, narrower permissions
+than Customer Admin within it). Invite permissions specifically are more
+nuanced than a flat role check -- see
+users_management_api.invite_user()'s own docstring for the full
+model (which of the three can invite which others, and the
+CustomerId-scoping restriction on a Customer Admin caller).
 """
 
 import os

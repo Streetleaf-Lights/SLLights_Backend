@@ -731,7 +731,7 @@ class TestRetentionPruneSql:
         """Last48Hours needs no pruning -- it's structurally always
         exactly one row per pole (matched on LocationId+PeriodType alone,
         not PeriodStart -- see _LAST_48_HOURS_MERGE_SQL)."""
-        assert pole_vitals_loader._RETENTION_LIMITS == {"Hour": 168, "Day": 7}
+        assert pole_vitals_loader._RETENTION_LIMITS == {"Hour": 720, "Day": 7}
         assert "Last48Hours" not in pole_vitals_loader._RETENTION_LIMITS
 
 
@@ -802,7 +802,7 @@ class TestLoadPoleVitalsSuccessFlow:
 
         # Retention prune calls are at indices 2 (Hour), 4 (Day)
         hour_prune = calls[2].args
-        assert hour_prune == (pole_vitals_loader._RETENTION_PRUNE_SQL, "Hour", "Hour", 168)
+        assert hour_prune == (pole_vitals_loader._RETENTION_PRUNE_SQL, "Hour", "Hour", 720)
         day_prune = calls[4].args
         assert day_prune == (pole_vitals_loader._RETENTION_PRUNE_SQL, "Day", "Day", 7)
 
@@ -1109,7 +1109,7 @@ class TestLast48HoursStaleRowCleanup:
         assert "AND t.LastUpload <> ?" in sql
 
     def test_cleanup_dispatches_to_retention_prune_for_hour_and_day(self):
-        for period_type, expected_limit in (("Hour", 168), ("Day", 7)):
+        for period_type, expected_limit in (("Hour", 720), ("Day", 7)):
             mock_cursor = MagicMock()
             mock_cursor.rowcount = 3
 
