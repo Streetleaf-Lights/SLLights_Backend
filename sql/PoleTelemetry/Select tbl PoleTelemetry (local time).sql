@@ -47,9 +47,9 @@ SELECT TOP 1000
     Lamp2State,
     ControllerCode,
     ProductId,
-    CreateTime,
-    SolarBoardDcStatus,
-    LampBatteryStatus,
+    -- CreateTime,
+    -- SolarBoardDcStatus,
+    -- LampBatteryStatus,
     UserName,
     LeadsunId,
     GroupId,
@@ -68,9 +68,9 @@ FROM PoleTelemetry t
 LEFT JOIN Poles p ON t.LocationId = p.LocationId
 LEFT JOIN PoleTimeZones ptz ON t.LocationId = ptz.LocationId
 WHERE 1 = 1
--- AND t.LocationId = '13240'
--- AND t.LocationId LIKE '%jacks%'
-AND p.PoleNumber = 'PAS-4938'
+-- AND t.LocationId = 'DRH-Orl'
+-- AND t.LocationId LIKE '%AEX-G%'
+-- AND p.PoleNumber LIKE '%AEX-GW%'
 -- AND t.SP_ExecId = 442
 -- AND t.IsDaylight IS NULL
 -- AND t.IsDaylight = 1
@@ -78,7 +78,26 @@ AND p.PoleNumber = 'PAS-4938'
     -- AND t.IsOnline = 0
     -- AND t.LampPower1 > 0
     -- AND t.LampPower2 > 0
+    -- AND t.GatewayCode = 'GT12L94A22082467'
+    -- AND t.ProductId = 'AEXSAM2324122936'
+    -- AND t.LeadsunProjectId = 389
 ORDER BY t.LastUpload DESC;
+
+-- SELECT
+--     LeadsunProjectId AS ProjectId,
+--     MAX(LeadsunProjectName) AS ProjectName,
+--     GroupId,
+--     LocationId,                        -- Leadsun's raw "productName" ends up here, not a separate ProductName column
+--     MAX(UserName) AS UserName,
+--     MAX(GroupName) AS GroupName,
+--     MAX(GatewayCode) AS GatewayCode,
+--     MAX(ProductId) AS ProductId,
+--     MAX(ControllerCode) AS ControllerCode,
+--     COUNT(*) AS ReadingCount,
+--     MAX(LastUpload) AS MostRecentReading
+-- FROM PoleTelemetry
+-- GROUP BY LeadsunProjectId, GroupId, LocationId
+-- ORDER BY ProjectName, GroupId, LocationId;
 
 -- WITH TelemetryWithFaultFlags AS (
 --     SELECT
@@ -195,7 +214,7 @@ ORDER BY t.LastUpload DESC;
 -- SELECT DISTINCT
 --     t.LocationId,
 --     t.UserName,
---     t.LastUpload AT TIME ZONE ISNULL(ptz.WindowsTimeZone, 'Eastern Standard Time') AS LastUpload,
+--     -- t.LastUpload AT TIME ZONE ISNULL(ptz.WindowsTimeZone, 'Eastern Standard Time') AS LastUpload,
 --     p.PoleNumber,
 --     p.CountyFips,
 --     ptz.WindowsTimeZone AS ExistingWindowsTimeZone,
@@ -212,7 +231,7 @@ ORDER BY t.LastUpload DESC;
 --   AND (ptz.LocationId IS NULL OR ptz.WindowsTimeZone IS NULL)
 --   AND t.LastUpload >= DATEADD(HOUR, -48, SYSDATETIMEOFFSET())
 --   AND t.LastUpload <> '9999-12-31 23:59:59.999 +00:00'
--- ORDER BY Reason, t.LocationId, LastUpload DESC;
+-- ORDER BY Reason, t.LocationId;--, LastUpload DESC;
 
 -- UPDATE PoleTelemetry
 -- SET IsDaylightForLedFault = NULL

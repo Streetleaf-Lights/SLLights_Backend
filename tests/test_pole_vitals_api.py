@@ -226,20 +226,18 @@ class TestPoleDetailsSqlStructure:
             "pt.LampPower1", "pt.LampPower2",
             "pt.BatteryElecCurrent1", "pt.BatteryElecCurrent2",
             "pt.SolarBoardVoltage", "pt.SolarBoardElecCurrent",
-            "pt.ModelId",
         ):
             assert col in apply_block
 
-    def test_battery_charging_min_defaults_to_13_5_via_isnull(self):
+    def test_battery_charging_min_removed_entirely(self):
+        """Removed entirely per explicit request -- not just from the
+        IsPanelFaultFlag check, but from the API surface, the SQL, and
+        the PoleModels join that only ever existed to support it here
+        (see "sql/PoleModels/Drop BatteryChargingMin column.sql")."""
         sql = m._POLE_DETAILS_SQL_TEMPLATE
-        assert "ISNULL(pm.BatteryChargingMin, 13.5) AS BatteryChargingMin" in sql
-
-    def test_battery_charging_min_joins_pole_models_via_latest_telemetrys_own_model_id(self):
-        """Must join on latest_pt.ModelId (that SAME reading's model),
-        not some other, possibly stale source of ModelId -- consistent
-        with how pole_vitals_loader.py itself resolves this value."""
-        sql = m._POLE_DETAILS_SQL_TEMPLATE
-        assert "LEFT JOIN PoleModels pm ON latest_pt.ModelId = pm.ModelId" in sql
+        assert "BatteryChargingMin" not in sql
+        assert "PoleModels" not in sql
+        assert "pt.ModelId" not in sql
 
 
 # --------------------------------------------------------------------------
@@ -270,7 +268,6 @@ class TestPoleRowToDict:
         battery_elec_current_2=15.2,
         solar_board_voltage=18.0,
         solar_board_elec_current=2.0,
-        battery_charging_min=13.5,
         is_online=True,
         is_led_fault=False,
         is_battery_fault=False,
@@ -287,7 +284,7 @@ class TestPoleRowToDict:
             last_update, controller_code, group_id, product_id, user_name,
             battery_voltage_1, battery_voltage_2,
             lamp_power_1, lamp_power_2, battery_elec_current_1, battery_elec_current_2,
-            solar_board_voltage, solar_board_elec_current, battery_charging_min,
+            solar_board_voltage, solar_board_elec_current,
             is_online, is_led_fault, is_battery_fault, is_panel_fault, is_open_issue_fault, is_pole_fault,
             battery_percentage, panel_percentage, light_percentage, customer_id,
         )
@@ -314,7 +311,6 @@ class TestPoleRowToDict:
             "batteryElecCurrent2": 15.2,
             "solarBoardVoltage": 18.0,
             "solarBoardElecCurrent": 2.0,
-            "batteryChargingMin": 13.5,
             "isOnline": True,
             "isLedFault": False,
             "isBatteryFault": False,
@@ -350,10 +346,7 @@ class TestPoleRowToDict:
 
     def test_pole_with_no_telemetry_has_null_last_update_and_latest_reading_fields(self):
         """A pole with no PoleTelemetry row at all -- every field sourced
-        from the OUTER APPLY must be null, EXCEPT batteryChargingMin,
-        which has its own ISNULL(..., 13.5) default and so still comes
-        back a real number even with no telemetry to source a ModelId
-        from at all -- see _POLE_DETAILS_SQL_TEMPLATE's own comment."""
+        from the OUTER APPLY must be null."""
         row = self._row(
             last_update=None, controller_code=None, group_id=None, product_id=None,
             user_name=None,
@@ -361,7 +354,6 @@ class TestPoleRowToDict:
             lamp_power_1=None, lamp_power_2=None,
             battery_elec_current_1=None, battery_elec_current_2=None,
             solar_board_voltage=None, solar_board_elec_current=None,
-            battery_charging_min=13.5,  # ISNULL's own default, not None
         )
         result = m._pole_row_to_dict(row)
         assert result["lastUpdate"] is None
@@ -377,21 +369,11 @@ class TestPoleRowToDict:
         assert result["batteryElecCurrent2"] is None
         assert result["solarBoardVoltage"] is None
         assert result["solarBoardElecCurrent"] is None
-        assert result["batteryChargingMin"] == 13.5
-
-    def test_battery_charging_min_defaults_to_13_5_when_model_unmatched(self):
-        """The other half of the same ISNULL() default: a pole WITH
-        telemetry, but whose ModelId has no PoleModels match at all,
-        must also fall back to 13.5 -- not just the no-telemetry-at-all
-        case above."""
-        row = self._row(battery_charging_min=13.5)
-        result = m._pole_row_to_dict(row)
-        assert result["batteryChargingMin"] == 13.5
 
 
 class TestRowToProjectDict:
     def test_maps_fields_and_computes_percent_working(self):
-        row = (None, None, "proj1", "Downtown", 8, 6, 3)
+        row = (None, None, "proj1", "Downtown", 8, 6, 3, 482)
         result = m._row_to_project_dict(row, poles=[])
         assert result["id"] == "proj1"
         assert result["name"] == "Downtown"
@@ -399,10 +381,11 @@ class TestRowToProjectDict:
         assert result["connectedLights"] == 6
         assert result["totalFaults"] == 3
         assert result["percentWorking"] == 62.5
+        assert result["leadsunProjectId"] == 482
         assert result["poles"] == []
 
     def test_no_optimistic_working_percentage_or_non_telemetry_fields(self):
-        row = (None, None, "proj1", "Downtown", 8, 6, 3)
+        row = (None, None, "proj1", "Downtown", 8, 6, 3, 482)
         result = m._row_to_project_dict(row, poles=[])
         assert "optimisticWorkingPercentage" not in result
         assert "totalNonTelemetryAvailable" not in result
@@ -410,9 +393,16 @@ class TestRowToProjectDict:
 
     def test_attaches_the_given_poles_list_as_is(self):
         poles = [{"id": "p1"}, {"id": "p2"}]
-        row = (None, None, "proj1", "Downtown", 2, 2, 0)
+        row = (None, None, "proj1", "Downtown", 2, 2, 0, 482)
         result = m._row_to_project_dict(row, poles=poles)
         assert result["poles"] == poles
+
+    def test_leadsun_project_id_can_be_none(self):
+        """A project Airtable hasn't recorded a Leadsun ProjectId for --
+        must come back None, not raise or default to something else."""
+        row = (None, None, "proj1", "Downtown", 2, 2, 0, None)
+        result = m._row_to_project_dict(row, poles=[])
+        assert result["leadsunProjectId"] is None
 
 
 # --------------------------------------------------------------------------
@@ -490,13 +480,13 @@ class TestGetPoleVitalsUnfiltered:
     def test_full_shape_with_one_customer_one_project_one_pole(
         self, patch_get_connection_pole_vitals_api, mock_cursor
     ):
-        agg_rows = [("cust1", "Acme", "proj1", "Downtown", 8, 6, 3)]
+        agg_rows = [("cust1", "Acme", "proj1", "Downtown", 8, 6, 3, 482)]
         pole_rows = [
             (
                 "proj1", "pole1", "PN-1", "LOC-1", "2025-01-01", 28.0, -82.0,
                 "2026-07-31 08:00:00 -04:00", "CC-100", 7, "PROD-42", "jdoe",
                 12.6, 12.4,
-                8.7, 8.6, 15.0, 15.2, 18.0, 2.0, 13.5,
+                8.7, 8.6, 15.0, 15.2, 18.0, 2.0,
                 True, False, True, False, False, True,
                 89.0, 45.0, 0.0, "cust1",
             )
@@ -524,13 +514,13 @@ class TestGetPoleVitalsUnfiltered:
         assert project["poles"][0]["productId"] == "PROD-42"
         assert project["poles"][0]["userName"] == "jdoe"
         assert project["poles"][0]["solarBoardVoltage"] == 18.0
-        assert project["poles"][0]["batteryChargingMin"] == 13.5
+        assert project["leadsunProjectId"] == 482
 
     def test_customer_with_zero_projects_gets_empty_projects_and_zeroed_rollup(
         self, patch_get_connection_pole_vitals_api, mock_cursor
     ):
         # Phantom row: ProjectId (index 2) is None for a customer with no projects
-        agg_rows = [("cust1", "Acme", None, None, None, None, None)]
+        agg_rows = [("cust1", "Acme", None, None, None, None, None, None)]
         mock_cursor.fetchall.side_effect = [agg_rows, []]
 
         result = m.get_pole_vitals()
@@ -543,8 +533,8 @@ class TestGetPoleVitalsUnfiltered:
         self, patch_get_connection_pole_vitals_api, mock_cursor
     ):
         agg_rows = [
-            ("custB", "Beta", "projB", "Proj B", 1, 1, 0),
-            ("custA", "Alpha", "projA", "Proj A", 1, 1, 0),
+            ("custB", "Beta", "projB", "Proj B", 1, 1, 0, 100),
+            ("custA", "Alpha", "projA", "Proj A", 1, 1, 0, 200),
         ]
         mock_cursor.fetchall.side_effect = [agg_rows, []]
 
@@ -568,7 +558,7 @@ class TestGetPoleVitalsCustomerIdFilter:
     def test_returns_a_single_dict_not_a_list(
         self, patch_get_connection_pole_vitals_api, mock_cursor
     ):
-        agg_rows = [("cust1", "Acme", "proj1", "Downtown", 1, 1, 0)]
+        agg_rows = [("cust1", "Acme", "proj1", "Downtown", 1, 1, 0, 482)]
         mock_cursor.fetchall.side_effect = [agg_rows, []]
 
         result = m.get_pole_vitals(customer_id="cust1")
@@ -609,7 +599,7 @@ class TestGetPoleVitalsProjectIdFilter:
     def test_returns_a_flat_dict_with_customer_context_not_nested(
         self, patch_get_connection_pole_vitals_api, mock_cursor
     ):
-        agg_rows = [("cust1", "Acme", "proj1", "Downtown", 1, 1, 0)]
+        agg_rows = [("cust1", "Acme", "proj1", "Downtown", 1, 1, 0, 482)]
         mock_cursor.fetchall.side_effect = [agg_rows, []]
 
         result = m.get_pole_vitals(project_id="proj1")
@@ -635,7 +625,7 @@ class TestGetPoleVitalsByPeriod:
         """Last48Hours is a single current-state row, not a history to
         page through -- must be rejected here even though it's valid for
         pole_vitals_loader.py itself."""
-        with pytest.raises(ValueError, match="Hour, Day"):
+        with pytest.raises(ValueError, match="Hour"):
             m.get_pole_vitals_by_period("pole1", "Last48Hours")
 
     def test_rejects_invalid_period_type(self):
@@ -653,7 +643,7 @@ class TestGetPoleVitalsByPeriod:
     ):
         mock_cursor.fetchone.return_value = (
             "pole1", "PN-1", "LOC-1", "2025-01-01", 28.0, -82.0, "2026-07-31 08:00:00 -04:00",
-            8.7, 8.6, 15.0, 15.2, 18.0, 2.0, 13.5,
+            8.7, 8.6, 15.0, 15.2, 18.0, 2.0,
         )
         mock_cursor.fetchall.return_value = [
             ("2026-07-31 07:00:00 -04:00", "2026-07-31 08:00:00 -04:00",
@@ -667,22 +657,20 @@ class TestGetPoleVitalsByPeriod:
         assert entry["isOnline"] is True
         assert entry["isPoleFault"] is False
         assert result["lampPower1"] == 8.7
-        assert result["batteryChargingMin"] == 13.5
 
     def test_pole_with_no_history_yet_returns_empty_vitals_list(
         self, patch_get_connection_pole_vitals_api, mock_cursor
     ):
         mock_cursor.fetchone.return_value = (
             "pole1", "PN-1", "LOC-1", None, None, None, None,
-            None, None, None, None, None, None, 13.5,
+            None, None, None, None, None, None,
         )
         mock_cursor.fetchall.return_value = []
 
-        result = m.get_pole_vitals_by_period("pole1", "Day")
+        result = m.get_pole_vitals_by_period("pole1", "Hour")
 
         assert result["vitals"] == []
         assert result["lampPower1"] is None
-        assert result["batteryChargingMin"] == 13.5
 
     def test_pole_info_last_update_query_converts_to_local_time_zone(self):
         sql = m._POLE_INFO_FOR_HISTORY_SQL_TEMPLATE
@@ -707,10 +695,10 @@ class TestGetPoleVitalsByPeriod:
         assert "BatteryVoltage1" not in sql
         assert "BatteryVoltage2" not in sql
 
-    def test_pole_info_battery_charging_min_defaults_to_13_5_via_isnull(self):
+    def test_pole_info_battery_charging_min_removed_entirely(self):
         sql = m._POLE_INFO_FOR_HISTORY_SQL_TEMPLATE
-        assert "ISNULL(pm.BatteryChargingMin, 13.5) AS BatteryChargingMin" in sql
-        assert "LEFT JOIN PoleModels pm ON latest_pt.ModelId = pm.ModelId" in sql
+        assert "BatteryChargingMin" not in sql
+        assert "PoleModels" not in sql
 
     def test_hour_history_query_has_a_bound_anchored_to_latest_telemetry(self):
         """The whole point of this specific change: anchored to this
@@ -758,7 +746,7 @@ class TestGetPoleVitalsByPeriod:
         the caller actually passed."""
         mock_cursor.fetchone.return_value = (
             "pole1", "PN-1", "LOC-1", "2025-01-01", 28.0, -82.0, "2026-07-31 08:00:00 -04:00",
-            8.7, 8.6, 15.0, 15.2, 18.0, 2.0, 13.5,
+            8.7, 8.6, 15.0, 15.2, 18.0, 2.0,
         )
         mock_cursor.fetchall.return_value = []
 
@@ -776,20 +764,12 @@ class TestGetPoleVitalsByPeriod:
         sql = m._POLE_VITALS_HOUR_HISTORY_SQL_TEMPLATE
         assert "SELECT TOP (?)" in sql
 
-    def test_day_history_query_unaffected_no_time_bound_added(self):
-        """Day intentionally keeps the plain, unbounded-by-wall-clock-time
-        query -- this is a deliberate difference from Hour, not an
-        oversight."""
-        sql = m._POLE_VITALS_HISTORY_SQL_TEMPLATE
-        assert "SYSDATETIMEOFFSET" not in sql
-        assert sql.count("?") == 3  # TOP (?), p.Id = ?, AND pv.PeriodType = ?
-
     def test_hour_period_type_uses_the_hour_specific_template(
         self, patch_get_connection_pole_vitals_api, mock_cursor
     ):
         mock_cursor.fetchone.return_value = (
             "pole1", "PN-1", "LOC-1", "2025-01-01", 28.0, -82.0, "2026-07-31 08:00:00 -04:00",
-            8.7, 8.6, 15.0, 15.2, 18.0, 2.0, 13.5,
+            8.7, 8.6, 15.0, 15.2, 18.0, 2.0,
         )
         mock_cursor.fetchall.return_value = []
 
@@ -800,22 +780,8 @@ class TestGetPoleVitalsByPeriod:
         # pole_id, THEN limit TWICE (once for TOP (?), once for the
         # DATEADD window bound -- the SAME value, not two different
         # ones) -- the opposite order, and one extra parameter, from the
-        # Day template below, forced by PoleContext's own CTE (which
-        # needs pole_id to resolve LocationId) coming textually before
-        # the main query's own TOP (?).
+        # now-removed Day template this used to be contrasted against,
+        # forced by PoleContext's own CTE (which needs pole_id to
+        # resolve LocationId) coming textually before the main query's
+        # own TOP (?).
         assert history_call.args == (m._POLE_VITALS_HOUR_HISTORY_SQL_TEMPLATE, "pole1", 10, 10)
-
-    def test_day_period_type_uses_the_original_template(
-        self, patch_get_connection_pole_vitals_api, mock_cursor
-    ):
-        mock_cursor.fetchone.return_value = (
-            "pole1", "PN-1", "LOC-1", "2025-01-01", 28.0, -82.0, "2026-07-31 08:00:00 -04:00",
-            8.7, 8.6, 15.0, 15.2, 18.0, 2.0, 13.5,
-        )
-        mock_cursor.fetchall.return_value = []
-
-        m.get_pole_vitals_by_period("pole1", "Day", limit=10)
-
-        history_call = mock_cursor.execute.call_args_list[-1]
-        assert history_call.args[0] == m._POLE_VITALS_HISTORY_SQL_TEMPLATE
-        assert history_call.args == (m._POLE_VITALS_HISTORY_SQL_TEMPLATE, 10, "pole1", "Day")

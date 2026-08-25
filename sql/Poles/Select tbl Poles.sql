@@ -2,6 +2,7 @@ SELECT --TOP (1000)
         [Id]
       ,[PoleNumber]
       ,[LocationId]
+      ,[ControllerId]
       ,CountyFips
       ,[ProjectId]
       ,[CustomerId]
@@ -12,14 +13,13 @@ SELECT --TOP (1000)
       ,[AirTableCreatedDateTime]
   FROM [dbo].[Poles]
   WHERE 1 = 1
-    -- AND Id = 'recwRDOn9vQboBEIS'
 --   AND [LocationId] = 'JAX-DEMO'
     -- AND LocationId LIKE '%jacks%'
---   AND PoleNumber = 'PAS-9398'
+    -- AND PoleNumber = 'PAS-4938'
     -- AND PoleNumber LIKE '%12009-100%'
     -- AND (Long IS NULL OR Lat IS NULL)
     -- AND CountyFips IS NOT NULL
-    AND CustomerId = 'recRXOKVBlGRpplTm'
+    AND ControllerId IS NULL
   ORDER BY [LocationId], [PoleNumber] DESC;
 
 -- SELECT LocationId, COUNT(*) AS PoleCount

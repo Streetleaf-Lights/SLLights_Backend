@@ -137,7 +137,7 @@ class TestGetProjects:
     def test_maps_rows_to_camelcase_dicts(self, patch_get_connection_projects_api, mock_cursor):
         mock_cursor.fetchall.return_value = [
             ("rec456", "Chaparral Ph3", "[]", "[]", "recwx649JfiRmWqxF", 42,
-             date(2026, 1, 1), "[]", datetime(2026, 1, 1, tzinfo=timezone.utc)),
+             date(2026, 1, 1), "[]", 482, datetime(2026, 1, 1, tzinfo=timezone.utc)),
         ]
 
         result = projects_api.get_projects()
@@ -149,6 +149,7 @@ class TestGetProjects:
         assert project["customerId"] == "recwx649JfiRmWqxF"
         assert project["polesUnderContract"] == 42
         assert isinstance(project["effectiveDate"], str)  # DATE isn't natively JSON-safe either
+        assert project["leadsunProjectId"] == 482
         assert isinstance(project["createdAt"], str)
         assert "Id" not in project  # PascalCase keys must not leak through
 

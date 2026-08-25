@@ -52,8 +52,8 @@ def _clamp_summary_limit(limit) -> int:
 # _POLE_DETAILS_SQL_TEMPLATE there, but with a deliberately LEANER
 # OUTER APPLY into PoleTelemetry than that query has -- just LastUpload,
 # not the other 8 telemetry columns (batteryVoltage1/2, lampPower1/2,
-# batteryElecCurrent1/2, solarBoardVoltage/solarBoardElecCurrent) or the
-# PoleModels join those feed into (batteryChargingMin). That OUTER APPLY
+# batteryElecCurrent1/2, solarBoardVoltage/solarBoardElecCurrent). That
+# OUTER APPLY
 # still runs once per pole (a correlated TOP-1 lookup) -- each individual
 # seek is cheap (PoleTelemetry's own clustered index is
 # (LocationId, LastUpload), LocationId leading), and doing it ~14,000

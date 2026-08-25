@@ -10,12 +10,10 @@ coordinates, cached in `PoleTimeZones`) rather than one hardcoded zone for
 every pole — including a live/recent-connectivity flag (`IsOnline`) and a
 per-pole health classification (`LightStatus`: `Working`/`DayLight`/`Not
 Working`) that compares each reading's actual behavior against whether it
-should be daylight at that pole's location and moment; includes a
-standalone `Workweek` calendar reference table (static, not synced from
-any external source, and currently unused now that the `Week` period type
-has been removed — see the Notes section below); and exposes read-only
-`getCustomers`/`getProjects`/`getPoleVitals`/`getPoles`/`getUsers` HTTP API endpoints (meant for
-API Management + a website, not part of the ETL pipeline).
+should be daylight at that pole's location and moment; and exposes
+read-only `getCustomers`/`getProjects`/`getPoleVitals`/`getPoles`/`getUsers`
+HTTP API endpoints (meant for API Management + a website, not part of the
+ETL pipeline).
 
 ## Project structure
 
@@ -53,7 +51,7 @@ Backend/
 │   ├── pole_telemetry_loader.py # Leadsun → PoleTelemetry upsert + retention (load_pole_telemetry)
 │   ├── pole_timezones_loader.py # PoleTelemetry coords → PoleTimeZones cache (load_pole_timezones)
 │   ├── pole_daylight_flags_loader.py # Caches PoleTelemetry.IsDaylight per reading (load_pole_daylight_flags)
-│   ├── pole_vitals_loader.py    # PoleTelemetry+PoleModels+PoleTimeZones(+Workweek) → PoleVitals
+│   ├── pole_vitals_loader.py    # PoleTelemetry+PoleModels+PoleTimeZones → PoleVitals
 │   ├── api_utils.py             # Shared helpers for the read-only query APIs (json_safe, clamp_limit)
 │   ├── customers_api.py         # Read-only Customers query logic for getCustomers (get_customers)
 │   ├── projects_api.py          # Read-only Projects query logic for getProjects (get_projects)
@@ -61,8 +59,6 @@ Backend/
 │   ├── poles_api.py             # Flat pole listing for getPoles (get_poles) -- reuses pole_vitals_api.py's per-pole SQL directly
 │   └── users_api.py             # Read-only Users query logic for getUsers (get_users), joined with Customers for customerName
 ├── scripts/
-│   ├── generate_workweek_sql.py # Standalone (no Azure Functions runtime needed) generator
-│   │                             # for Workweek's populate script -- see below
 │   └── run_pole_vitals_backfill.py # One-off PoleVitals full-history backfill runner
 ├── sql/                     # One folder per table; each has a guarded CREATE
 │   │                        # and a scratch SELECT for querying/debugging in SSMS/ADS
@@ -90,15 +86,10 @@ Backend/
 │   │   ├── Create tbl PoleVitals.sql
 │   │   └── Select tbl PoleVitals.sql
 │   ├── Users/                # Application login accounts -- NOT part of the ETL
-│   │   │                      # pipeline (no Source/SP_ExecId, no loader), same reasoning
-│   │   │                      # as Workweek being the other non-ETL table here
+│   │   │                      # pipeline (no Source/SP_ExecId, no loader)
 │   │   ├── Create tbl Users.sql
 │   │   ├── Select tbl Users.sql
 │   │   └── Select tbl Users joined with Customers.sql
-│   ├── Workweek/
-│   │   ├── Create tbl Workweek.sql
-│   │   ├── Select tbl Workweek.sql
-│   │   └── Populate tbl Workweek 2026-2030.sql  # generated, idempotent MERGE
 │   ├── Rename PoleModel to PoleModels and PoleRawData to PoleTelemetry.sql
 │   │                        # One-time migration for environments where these
 │   │                        # tables already exist under their old names
@@ -199,7 +190,6 @@ no credentials needed for the default run.
 | `tests/test_pole_daylight_flags_loader.py` | The find-unflagged-readings query (`INNER JOIN PoleTimeZones` — not `LEFT`, and requires `WindowsTimeZone IS NOT NULL`, since a reading whose location can't be trusted can't have its daylight status computed at all), full-flow tests (`SP_Execution` open/close, per-reading `is_daylight()` call using `PoleTimeZones`' cached coordinates — not `PoleTelemetry`'s own — batched `UPDATE` with a per-row fallback, per-reading failure isolation); **a real bug caught in production**: `LastUpload` must be written back as a `_to_dto_string()`-formatted string, not the raw `datetime` read back from the `SELECT` — binding it raw hit the established pyodbc + `DATETIMEOFFSET` write-parameter gotcha, silently matching zero rows on every `UPDATE` with no exception raised, while `SP_Execution` kept reporting success regardless; also covers the new "zero rows affected" warning added specifically to surface that exact failure mode loudly if it ever recurs |
 | `tests/test_pole_vitals_loader.py` | `_compute_cutoff()`'s lookback-window math (per period type, and the wider `backfill=True` window) — pure and unit-tested since the aggregation SQL itself can't be executed in this sandbox; structural checks on both period types' `MERGE` SQL (formulas, `NULLIF` guards, join conditions, bucketing expressions, the `_MISSING_LAST_UPLOAD_SENTINEL` exclusion, the per-pole `PoleTimeZones` join with its `ISNULL(...,'Eastern Standard Time')` fallback); dedicated `TimeZoneName`-propagation tests confirming it survives the `GROUP BY` for every period type; **`IsOnline`/`LightStatus`'s classification logic** (offline → `Working` not `Not Working`, unresolved daylight excluded not guessed, priority-ordered bucket aggregation — `Not Working` beats `Working` beats the `DayLight` default); **`TestDayRecentActivityWindow`** — confirms Day's "last 6 hours" window is computed via `DATEADD(HOUR, -6, ...)` relative to *that bucket's own end* and does **not** use an externally-bound `?` parameter — guarding against a real bug caught before shipping, where an earlier version computed this relative to "now" (the loader's execution time) instead, silently giving every already-completed historical bucket the wrong window every time it was recomputed — plus a regression test for a second bug only caught in production (SQLSTATE `42000`, `DATEADD(HOUR,...)` rejecting a plain `DATE` value), both an exact-match check and a looser structural one meant to catch the same class of mistake even if the exact expression changes later (this class used to also cover Week and Month, back when those period types existed — see the Notes section for why they were removed); **`TestLoadPoleVitalsPerPeriodTypeCommits`** — confirms `load_pole_vitals()` commits after each period type individually rather than once at the end (exact `execute`/`commit`/`rollback` ordering, tracked via `side_effect` call-order lists rather than `mock_calls`, which doesn't reliably propagate calls on this project's explicitly-named `mock_cursor`/`mock_conn` fixtures — confirmed directly before relying on it), that a benign SQLSTATE `01003` warning still commits (the underlying `MERGE` did succeed), that a genuine failure rolls back *and* doesn't block the other period type from still being attempted and committed, and specifically that an earlier period type's commit has already happened before a later one's failure — the actual property this change exists for; `_is_benign_null_aggregate_warning()` (SQLSTATE `01003` treated as success, `22007` and other genuine errors still treated as failures); full-flow tests (`SP_Execution` open/close, per-period-type failure isolation, rowcount aggregation) |
 | `tests/test_function_app.py` | Timer trigger fires only at 6 AM/6 PM Eastern (verified across the DST boundary with freezegun), `past_due` handling, manual HTTP trigger's `Prod` block, synchronous (non-threaded) execution, **Poles runs before Projects runs before Customers** in both triggers, a failure in an earlier loader blocks the later ones, **`loadLeadsunData` runs unconditionally** (no hour-gating) otherwise, runs **Models → Telemetry → TimeZones → DaylightFlags → Vitals in order** (a failure in an earlier one blocks the later ones here too), and never touches the Airtable loaders — and **both timer triggers skip entirely when `ENVIRONMENT == "Dev"`**, before even checking `past_due`, while both manual triggers are unaffected by that guard; separately, **`getCustomers`** and **`getProjects`**'s array-vs-single-object-vs-404 response shaping, non-numeric `limit` → `400` without querying the DB at all, a query failure surfacing as `500` with a JSON error body rather than a raw exception, and **`getProjects?customerId=X`**'s distinct list-query semantics (empty array + `200`, not `404`, when a customer has no projects) vs. `projectId`'s single-object-or-404, including when both params are combined; **`getPoleVitals`** gets the same response-shaping/error-handling coverage, but with a genuinely different contract worth its own tests — unlike `getProjects`, `customerId` here is ALSO a single-entity lookup (404-on-not-found), not a collection filter (empty-array), since `get_pole_vitals()` returns `None` rather than `[]` for "doesn't exist" in either the `projectId` or `customerId` case; **`getPoles`** gets the same response-shaping/error-handling coverage too, but with yet another distinct contract — here `poleId` is the single-entity lookup (404-on-not-found), while `projectId`/`customerId` alone are back to being collection filters (empty array + `200`, matching `getProjects?customerId=X`'s convention, not `getPoleVitals`'s), and `poleId` combined with `projectId`/`customerId` is confirmed to pass every given param through together rather than one silently overriding another; **`?summary=`** — parsed case-insensitively (`"true"`/`"TRUE"`/`"1"` all treated as `True`, `"false"`/absent both `False`), and confirmed to actually flow through as a real keyword argument to `get_poles()` on every call, not just when truthy; **`getUsers`** follows `getCustomers`/`getProjects`' array-vs-single-object-vs-404 shaping and `customerId`-as-collection-filter convention (not `getPoleVitals`'s single-entity one), with `userId`+`customerId` combined confirmed to pass both through together and correctly 404 when a real user belongs to a different customer than the one specified |
-| `tests/test_generate_workweek_sql.py` | `sunday_on_or_before()`, full validation of the generated rows (260 for 2026-2030: no duplicates, every week exactly 7 days Sun-Sat, no gaps/overlaps within a year, Jan 1 always in that year's Week 1, leap-day coverage), and that the emitted SQL is a `MERGE` (idempotent), not a plain `INSERT` |
 | `tests/test_run_pole_vitals_backfill.py` | `refuse_if_prod()` (blocks `"Prod"`, allows everything else), `load_local_settings_into_env()` (missing file, missing `Values` key, doesn't clobber an already-set env var) |
 | `tests/test_api_utils.py` | `json_safe()` (datetime/date/unknown-type coercion), `clamp_limit()` (default equals max, cap, negative) — extracted from `test_customers_api.py` once `getProjects` needed the exact same logic |
 | `tests/test_customers_api.py` | `get_customers()` query shape (by-id vs. `TOP (?)`, `SP_ExecId` never selected, camelCase key mapping, connection cleanup on success and failure) |
@@ -207,7 +197,7 @@ no credentials needed for the default run.
 | `tests/test_pole_vitals_api.py` | `_working_percentage()`'s divide-by-zero guard (0 total lights → `0.0`, not a crash, not `None`) and rounding; SQL structural checks (`COUNT(*)` — not `COUNT(LightStatus)` — for `TotalLights`, so an unclassified pole still counts; every `LEFT JOIN`, confirming a pole with zero `Hour` `PoleVitals` rows in the recent window, a project with zero poles, and a customer with zero projects all still appear rather than being silently dropped by an `INNER JOIN`; the `Working`+`DayLight` grouping, the `Not Working`-only fault definition, and the separate `NoTelemetryCount` aggregate (`LightStatus IS NULL`) confirming an unclassified pole is counted on its own, folded into neither the fault count nor the working percentage; the `RecentPoleStats` CTE's rolling-window filter (`PeriodStart >= DATEADD(HOUR, -{hours_window}, SYSDATETIMEOFFSET())`, confirmed via the raw `{hours_window}` placeholder text so the SQL can't drift from `_RECENT_HOURS_WINDOW`, plus a separate test confirming it formats to the real constant) and its priority-based `LightStatus` aggregation (`MAX(CASE...)` per `LocationId`), replacing the earlier single-row `ROW_NUMBER()` approach entirely (`ROW_NUMBER()` confirmed absent from both templates); the Python-side grouping into nested `Customer → [Project]` (multiple projects correctly grouped under one customer, customer order preserved from the SQL's own `ORDER BY`, not reshuffled by dict grouping); the `customerId`-with-zero-projects case specifically — a real gap found by writing these tests, not a hypothetical: the original query used `INNER JOIN Projects`, meaning a customer with zero projects was indistinguishable from a nonexistent one, fixed by switching to `LEFT JOIN Projects` plus detecting the resulting all-NULL "phantom" project row in Python; `projectId`'s flat (not nested) single-object shape, including customer context merged onto it directly; **`_sum_pole_stats()`/`_customer_rollup_fields()`** — dedicated coverage for the customer-level rollup, most importantly confirming it's a genuine pole-weighted aggregate (sum of working ÷ sum of total across a customer's own projects) and not a naive average of each project's own percentage — a tiny project at 80% and a huge one at 100% must roll up close to 100%, not to a misleading 90%; confirms this rollup (including `totalNonTelemetryAvailable`) appears on the customer object in both the unfiltered and `customerId`-filtered cases, and deliberately does *not* leak onto the flat `projectId`-filtered single-project response; **`optimisticWorkingPercentage`** — confirms it treats each unclassified pole as working (numerator becomes `workingCount + noTelemetryCount`), differs from the conservative `workingPercentage` exactly when unclassified poles exist and matches it exactly when they don't, and is itself a pole-weighted aggregate at the customer level (summed before dividing, same principle as `workingPercentage`); **the per-project `"poles"` list** — the second, separate SQL query's structure (plain `INNER JOIN`s, no phantom-row handling needed, since a project with zero matching poles just yields zero rows and an empty list falls out naturally; its own `RecentPoleStats` additionally averaging the three `avg*Percentage` fields via `ROUND(AVG(...), 2)`, and casting `IsOnline`'s `MAX(CASE...)` explicitly to `BIT` — confirmed directly, since without that cast pyodbc would hand the aggregated value back as a plain Python `int`, serializing as `1`/`0` in JSON instead of `true`/`false`); `_pole_row_to_dict()`'s `lightStatus: null`/`isOnline: null`/all-three-percentages-`null` (not an invented string, not `False`, not `0`) for an unclassified pole, and that both queries use the *identical* rolling-window pattern, not a different/inconsistent definition of "current status" between them; that both queries are actually issued (`mock_cursor.execute.call_count == 2`) and reuse the *identical* `where_clause`/params (confirmed directly by comparing both calls' bound arguments, not assumed); and that poles from different projects never cross-contaminate when grouped, across all three filtering branches (unfiltered, `customerId`, `projectId`); **`installDate`/`lat`/`long`/`lastUpdate`/`batteryVoltage1`/`batteryVoltage2`** — SQL structural checks confirming `installDate`/`lat`/`long` are selected directly from `Poles` (not derived), and the `OUTER APPLY`'s exact shape (`SELECT TOP 1 ... ORDER BY LastUpload DESC`, correlated on `LocationId`, `OUTER` specifically rather than `CROSS`/`INNER`); `_pole_row_to_dict()` tests confirming all three `PoleTelemetry`-sourced fields are `null` (not `0` or a fabricated timestamp) for a pole with no matching row, while `installDate`/`lat`/`long` pass through independently of whether any telemetry or vitals data exists at all; **`CustomerId`** — confirms `c.Id AS CustomerId` is selected (the `Customers` join already existed for the `where_clause`'s own filtering, so this needed no new join), and that `_pole_row_to_dict()` still excludes both `ProjectId` and `CustomerId` from its own output even when both are given real, non-null values (an exact-dict-equality check, not just a coincidental absence from defaulting to `None`) — `poles_api.py` reads both straight from the row itself instead; **`_RECENT_POLE_STATS_CTE`** — a permanent byte-for-byte regression test confirming `_POLE_DETAILS_SQL_TEMPLATE`'s fully-assembled text is *identical* to what it was before this CTE was factored out into its own constant (not just "looks the same" after the refactor), plus a separate test confirming the template still actually embeds that shared constant — together guarding against `shared/poles_api.py`'s lighter summary query (added later, reusing this same CTE so its `LightStatus`/`IsOnline`/`avg*Percentage` classification logic can't drift out of sync with the original) silently diverging from what `getPoleVitals` and `getPoles`' full-detail mode both still rely on |
 | `tests/test_poles_api.py` | `_pole_row_to_dict_with_parents()` (renamed from `_pole_row_to_dict_with_project()` once it started adding both parents, not just one) confirming it adds `projectId` *and* `customerId` on top of every field `pole_vitals_api._pole_row_to_dict()` already produces, without altering any of them, including for a fully unclassified pole; `get_poles()`'s four filtering branches — unfiltered (limit-based `TOP (?) Id FROM Poles ORDER BY PoleNumber` subquery, mirroring `pole_vitals_api.py`'s own "limit via a subquery" pattern even though there's no grouping concern to protect against here), `poleId` alone (single-object-or-404, matching `getCustomers`/`getProjects`'s convention), `projectId`/`customerId` alone (collection filters — empty array, not `404`/`None`, when nothing matches, matching `projects_api.get_projects()`'s `customerId` convention), and `projectId`+`customerId` combined; **`TestGetPolesCombinedWithPoleId`** — a real bug caught by writing these tests, not a hypothetical: the first version used an `if`/`elif` chain, so `poleId` combined with `projectId` silently ignored `projectId` entirely, directly contradicting the function's own docstring (which claims `poleId` "can be combined with `projectId` and/or `customerId` to also verify the pole belongs to that project/customer"); fixed by building the `WHERE` clause from whichever conditions were actually given, joined with `AND`, rather than a mutually-exclusive chain — covers `poleId`+`projectId`, `poleId`+`customerId`, and all three together, confirming each combination still returns a single dict (not a list) and correctly returns `None` for a real pole that belongs to a *different* project than the one specified; a full-flow test confirming `customerId` (like `projectId`) flows all the way through `get_poles()`'s unfiltered case onto each pole in the result, not just at the `_pole_row_to_dict_with_parents()` unit level; **summary mode** — `_clamp_summary_limit()` (defaults/caps against `_SUMMARY_MAX_LIMIT`, confirmed well above `api_utils.MAX_LIMIT`, which is the whole reason this separate ceiling exists); `_POLE_SUMMARY_SQL_TEMPLATE`'s structure (no `OUTER APPLY`, no `LastUpload`/`BatteryVoltage1`/`BatteryVoltage2` columns, embeds the shared `_RECENT_POLE_STATS_CTE` rather than a second copy, still selects `InstallDate`/`Lat`/`Long`/`CustomerId`); `_summary_row_to_dict()`'s field set (matches the full-detail shape minus exactly the three telemetry fields, `null`-not-`0` for an unclassified pole); and `get_poles(summary=True)`'s full-flow behavior — the unfiltered case switches to the lighter template and the higher limit ceiling, an explicit `limit` is still respected within that raised ceiling, and `summary=True` combined with `poleId`/`projectId` still switches which query and dict-mapping function is used, not just in the unfiltered case |
 | `tests/test_users_api.py` | Structural checks on `get_users()`'s SQL: the `LEFT JOIN Customers` (not `INNER`, so a customer-less user like a Streetleaf Admin still appears, with `customerName` `NULL` rather than being dropped), and — a hard security requirement, not an incidental check — that `PasswordHash`/`ResetToken`/`ResetTokenExpiresAt` never appear in the `SELECT` list under any circumstance; camelCase field mapping (`_COLUMN_TO_JSON_KEY`), confirming PascalCase keys never leak through; `userId`/`customerId` filtering matching `customers_api.get_customers()`'s "always returns a list, 0 or 1 elements for an id lookup" contract; **`TestGetUsersCombinedFilter`** — confirms `userId`+`customerId` combine with `AND` from the start (built this way deliberately, avoiding the exact `if`/`elif`-silently-ignores-a-filter bug that was found and fixed in `poles_api.py` earlier, rather than repeating it and fixing it again later) |
-| `tests/test_schema_integration.py` | Column-name consistency between the code's SQL and a documented expected schema (all eight loader-backed tables, plus a lighter DDL-vs-generator check for `Workweek`); two opt-in **real** end-to-end tests (Airtable+SQL, and separately Leadsun+SQL, the latter now covering Models → Telemetry → TimeZones → DaylightFlags → Vitals) |
+| `tests/test_schema_integration.py` | Column-name consistency between the code's SQL and a documented expected schema (all eight loader-backed tables); two opt-in **real** end-to-end tests (Airtable+SQL, and separately Leadsun+SQL, the latter now covering Models → Telemetry → TimeZones → DaylightFlags → Vitals) |
 
 ```bash
 pytest -v
@@ -782,7 +772,13 @@ reference for a from-scratch project, not as the LightsApp deploy runbook.
   `Month` altogether. If a wider-than-Day rollup is wanted again later,
   the removed SQL templates and their tests are recoverable from git
   history (or ask to rebuild them) — nothing about the current Hour/Day
-  design would need to change to reintroduce them.
+  design would need to change to reintroduce them. The `Workweek` table
+  itself sat unused after that removal (nothing else in this project
+  ever read from it) and has since been dropped entirely too, along with
+  its generator script and tests — see "sql/Workweek/Drop tbl
+  Workweek.sql" for that later, separate cleanup; reintroducing `Week`
+  would mean rebuilding `Workweek` from scratch as well, not just the
+  period type's own SQL.
 
   **Per-reading formulas** (computed row-by-row, then averaged within
   each bucket):
@@ -877,11 +873,8 @@ reference for a from-scratch project, not as the LightsApp deploy runbook.
 
   **`PeriodEnd` is exclusive** (the start of the next period) for both
   period types — e.g. an Hour bucket's `PeriodEnd` is exactly
-  `PeriodStart + 1 hour`. This is worth noting because it differs from
-  `Workweek`'s own `EndDate` convention (inclusive — the Saturday itself,
-  not the following Sunday, relevant if `Workweek`/`Week` bucketing is
-  ever reintroduced); exclusive bounds were chosen here since they're
-  simpler for range queries (`WHERE ts >= PeriodStart AND ts <
+  `PeriodStart + 1 hour` — chosen since exclusive bounds are simpler for
+  range queries (`WHERE ts >= PeriodStart AND ts <
   PeriodEnd`) at hour/day granularity.
 
   **Scale**: `PoleTelemetry` is retained for 6 months and could grow to
@@ -948,51 +941,14 @@ reference for a from-scratch project, not as the LightsApp deploy runbook.
     `ERROR`) — while a genuinely different SQLSTATE (like the `22007`
     above) still correctly counts as a real failure.
 
-- **`Workweek` — a static calendar reference table, not synced from
-  anywhere, and currently unused now that the `Week` period type has
-  been removed from `PoleVitals`.** Left in place rather than dropped, in
-  case `Week`-style bucketing is ever reintroduced (see the note under
-  `PoleVitals` above) or some other future use comes up — it costs
-  nothing to leave a static, already-populated reference table sitting
-  unused. Unlike every other table in this project, there's no external
-  API, no loader function, no Azure Function, and no `Source`/`SP_ExecId`
-  columns — it's pure computed date arithmetic. `scripts/generate_workweek_sql.py`
-  is a standalone script (stdlib only, no `pyodbc`/Azure Functions
-  runtime needed) that emits an idempotent `MERGE` statement for a given
-  year range; `sql/Workweek/Populate tbl Workweek 2026-2030.sql` is its
-  output for the requested range, already generated (from when it was
-  still in active use).
-
-  **The convention, and why one was needed**: `Week` runs 1-52 always
-  (never 53), and every week is a full 7-day Sunday-Saturday span — but
-  52 × 7 = 364 days, one or two short of a full 365/366-day year, so some
-  convention has to absorb the difference. This one anchors **Week 1 of
-  year Y to the Sunday on-or-before January 1 of Y** (so Jan 1 always
-  falls in that year's Week 1), with each year computed independently
-  from its own January 1 rather than continuously rolling across years.
-  The practical effect: Week 1 of a year sometimes dips a few days into
-  the *previous* December (e.g. 2026's Week 1 starts Sun 2025-12-28,
-  since Jan 1 2026 is a Thursday), and correspondingly the last 2-8 days
-  of each December become part of the *following* year's Week 1 rather
-  than that year's (non-existent) Week 53. No calendar date within a
-  continuously-populated range is ever left uncovered — it just sometimes
-  lands under the year you might not expect at a glance. This is a real
-  interpretation choice, not the only valid one (ISO 8601 weeks, e.g.,
-  use Monday-Sunday and allow 53 weeks in some years) — if a different
-  convention is wanted later, `generate_workweek_sql.py` is the one place
-  to change the logic; regenerate and re-run the resulting script
-  afterward.
-
-  **Extending to future years** is a one-line command, no code changes
-  needed:
-  ```bash
-  python3 scripts/generate_workweek_sql.py 2031 2035 > "sql/Workweek/Populate tbl Workweek 2031-2035.sql"
-  ```
-  Then run the resulting `.sql` file against the database. The `MERGE` is
-  idempotent — re-running any populate script (including the existing
-  2026-2030 one) is always safe and won't create duplicates or error on
-  a second run, unlike a plain `INSERT` would against the `(Year, Week)`
-  primary key.
+- **`Workweek`** — a static calendar reference table this project used to
+  keep around for the `Week` period type (see the note under `PoleVitals`
+  above). Once that period type was removed, `Workweek` had no remaining
+  purpose and has since been dropped from the schema entirely, along with
+  its generator script and tests — see "sql/Workweek/Drop tbl
+  Workweek.sql" for the removal migration and its own comment for the
+  full week-numbering convention this table used to follow, preserved
+  there for anyone rebuilding it later.
 
 - **`shared/sql_client.py`'s `get_connection()` registers a `DATETIMEOFFSET`
   output converter on every connection it returns.** Discovered via a real

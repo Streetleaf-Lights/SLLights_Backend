@@ -17,6 +17,17 @@
 --     CustomerId are both linked-record references (list of ids, first one
 --     taken) -- see projects_loader.py's comments on "Contracting Entity"
 --     for background on that field-naming quirk.
+--   * CountyFips is VARCHAR(5), not INT -- a FIPS code can have a leading
+--     zero (e.g. "01001" for Autauga County, AL), which an INT column
+--     would silently strip on storage. This is what
+--     pole_timezones_loader.py joins against CountyTimeZones.FIPS with.
+--   * ControllerId matches up with PoleTelemetry.ProductId -- Leadsun's
+--     own name for the exact same underlying identifier, sourced here
+--     from Airtable's own "Controller ID" field instead. Two separate,
+--     independently-sourced columns rather than one shared column --
+--     see shared/poles_loader.py's own comment on _map_record_to_pole()'s
+--     ControllerId mapping for the full reasoning. NVARCHAR(50), matching
+--     PoleTelemetry.ProductId's own type/width.
 
 -- DROP TABLE IF EXISTS Poles;
 
@@ -27,11 +38,13 @@ BEGIN
         Id                      VARCHAR(50)         NOT NULL PRIMARY KEY,
         PoleNumber              NVARCHAR(100)       NULL,
         LocationId              VARCHAR(50)          NULL,
+        CountyFips              VARCHAR(5)           NULL,
         ProjectId               VARCHAR(50)          NULL,
         CustomerId              VARCHAR(50)          NULL,
         InstallDate             DATE                 NULL,
         Lat                     FLOAT                NULL,
         Long                    FLOAT                NULL,
+        ControllerId            NVARCHAR(50)         NULL,
         SP_ExecId               INT                  NULL,
         AirTableCreatedDateTime DATETIMEOFFSET(3)    NULL
     );
@@ -47,4 +60,7 @@ BEGIN
 
     CREATE NONCLUSTERED INDEX IX_Poles_LocationId
         ON Poles (LocationId);
+
+    CREATE NONCLUSTERED INDEX IX_Poles_CountyFips
+        ON Poles (CountyFips);
 END

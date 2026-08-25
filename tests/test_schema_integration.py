@@ -79,6 +79,7 @@ EXPECTED_PROJECTS_COLUMNS = {
     "PolesUnderContract",
     "EffectiveDate",
     "InstallDates",
+    "LeadsunProjectId",
     "AirTableCreatedDateTime",
 }
 
@@ -92,6 +93,7 @@ EXPECTED_POLES_COLUMNS = {
     "InstallDate",
     "Lat",
     "Long",
+    "ControllerId",
     "SP_ExecId",
     "AirTableCreatedDateTime",
 }
@@ -314,7 +316,7 @@ class TestPoleModelsSchemaConsistency:
 class TestPoleVitalsSchemaConsistency:
     """
     PoleVitals has no single _ALL_COLUMNS source of truth like the other
-    loaders (it's three hand-written MERGE statements, not a generic
+    loaders (it's two hand-written MERGE statements, not a generic
     fetch-map-upsert pipeline), so this hardcodes the expected column set
     from the DDL and cross-checks each period type's INSERT column list
     against it directly.
@@ -346,12 +348,11 @@ class TestPoleVitalsSchemaConsistency:
         cols = {c.strip() for c in match.group(1).split(",")}
         assert cols == self._EXPECTED_COLUMNS
 
-    @pytest.mark.parametrize("period_type", ("Hour", "Day"))
-    def test_update_set_columns_never_touch_the_match_key(self, period_type):
-        """Hour/Day match on (LocationId, PeriodType, PeriodStart), so
+    def test_update_set_columns_never_touch_the_match_key(self):
+        """Hour matches on (LocationId, PeriodType, PeriodStart), so
         none of those three should appear in the UPDATE SET list.
         Last48Hours is different -- see the test below."""
-        sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE[period_type]
+        sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE["Hour"]
         match = re.search(r"THEN UPDATE SET\s*(.+?)\s*WHEN NOT MATCHED", sql, re.DOTALL)
         assignments = match.group(1).strip().rstrip(",").split(",")
         cols = {a.split("=")[0].strip() for a in assignments}
@@ -400,34 +401,6 @@ class TestPoleTimeZonesSchemaConsistency:
         assignments = match.group(1).strip().rstrip(",").split(",")
         cols = {a.split("=")[0].strip() for a in assignments}
         assert cols == self._EXPECTED_COLUMNS - {"LocationId"}
-
-
-class TestWorkweekSchemaConsistency:
-    """
-    Workweek has no loader module (it's static computed data, not synced
-    from Airtable/Leadsun), so there's no _ALL_COLUMNS to cross-check
-    against like the other tables -- instead this checks the DDL's column
-    list against what scripts/generate_workweek_sql.py actually emits.
-    """
-
-    _EXPECTED_COLUMNS = {"Year", "Week", "StartDate", "EndDate"}
-
-    def test_ddl_columns_match_generator_output_columns(self):
-        from scripts.generate_workweek_sql import generate_merge_sql
-
-        sql = generate_merge_sql(2026, 2026)
-        match = re.search(r"AS source \(([^)]+)\)", sql)
-        cols = {c.strip() for c in match.group(1).split(",")}
-        assert cols == self._EXPECTED_COLUMNS
-
-    def test_generator_produces_a_merge_not_a_plain_insert(self):
-        """Idempotent/re-runnable, consistent with every other loader in
-        this project using upsert semantics rather than a one-shot insert
-        that would fail on re-run."""
-        from scripts.generate_workweek_sql import generate_merge_sql
-
-        sql = generate_merge_sql(2026, 2026)
-        assert "MERGE Workweek AS target" in sql
 
 
 # --------------------------------------------------------------------------

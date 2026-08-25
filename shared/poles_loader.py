@@ -27,6 +27,11 @@ AIRTABLE_POLES_FIELDS = [
     "Field Installed",
     "LAT",
     "LONG",
+    "Controller ID",  # matches up with PoleTelemetry.ProductId (Leadsun's
+    # own name for the same underlying identifier) -- two different
+    # systems' own naming for the same concept, not two different
+    # concepts. See _map_record_to_pole()'s own comment on ControllerId
+    # for the full reasoning.
 ]
 
 ENVIRONMENT = os.environ.get("ENVIRONMENT", "Dev")
@@ -62,30 +67,31 @@ MERGE Poles AS target
 USING (
     SELECT
         ? AS Id, ? AS PoleNumber, ? AS LocationId, ? AS CountyFips, ? AS ProjectId, ? AS CustomerId,
-        ? AS InstallDate, ? AS Lat, ? AS Long, ? AS SP_ExecId, ? AS AirTableCreatedDateTime
+        ? AS InstallDate, ? AS Lat, ? AS Long, ? AS ControllerId, ? AS SP_ExecId, ? AS AirTableCreatedDateTime
 ) AS source
 ON target.Id = source.Id
 WHEN MATCHED AND NOT EXISTS (
     SELECT target.PoleNumber, target.LocationId, target.CountyFips, target.ProjectId, target.CustomerId,
-           target.InstallDate, target.Lat, target.Long
+           target.InstallDate, target.Lat, target.Long, target.ControllerId
     INTERSECT
     SELECT source.PoleNumber, source.LocationId, source.CountyFips, source.ProjectId, source.CustomerId,
-           source.InstallDate, source.Lat, source.Long
+           source.InstallDate, source.Lat, source.Long, source.ControllerId
 )
 THEN UPDATE SET
-    PoleNumber  = source.PoleNumber,
-    LocationId  = source.LocationId,
-    CountyFips  = source.CountyFips,
-    ProjectId   = source.ProjectId,
-    CustomerId  = source.CustomerId,
-    InstallDate = source.InstallDate,
-    Lat         = source.Lat,
-    Long        = source.Long,
-    SP_ExecId   = source.SP_ExecId
+    PoleNumber   = source.PoleNumber,
+    LocationId   = source.LocationId,
+    CountyFips   = source.CountyFips,
+    ProjectId    = source.ProjectId,
+    CustomerId   = source.CustomerId,
+    InstallDate  = source.InstallDate,
+    Lat          = source.Lat,
+    Long         = source.Long,
+    ControllerId = source.ControllerId,
+    SP_ExecId    = source.SP_ExecId
 WHEN NOT MATCHED THEN
-    INSERT (Id, PoleNumber, LocationId, CountyFips, ProjectId, CustomerId, InstallDate, Lat, Long, SP_ExecId, AirTableCreatedDateTime)
+    INSERT (Id, PoleNumber, LocationId, CountyFips, ProjectId, CustomerId, InstallDate, Lat, Long, ControllerId, SP_ExecId, AirTableCreatedDateTime)
     VALUES (source.Id, source.PoleNumber, source.LocationId, source.CountyFips, source.ProjectId, source.CustomerId,
-            source.InstallDate, source.Lat, source.Long, source.SP_ExecId, source.AirTableCreatedDateTime);
+            source.InstallDate, source.Lat, source.Long, source.ControllerId, source.SP_ExecId, source.AirTableCreatedDateTime);
 """
 
 # --------------------------------------------------------------------------
@@ -118,14 +124,15 @@ CREATE TABLE #PolesStaging (
     InstallDate             DATE              NULL,
     Lat                     FLOAT             NULL,
     Long                    FLOAT             NULL,
+    ControllerId            NVARCHAR(50)      NULL,
     SP_ExecId               INT               NULL,
     AirTableCreatedDateTime DATETIMEOFFSET(3) NULL
 );
 """
 
 _STAGING_INSERT_SQL = """
-INSERT INTO #PolesStaging (Id, PoleNumber, LocationId, CountyFips, ProjectId, CustomerId, InstallDate, Lat, Long, SP_ExecId, AirTableCreatedDateTime)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO #PolesStaging (Id, PoleNumber, LocationId, CountyFips, ProjectId, CustomerId, InstallDate, Lat, Long, ControllerId, SP_ExecId, AirTableCreatedDateTime)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 _MERGE_FROM_STAGING_SQL = """
@@ -134,25 +141,26 @@ USING #PolesStaging AS source
 ON target.Id = source.Id
 WHEN MATCHED AND NOT EXISTS (
     SELECT target.PoleNumber, target.LocationId, target.CountyFips, target.ProjectId, target.CustomerId,
-           target.InstallDate, target.Lat, target.Long
+           target.InstallDate, target.Lat, target.Long, target.ControllerId
     INTERSECT
     SELECT source.PoleNumber, source.LocationId, source.CountyFips, source.ProjectId, source.CustomerId,
-           source.InstallDate, source.Lat, source.Long
+           source.InstallDate, source.Lat, source.Long, source.ControllerId
 )
 THEN UPDATE SET
-    PoleNumber  = source.PoleNumber,
-    LocationId  = source.LocationId,
-    CountyFips  = source.CountyFips,
-    ProjectId   = source.ProjectId,
-    CustomerId  = source.CustomerId,
-    InstallDate = source.InstallDate,
-    Lat         = source.Lat,
-    Long        = source.Long,
-    SP_ExecId   = source.SP_ExecId
+    PoleNumber   = source.PoleNumber,
+    LocationId   = source.LocationId,
+    CountyFips   = source.CountyFips,
+    ProjectId    = source.ProjectId,
+    CustomerId   = source.CustomerId,
+    InstallDate  = source.InstallDate,
+    Lat          = source.Lat,
+    Long         = source.Long,
+    ControllerId = source.ControllerId,
+    SP_ExecId    = source.SP_ExecId
 WHEN NOT MATCHED THEN
-    INSERT (Id, PoleNumber, LocationId, CountyFips, ProjectId, CustomerId, InstallDate, Lat, Long, SP_ExecId, AirTableCreatedDateTime)
+    INSERT (Id, PoleNumber, LocationId, CountyFips, ProjectId, CustomerId, InstallDate, Lat, Long, ControllerId, SP_ExecId, AirTableCreatedDateTime)
     VALUES (source.Id, source.PoleNumber, source.LocationId, source.CountyFips, source.ProjectId, source.CustomerId,
-            source.InstallDate, source.Lat, source.Long, source.SP_ExecId, source.AirTableCreatedDateTime);
+            source.InstallDate, source.Lat, source.Long, source.ControllerId, source.SP_ExecId, source.AirTableCreatedDateTime);
 """
 
 _TRUNCATE_STAGING_SQL = "TRUNCATE TABLE #PolesStaging"
@@ -257,6 +265,16 @@ def _map_record_to_pole(record: dict) -> dict:
         "InstallDate": fields.get("Field Installed"),
         "Lat": _clean_coordinate(fields.get("LAT")),
         "Long": _clean_coordinate(fields.get("LONG")),
+        # Confirmed matches up with PoleTelemetry.ProductId -- Leadsun's
+        # own name for the exact same underlying identifier, not a
+        # different concept that happens to look similar. Two separate,
+        # independently-sourced columns (this one from Airtable, that one
+        # from Leadsun's own API) rather than one shared column, since
+        # every other column in this table is likewise named after
+        # WHATEVER LABEL AIRTABLE ITSELF uses, not a cross-system alias --
+        # kept consistent with that same convention here, rather than
+        # naming this "ProductId" to match Leadsun's own term instead.
+        "ControllerId": fields.get("Controller ID"),
         "AirTableCreatedDateTime": _airtable_created_time_to_eastern(
             record.get("createdTime")
         ),
@@ -322,6 +340,7 @@ def load_poles() -> None:
                 pole["InstallDate"],
                 pole["Lat"],
                 pole["Long"],
+                pole["ControllerId"],
                 sp_exec_id,
                 pole["AirTableCreatedDateTime"],
             )

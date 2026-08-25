@@ -9,7 +9,6 @@ SELECT
     SunboardPower,
     LightPower,
     Battery,
-    BatteryChargingMin,
     SystemVoltage,
     CommType,
     LightDisType,
@@ -26,5 +25,4 @@ SELECT
 FROM PoleModels
 WHERE 1 = 1
 -- AND ModelId = 153
--- AND BatteryChargingMin IS NULL
 ORDER BY ModelId;

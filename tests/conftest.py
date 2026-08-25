@@ -293,6 +293,14 @@ def patch_get_connection_poles_api(mocker, mock_conn):
 
 
 @pytest.fixture
+def patch_get_connection_projects_api(mocker, mock_conn):
+    """Patches shared.projects_api.get_connection to return mock_conn."""
+    return mocker.patch(
+        "shared.projects_api.get_connection", return_value=mock_conn
+    )
+
+
+@pytest.fixture
 def patch_fetch_all_records_poles(mocker):
     """Patches shared.poles_loader.fetch_all_records (already imported by name)."""
     return mocker.patch("shared.poles_loader.fetch_all_records")
@@ -319,6 +327,7 @@ def make_pole_record():
         install_date="2026-03-01",
         lat=27.9506,
         long=-82.4572,
+        controller_id="CTRL-9999",
         extra_fields=None,
     ):
         fields = {
@@ -330,6 +339,7 @@ def make_pole_record():
             "Field Installed": install_date,
             "LAT": lat,
             "LONG": long,
+            "Controller ID": controller_id,
         }
         if extra_fields:
             fields.update(extra_fields)
@@ -358,6 +368,7 @@ def make_project_record():
         poles_under_contract=25,
         effective_date="2026-01-15",
         install_dates=None,
+        leadsun_project_id=482,
         extra_fields=None,
     ):
         fields = {
@@ -368,6 +379,7 @@ def make_project_record():
             "Lights Under Contract": poles_under_contract,
             "Effective Date": effective_date,
             "Install Date(S)": install_dates if install_dates is not None else ["2026-03-01"],
+            "Leadsun ProjectID": leadsun_project_id,
         }
         if extra_fields:
             fields.update(extra_fields)

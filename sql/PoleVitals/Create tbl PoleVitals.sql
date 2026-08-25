@@ -1,19 +1,44 @@
--- PoleVitals: rolling averages of pole health metrics (battery, solar
--- panel, light output) derived FROM PoleTelemetry + PoleModels, bucketed
--- into Hour/Day periods per LocationId.
+-- PoleVitals: rolling health metrics (battery, solar panel, light
+-- output, and per-reading fault flags) derived FROM PoleTelemetry +
+-- PoleModels + PoleTimeZones, bucketed by LocationId + PeriodType.
 --
--- Week and Month period types were removed from active computation (see
--- shared/pole_vitals_loader.py's module docstring and the README for the
--- full history -- a real row-explosion bug in Week's Workweek join, then
+-- This is the CONSOLIDATED, up-to-date schema -- it supersedes the
+-- separate "Create tbl PoleVitals.sql" / "Add IsOnline and LightStatus
+-- columns to PoleVitals.sql" / "Replace LightStatus with fault flags and
+-- allow Last48Hours.sql" / "Widen PeriodType to fit Last48Hours.sql" /
+-- "Allow LastKnown48Hours PeriodType.sql" migrations that used to live
+-- in this same folder (each one incrementally evolved the table over
+-- time; this single script reflects where they all ended up, for a
+-- brand NEW environment being set up from scratch). If you're instead
+-- bringing an EXISTING, already-migrated PoleVitals table up to date
+-- with the latest change (removing 'Day'/'Week'/'Month' from the
+-- allowed PeriodType set), see "Remove Day Week and Month PeriodTypes.sql"
+-- in this same folder instead -- this CREATE script's own IF NOT EXISTS
+-- guard means it silently does nothing at all against a table that
+-- already exists, so it can't apply that change to a live database on
+-- its own.
+--
+-- Four period types were ever computed at different points in this
+-- project's history: Hour, Day, Week, and Month, plus a later-added
+-- Last48Hours (a single, continuously-updated rolling window per pole,
+-- not a discrete historical bucket) and LastKnown48Hours (identical to
+-- Last48Hours, but persists for an offline pole rather than
+-- disappearing). By explicit request, only Hour, Last48Hours, and
+-- LastKnown48Hours are computed and permitted going forward -- Day,
+-- Week, and Month have all been removed entirely (Week/Month due to a
+-- real row-explosion bug in Week's own Workweek join, followed by
 -- persistent database CPU contention that never resolved proportionally
--- to the tuning effort spent on it). The CHECK CONSTRAINT below
--- deliberately still allows 'Week'/'Month' as PeriodType values, rather
--- than being tightened to just ('Hour', 'Day') -- if any existing rows
--- with PeriodType IN ('Week', 'Month') are still in this table, a
--- tightened constraint would need those rows dealt with first (deleted,
--- or the constraint added WITH NOCHECK). Whether to delete those
--- historical rows, and whether to tighten this constraint afterward, is
--- an open decision -- ask if you want help with either.
+-- to the tuning effort spent on it; Day for consolidation, once it was
+-- the only one left of the three "historical discrete bucket" period
+-- types). See shared/pole_vitals_loader.py's own module docstring for
+-- the full history and design of what's actually computed today.
+--
+-- Existing historical rows with PeriodType IN ('Day', 'Week', 'Month')
+-- are NOT deleted by removing them from the CHECK CONSTRAINT below --
+-- only NEW rows with those values are prevented going forward. See
+-- "Remove Day Week and Month PeriodTypes.sql" for how an existing,
+-- already-populated table applies this same tightening via WITH NOCHECK
+-- specifically so it doesn't reject those already-present rows.
 --
 -- Unlike every other table in this project, this one isn't synced from an
 -- external API directly -- it's computed FROM already-loaded data
@@ -33,22 +58,28 @@
 -- A reading whose model can't be found, or whose SunboardPower/LightPower
 -- is 0, contributes NULL for that specific percentage (NULLIF-guarded in
 -- the loader's SQL) rather than erroring or skewing the average -- AVG()
--- ignores NULLs.
+-- ignores NULLs. For Last48Hours/LastKnown48Hours specifically,
+-- AvgPanelPercentage/AvgLightPercentage are further restricted to only
+-- readings taken during daylight with the battery genuinely charging
+-- (for Panel) or at night (for Light) -- see pole_vitals_loader.py's own
+-- comments on those two constants for the exact conditions.
 --
--- IsOnline / LightStatus: see shared/pole_vitals_loader.py's module-level
--- comment for the full per-reading classification and bucket-aggregation
--- logic. One thing worth restating here since it's easy to get wrong:
--- for Day, the "last 6 hours" window IsOnline/LightStatus use is relative
--- to EACH BUCKET'S OWN END, not to whenever load_pole_vitals() happens to
--- run -- a historical bucket recomputed later still reflects that same
--- period's own tail end, not "now".
+-- Fault flags (IsLedFault/IsBatteryFault/IsPanelFault/IsOpenIssueFault/
+-- IsPoleFault) replace an earlier Daylight-based LightStatus
+-- classification ('Working'/'DayLight'/'Not Working') that has since
+-- been removed from this table entirely -- LightStatus no longer exists
+-- anywhere in this project. See shared/pole_vitals_loader.py's own
+-- module-level comment for the full per-reading classification and
+-- bucket-aggregation logic behind each fault flag.
 --
--- PeriodEnd is EXCLUSIVE (the start of the next period), e.g. an Hour
--- bucket's PeriodEnd is exactly PeriodStart + 1 hour -- this differs from
--- Workweek's own EndDate convention (inclusive, the Saturday itself,
--- relevant if Week bucketing is ever reintroduced), a deliberate choice
+-- IsOnline: Hour/Last48Hours both use "was ANY reading in the bucket/
+-- window online". See shared/pole_vitals_loader.py's own module
+-- docstring for the exact aggregation.
+--
+-- PeriodEnd is EXCLUSIVE (the start of the next period) for Hour, e.g.
+-- an Hour bucket's PeriodEnd is exactly PeriodStart + 1 hour -- chosen
 -- since exclusive bounds are simpler for range queries
--- (`WHERE ts >= PeriodStart AND ts < PeriodEnd`) at hour/day granularity.
+-- (`WHERE ts >= PeriodStart AND ts < PeriodEnd`).
 --
 -- No FK anywhere -- same reasoning as PoleTelemetry/PoleModels: this
 -- project doesn't enforce FKs where load/compute order makes it
@@ -62,34 +93,27 @@ IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'PoleVitals')
 BEGIN
     CREATE TABLE PoleVitals (
         LocationId           NVARCHAR(100)     NOT NULL,
-        PeriodType           VARCHAR(10)       NOT NULL,  -- 'Hour' or 'Day' actively computed --
-                                                            -- 'Week'/'Month' still allowed by the
-                                                            -- CHECK CONSTRAINT below but no longer
-                                                            -- written by load_pole_vitals() -- see
-                                                            -- the header comment above
+        PeriodType           VARCHAR(20)       NOT NULL,  -- 'Hour', 'Last48Hours', or
+                                                            -- 'LastKnown48Hours' -- see the
+                                                            -- header comment above for the
+                                                            -- full history of what this
+                                                            -- column has allowed over time
         PeriodStart          DATETIMEOFFSET(3) NOT NULL,
-        PeriodEnd            DATETIMEOFFSET(3) NOT NULL,  -- exclusive -- see note above
+        PeriodEnd            DATETIMEOFFSET(3) NOT NULL,  -- exclusive for Hour -- see note above
         AvgBatteryPercentage FLOAT             NULL,
         AvgPanelPercentage   FLOAT             NULL,
         AvgLightPercentage   FLOAT             NULL,
-        IsOnline             BIT               NULL,  -- Hour: any reading in the bucket was online.
-                                                        -- Day: any reading in the last 6
-                                                        -- hours OF THAT BUCKET'S OWN END was online
-                                                        -- (not "now", and not the whole period) --
-                                                        -- see the header comment above and
-                                                        -- pole_vitals_loader.py's module docstring
-        LightStatus          VARCHAR(20)        NULL,  -- 'Working' / 'DayLight' / 'Not Working' --
-                                                        -- see pole_vitals_loader.py for the exact
-                                                        -- per-reading classification and priority-based
-                                                        -- bucket aggregation
+        IsOnline             BIT               NULL,
+        IsLedFault           BIT               NULL,
+        IsBatteryFault       BIT               NULL,
+        IsPanelFault         BIT               NULL,
+        IsOpenIssueFault     BIT               NULL,
+        IsPoleFault          BIT               NULL,
         RecordCount          INT               NOT NULL,  -- how many telemetry readings fed this average
         Source               VARCHAR(50)       NOT NULL,
         SP_ExecId            INT               NULL,
         CONSTRAINT PK_PoleVitals PRIMARY KEY (LocationId, PeriodType, PeriodStart),
-        -- Deliberately NOT tightened to ('Hour', 'Day') -- see the header
-        -- comment above for why this is an open decision, not an oversight.
-        CONSTRAINT CK_PoleVitals_PeriodType CHECK (PeriodType IN ('Hour', 'Day', 'Week', 'Month')),
-        CONSTRAINT CK_PoleVitals_LightStatus CHECK (LightStatus IN ('Working', 'DayLight', 'Not Working'))
+        CONSTRAINT CK_PoleVitals_PeriodType CHECK (PeriodType IN ('Hour', 'Last48Hours', 'LastKnown48Hours'))
     );
 
     CREATE NONCLUSTERED INDEX IX_PoleVitals_PeriodType_PeriodStart

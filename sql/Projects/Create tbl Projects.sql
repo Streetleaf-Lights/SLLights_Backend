@@ -14,6 +14,14 @@
 --     install date), so it's stored the same way as PoleNumbers/PoleIds --
 --     JSON-encoded text in NVARCHAR(MAX), not a native DATE/date-list type.
 --   * SP_ExecId has no FK either, consistent with Customers.SP_ExecId.
+--   * LeadsunProjectId is INT, matching PoleTelemetry.LeadsunProjectId's
+--     own type (confirmed INT in a real Leadsun /lamps response, e.g.
+--     442, 314) -- correlates a Project directly with its own
+--     PoleTelemetry rows via this shared identifier, rather than only
+--     indirectly through Poles. Sourced from Airtable's own "Leadsun
+--     Projectid" field (ASSUMED exact spelling, per what was reported --
+--     confirm against the real base if this comes back NULL for every
+--     project).
 
 -- DROP TABLE IF EXISTS Projects;
 
@@ -30,6 +38,7 @@ BEGIN
         PolesUnderContract      INT                  NULL,
         EffectiveDate           DATE                 NULL,
         InstallDates            NVARCHAR(MAX)        NULL,
+        LeadsunProjectId        INT                  NULL,
         AirTableCreatedDateTime DATETIMEOFFSET(3)    NULL
     );
 
@@ -41,4 +50,7 @@ BEGIN
 
     CREATE NONCLUSTERED INDEX IX_Projects_Name
         ON Projects (Name);
+
+    CREATE NONCLUSTERED INDEX IX_Projects_LeadsunProjectId
+        ON Projects (LeadsunProjectId);
 END

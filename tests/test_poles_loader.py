@@ -26,6 +26,7 @@ class TestMapRecordToPole:
             install_date="2026-05-01",
             lat=27.9,
             long=-82.4,
+            controller_id="CTRL-1234",
         )
 
         result = poles_loader._map_record_to_pole(record)
@@ -39,6 +40,24 @@ class TestMapRecordToPole:
         assert result["InstallDate"] == "2026-05-01"
         assert result["Lat"] == 27.9
         assert result["Long"] == -82.4
+        assert result["ControllerId"] == "CTRL-1234"
+
+    def test_controller_id_read_from_its_own_airtable_field(self, make_pole_record):
+        """"Controller ID" is a plain scalar Airtable field (not a
+        linked-record field like Contracting Entity/Customer ID), read
+        directly with no list-unwrapping needed -- confirmed matches up
+        with PoleTelemetry.ProductId (Leadsun's own name for the same
+        underlying identifier), but sourced independently here from
+        Airtable's own field, not derived from or joined against
+        PoleTelemetry in any way at load time."""
+        record = make_pole_record(controller_id="CTRL-5678")
+        result = poles_loader._map_record_to_pole(record)
+        assert result["ControllerId"] == "CTRL-5678"
+
+    def test_missing_controller_id_becomes_none(self, make_pole_record):
+        record = make_pole_record(controller_id=None)
+        result = poles_loader._map_record_to_pole(record)
+        assert result["ControllerId"] is None
 
     def test_location_id_and_county_fips_are_read_from_separate_fields(
         self, make_pole_record
@@ -268,7 +287,7 @@ class TestPoleUpsertSqlStructure:
         sql_text, batch = mock_cursor.executemany.call_args.args
         assert "INSERT INTO #PolesStaging" in sql_text
         assert len(batch) == 1
-        assert sql_text.count("?") == len(batch[0]) == 11
+        assert sql_text.count("?") == len(batch[0]) == 12
 
     def test_merge_from_staging_is_executed_after_staging_insert(
         self, patch_get_connection_poles, patch_fetch_all_records_poles, mock_cursor, make_pole_record
@@ -286,7 +305,7 @@ class TestPoleUpsertSqlStructure:
         sql = poles_loader._POLE_UPSERT_SQL
         insert_cols = re.search(r"INSERT \(([^)]+)\)", sql).group(1)
         values_cols = re.search(r"VALUES \(([^)]+)\)", sql, re.DOTALL).group(1)
-        assert len(insert_cols.split(",")) == len(values_cols.split(",")) == 11
+        assert len(insert_cols.split(",")) == len(values_cols.split(",")) == 12
 
     def test_merge_match_key_is_id(self):
         assert "ON target.Id = source.Id" in poles_loader._POLE_UPSERT_SQL
@@ -317,7 +336,7 @@ class TestStagingMergeSqlStructure:
     def test_staging_insert_placeholder_count_matches_column_count(self):
         sql = poles_loader._STAGING_INSERT_SQL
         insert_cols = re.search(r"INSERT INTO #PolesStaging \(([^)]+)\)", sql).group(1)
-        assert len(insert_cols.split(",")) == sql.count("?") == 11
+        assert len(insert_cols.split(",")) == sql.count("?") == 12
 
     def test_merge_from_staging_sources_the_staging_table(self):
         assert "USING #PolesStaging AS source" in poles_loader._MERGE_FROM_STAGING_SQL
@@ -336,7 +355,7 @@ class TestStagingMergeSqlStructure:
         sql = poles_loader._MERGE_FROM_STAGING_SQL
         insert_cols = re.search(r"INSERT \(([^)]+)\)", sql).group(1)
         values_cols = re.search(r"VALUES \(([^)]+)\)", sql, re.DOTALL).group(1)
-        assert len(insert_cols.split(",")) == len(values_cols.split(",")) == 11
+        assert len(insert_cols.split(",")) == len(values_cols.split(",")) == 12
 
     def test_truncate_staging_sql_targets_staging_table(self):
         assert poles_loader._TRUNCATE_STAGING_SQL == "TRUNCATE TABLE #PolesStaging"
@@ -448,9 +467,9 @@ class TestLoadPolesSuccessFlow:
         assert len(batch) == 2
         assert batch[0][0] == "recPole1"
         assert batch[0][3] == "12057"  # CountyFips position
-        assert batch[0][9] == 7  # SP_ExecId position
+        assert batch[0][10] == 7  # SP_ExecId position
         assert batch[1][0] == "recPole2"
-        assert batch[1][9] == 7
+        assert batch[1][10] == 7
 
         update_sql, end_time, success, errors, batch_count, sp_exec_id = calls[4].args
         assert "UPDATE SP_Execution" in update_sql

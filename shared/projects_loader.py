@@ -35,15 +35,15 @@ USING (
     SELECT
         ? AS Id, ? AS Name, CAST(? AS NVARCHAR(MAX)) AS PoleNumbers, CAST(? AS NVARCHAR(MAX)) AS PoleIds, ? AS SP_ExecId,
         ? AS CustomerId, ? AS PolesUnderContract, ? AS EffectiveDate,
-        CAST(? AS NVARCHAR(MAX)) AS InstallDates, ? AS AirTableCreatedDateTime
+        CAST(? AS NVARCHAR(MAX)) AS InstallDates, ? AS LeadsunProjectId, ? AS AirTableCreatedDateTime
 ) AS source
 ON target.Id = source.Id
 WHEN MATCHED AND NOT EXISTS (
     SELECT target.Name, target.PoleNumbers, target.PoleIds, target.CustomerId,
-           target.PolesUnderContract, target.EffectiveDate, target.InstallDates
+           target.PolesUnderContract, target.EffectiveDate, target.InstallDates, target.LeadsunProjectId
     INTERSECT
     SELECT source.Name, source.PoleNumbers, source.PoleIds, source.CustomerId,
-           source.PolesUnderContract, source.EffectiveDate, source.InstallDates
+           source.PolesUnderContract, source.EffectiveDate, source.InstallDates, source.LeadsunProjectId
 )
 THEN UPDATE SET
     Name               = source.Name,
@@ -53,12 +53,13 @@ THEN UPDATE SET
     CustomerId         = source.CustomerId,
     PolesUnderContract = source.PolesUnderContract,
     EffectiveDate      = source.EffectiveDate,
-    InstallDates       = source.InstallDates
+    InstallDates       = source.InstallDates,
+    LeadsunProjectId   = source.LeadsunProjectId
 WHEN NOT MATCHED THEN
-    INSERT (Id, Name, PoleNumbers, PoleIds, SP_ExecId, CustomerId, PolesUnderContract, EffectiveDate, InstallDates, AirTableCreatedDateTime)
+    INSERT (Id, Name, PoleNumbers, PoleIds, SP_ExecId, CustomerId, PolesUnderContract, EffectiveDate, InstallDates, LeadsunProjectId, AirTableCreatedDateTime)
     VALUES (source.Id, source.Name, source.PoleNumbers, source.PoleIds, source.SP_ExecId,
             source.CustomerId, source.PolesUnderContract, source.EffectiveDate,
-            source.InstallDates, source.AirTableCreatedDateTime);
+            source.InstallDates, source.LeadsunProjectId, source.AirTableCreatedDateTime);
 """
 
 
@@ -97,6 +98,15 @@ def _map_record_to_project(record: dict) -> dict:
         "InstallDates": (
             json.dumps(install_dates) if isinstance(install_dates, list) else install_dates
         ),
+        # Correlates with PoleTelemetry.LeadsunProjectId -- Leadsun's own
+        # numeric project identifier (confirmed INT in a real /lamps
+        # response, e.g. 442, 314), now also recorded on the Airtable side
+        # per explicit request, so a Project can be joined directly to its
+        # own PoleTelemetry rows via this shared identifier rather than
+        # only indirectly (Project -> Poles.ProjectId -> Poles.LocationId
+        # -> PoleTelemetry.LocationId). Airtable's own field name confirmed
+        # to be "Leadsun ProjectID".
+        "LeadsunProjectId": fields.get("Leadsun ProjectID"),
         "AirTableCreatedDateTime": _airtable_created_time_to_eastern(
             record.get("createdTime")
         ),
@@ -155,6 +165,7 @@ def load_projects() -> None:
                     project["PolesUnderContract"],
                     project["EffectiveDate"],
                     project["InstallDates"],
+                    project["LeadsunProjectId"],
                     project["AirTableCreatedDateTime"],
                 )
                 total_success += 1

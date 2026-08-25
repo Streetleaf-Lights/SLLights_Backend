@@ -26,6 +26,7 @@ class TestMapRecordToProject:
             poles_under_contract=42,
             effective_date="2026-02-01",
             install_dates=["2026-04-15", "2026-05-01"],
+            leadsun_project_id=482,
         )
 
         result = projects_loader._map_record_to_project(record)
@@ -38,6 +39,21 @@ class TestMapRecordToProject:
         assert result["PolesUnderContract"] == 42
         assert result["EffectiveDate"] == "2026-02-01"
         assert result["InstallDates"] == json.dumps(["2026-04-15", "2026-05-01"])
+        assert result["LeadsunProjectId"] == 482
+
+    def test_leadsun_project_id_read_from_its_own_airtable_field(self, make_project_record):
+        """Correlates with PoleTelemetry.LeadsunProjectId -- Leadsun's own
+        numeric project identifier -- but sourced independently here from
+        Airtable's own field, not derived from or joined against
+        PoleTelemetry at load time."""
+        record = make_project_record(leadsun_project_id=999)
+        result = projects_loader._map_record_to_project(record)
+        assert result["LeadsunProjectId"] == 999
+
+    def test_missing_leadsun_project_id_becomes_none(self, make_project_record):
+        record = make_project_record(leadsun_project_id=None)
+        result = projects_loader._map_record_to_project(record)
+        assert result["LeadsunProjectId"] is None
 
     def test_non_list_pole_and_install_dates_fields_pass_through_unchanged(self, make_project_record):
         record = make_project_record(
@@ -106,13 +122,13 @@ class TestProjectUpsertSqlStructure:
         ]
         assert len(upsert_calls) == 1
         sql_text, *params = upsert_calls[0].args
-        assert sql_text.count("?") == len(params) == 10
+        assert sql_text.count("?") == len(params) == 11
 
     def test_insert_column_list_matches_values_list_length(self):
         sql = projects_loader._PROJECT_UPSERT_SQL
         insert_cols = re.search(r"INSERT \(([^)]+)\)", sql).group(1)
         values_cols = re.search(r"VALUES \(([^)]+)\)", sql, re.DOTALL).group(1)
-        assert len(insert_cols.split(",")) == len(values_cols.split(",")) == 10
+        assert len(insert_cols.split(",")) == len(values_cols.split(",")) == 11
 
     def test_merge_match_key_is_id(self):
         assert "ON target.Id = source.Id" in projects_loader._PROJECT_UPSERT_SQL
