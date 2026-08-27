@@ -15,7 +15,7 @@ _COLUMN_TO_JSON_KEY = [
     ("PolesUnderContract", "polesUnderContract"),
     ("EffectiveDate", "effectiveDate"),
     ("InstallDates", "installDates"),
-    ("LeadsunProjectId", "leadsunProjectId"),
+    ("LeadsunProject", "leadsunProject"),
     ("AirTableCreatedDateTime", "createdAt"),
 ]
 

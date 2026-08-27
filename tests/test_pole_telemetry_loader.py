@@ -2,12 +2,16 @@
 
 import json
 import re
+from datetime import datetime, timedelta
 from unittest.mock import MagicMock
+from zoneinfo import ZoneInfo
 
 import pytest
+from freezegun import freeze_time
 
 from shared import pole_telemetry_loader
 
+EASTERN = ZoneInfo("America/New_York")
 DTO_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} [+-]\d{2}:\d{2}$")
 
 
@@ -631,3 +635,362 @@ class TestBackfillIsOpenIssueFaultFailureRecordingUsesAFreshConnection:
             "additionally failed to record this run's failure" in msg and "recovery also failed" in msg
             for msg in error_messages
         )
+
+
+# --------------------------------------------------------------------------
+# _aggregate_telemetry_by_leadsun_project() -- pure grouping/reshaping
+# logic, no database involved -- see that function's own docstring for
+# the full field-mapping reasoning this locks in.
+# --------------------------------------------------------------------------
+
+
+def _telemetry_row(
+    leadsun_project_id=482,
+    leadsun_project_name="Chaparral",
+    user_name="12009-brevard",
+    group_id=1149,
+    group_name="Chaparral Ph3",
+    gateway_code="GT18L94A25082883",
+    leadsun_id=10358,
+    location_id="12009-1000",
+    controller_code="A3P70LA323110598",
+    product_id="AE3SAP7323113143",
+):
+    """Matches _FETCH_TELEMETRY_FOR_PROJECT_AGGREGATION_SQL's own column
+    order exactly."""
+    return (
+        leadsun_project_id,
+        leadsun_project_name,
+        user_name,
+        group_id,
+        group_name,
+        gateway_code,
+        leadsun_id,
+        location_id,
+        controller_code,
+        product_id,
+    )
+
+
+class TestAggregateTelemetryByLeadsunProject:
+    def test_single_reading_produces_expected_shape(self):
+        result = pole_telemetry_loader._aggregate_telemetry_by_leadsun_project(
+            [_telemetry_row()]
+        )
+
+        assert list(result.keys()) == ["482"]
+        project = result["482"]
+        assert project["ProjectName"] == "Chaparral"
+        assert project["UserName"] == "12009-brevard"
+        assert len(project["groups"]) == 1
+
+        group = project["groups"][0]
+        assert group["GroupId"] == 1149
+        assert group["GroupName"] == "Chaparral Ph3"
+        assert group["GatewayCode"] == "GT18L94A25082883"
+        assert len(group["products"]) == 1
+
+        product = group["products"][0]
+        assert product == {
+            "ProductId": 10358,
+            "ProductName": "12009-1000",
+            "ControllerCode": "A3P70LA323110598",
+            "ProvidedProductId": "AE3SAP7323113143",
+        }
+
+    def test_field_mapping_disambiguates_id_from_provided_product_id(self):
+        """Regression guard for the exact confusion this structure was
+        designed to resolve: ProductId is Leadsun's raw "id"/LeadsunId (a
+        plain integer), ProvidedProductId is Leadsun's raw "productId"
+        (a separate, alphanumeric value) -- confirmed against a real
+        /lamps response where these two are genuinely different values
+        for the same pole, not two names for the same thing."""
+        row = _telemetry_row(leadsun_id=10358, product_id="AE3SAP7323113143")
+        result = pole_telemetry_loader._aggregate_telemetry_by_leadsun_project([row])
+        product = result["482"]["groups"][0]["products"][0]
+        assert product["ProductId"] == 10358
+        assert product["ProvidedProductId"] == "AE3SAP7323113143"
+        assert product["ProductId"] != product["ProvidedProductId"]
+
+    def test_project_key_is_a_string_not_the_original_int(self):
+        """Matches how Projects.LeadsunProject's own "ProjectId" is
+        stored -- a JSON STRING, from Airtable, via json.dumps() -- even
+        though PoleTelemetry.LeadsunProjectId itself is a plain INT
+        column. Both sides need to agree on one representation to match
+        correctly later in update_leadsun_project_details()."""
+        result = pole_telemetry_loader._aggregate_telemetry_by_leadsun_project(
+            [_telemetry_row(leadsun_project_id=482)]
+        )
+        assert "482" in result
+        assert 482 not in result
+
+    def test_multiple_products_in_the_same_group_are_both_kept(self):
+        rows = [
+            _telemetry_row(leadsun_id=1, location_id="LOC-1", product_id="PROD-1"),
+            _telemetry_row(leadsun_id=2, location_id="LOC-2", product_id="PROD-2"),
+        ]
+        result = pole_telemetry_loader._aggregate_telemetry_by_leadsun_project(rows)
+        products = result["482"]["groups"][0]["products"]
+        assert len(products) == 2
+        assert {p["ProductId"] for p in products} == {1, 2}
+
+    def test_multiple_groups_in_the_same_project_are_both_kept(self):
+        rows = [
+            _telemetry_row(group_id=100, group_name="Group A", leadsun_id=1),
+            _telemetry_row(group_id=200, group_name="Group B", leadsun_id=2),
+        ]
+        result = pole_telemetry_loader._aggregate_telemetry_by_leadsun_project(rows)
+        groups = result["482"]["groups"]
+        assert len(groups) == 2
+        assert {g["GroupId"] for g in groups} == {100, 200}
+
+    def test_multiple_projects_are_each_aggregated_independently(self):
+        rows = [
+            _telemetry_row(leadsun_project_id=1, leadsun_project_name="Project One"),
+            _telemetry_row(leadsun_project_id=2, leadsun_project_name="Project Two"),
+        ]
+        result = pole_telemetry_loader._aggregate_telemetry_by_leadsun_project(rows)
+        assert set(result.keys()) == {"1", "2"}
+        assert result["1"]["ProjectName"] == "Project One"
+        assert result["2"]["ProjectName"] == "Project Two"
+
+    def test_row_with_null_leadsun_project_id_is_skipped(self):
+        rows = [_telemetry_row(leadsun_project_id=None), _telemetry_row(leadsun_project_id=482)]
+        result = pole_telemetry_loader._aggregate_telemetry_by_leadsun_project(rows)
+        assert list(result.keys()) == ["482"]
+
+    def test_row_with_null_group_id_is_skipped(self):
+        rows = [_telemetry_row(group_id=None), _telemetry_row(group_id=1149)]
+        result = pole_telemetry_loader._aggregate_telemetry_by_leadsun_project(rows)
+        assert len(result["482"]["groups"]) == 1
+
+    def test_empty_input_produces_empty_result(self):
+        assert pole_telemetry_loader._aggregate_telemetry_by_leadsun_project([]) == {}
+
+    def test_real_dataset_matches_the_known_totals(self):
+        """Regression guard using the exact numbers this function was
+        validated against, from a real 11,837-record Leadsun /lamps
+        response: 176 distinct projects, and every single reading
+        accounted for exactly once across all groups/products (no loss,
+        no duplication)."""
+        import json as jsonlib
+        import os as oslib
+
+        fixture_path = oslib.path.join(
+            oslib.path.dirname(__file__), "fixtures", "leadsun_lamps_sample.json"
+        )
+        if not oslib.path.exists(fixture_path):
+            pytest.skip("Real-data fixture not present in this environment")
+
+        with open(fixture_path) as f:
+            records = jsonlib.load(f)
+
+        rows = [
+            (
+                r.get("projectId"), r.get("projectName"), r.get("userName"),
+                r.get("groupId"), r.get("groupName"), r.get("gatewayCode"),
+                r.get("id"), r.get("productName"), r.get("controllerCode"),
+                r.get("productId"),
+            )
+            for r in records
+        ]
+
+        result = pole_telemetry_loader._aggregate_telemetry_by_leadsun_project(rows)
+
+        assert len(result) == 176
+        total_products = sum(
+            len(group["products"]) for project in result.values() for group in project["groups"]
+        )
+        assert total_products == len(records)
+
+
+# --------------------------------------------------------------------------
+# update_leadsun_project_details()
+# --------------------------------------------------------------------------
+
+
+class TestUpdateLeadsunProjectDetailsSuccessFlow:
+    def test_matching_project_gets_updated_with_full_json(
+        self, patch_get_connection_pole_telemetry, mock_conn, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = (99,)
+        mock_cursor.fetchall.side_effect = [
+            [("recProj1", "482")],  # Projects with a Leadsun ProjectID recorded
+            [_telemetry_row()],  # matching telemetry
+        ]
+
+        pole_telemetry_loader.update_leadsun_project_details()
+
+        update_call = next(
+            c for c in mock_cursor.execute.call_args_list
+            if c.args[0] == pole_telemetry_loader._UPDATE_PROJECT_LEADSUN_PROJECT_SQL
+        )
+        leadsun_project_json, project_id = update_call.args[1:]
+        assert project_id == "recProj1"
+        parsed = json.loads(leadsun_project_json)
+        assert parsed["ProjectId"] == "482"
+        assert parsed["ProjectName"] == "Chaparral"
+        assert parsed["UserName"] == "12009-brevard"
+        assert len(parsed["groups"]) == 1
+
+    def test_project_with_no_matching_telemetry_is_left_untouched(
+        self, patch_get_connection_pole_telemetry, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = (99,)
+        mock_cursor.fetchall.side_effect = [
+            [("recProj1", "999")],  # this project's own ProjectId has no matching telemetry
+            [_telemetry_row(leadsun_project_id=482)],  # only 482 has telemetry
+        ]
+
+        pole_telemetry_loader.update_leadsun_project_details()
+
+        update_calls = [
+            c for c in mock_cursor.execute.call_args_list
+            if c.args[0] == pole_telemetry_loader._UPDATE_PROJECT_LEADSUN_PROJECT_SQL
+        ]
+        assert update_calls == []
+
+    def test_telemetry_with_no_matching_project_is_not_an_error(
+        self, patch_get_connection_pole_telemetry, mock_cursor
+    ):
+        """Telemetry for a LeadsunProjectId no Project in Airtable has
+        recorded yet -- simply nothing to update, not a failure."""
+        mock_cursor.fetchone.return_value = (99,)
+        mock_cursor.fetchall.side_effect = [
+            [],  # no Projects have a Leadsun ProjectID recorded at all
+            [_telemetry_row()],
+        ]
+
+        pole_telemetry_loader.update_leadsun_project_details()  # must not raise
+
+        final_update_args = mock_cursor.execute.call_args_list[-1].args
+        success, errors = final_update_args[2], final_update_args[3]
+        assert (success, errors) == (0, 0)
+
+    def test_final_sp_execution_update_counts_successful_projects(
+        self, patch_get_connection_pole_telemetry, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = (99,)
+        mock_cursor.fetchall.side_effect = [
+            [("recProj1", "482"), ("recProj2", "999")],
+            [_telemetry_row(leadsun_project_id=482)],  # only 482 has matching telemetry
+        ]
+
+        pole_telemetry_loader.update_leadsun_project_details()
+
+        final_update_args = mock_cursor.execute.call_args_list[-1].args
+        success, errors = final_update_args[2], final_update_args[3]
+        assert (success, errors) == (1, 0)
+
+    def test_commits_and_closes_cursor_and_connection(
+        self, patch_get_connection_pole_telemetry, mock_conn, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = (99,)
+        mock_cursor.fetchall.side_effect = [[], []]
+
+        pole_telemetry_loader.update_leadsun_project_details()
+
+        assert mock_conn.commit.called
+        mock_cursor.close.assert_called_once()
+        mock_conn.close.assert_called_once()
+
+
+class TestFetchTelemetryForProjectAggregationSqlIsBounded:
+    """
+    Regression guard for a real production incident: an earlier version
+    of _FETCH_TELEMETRY_FOR_PROJECT_AGGREGATION_SQL filtered ONLY on
+    "LeadsunProjectId IS NOT NULL", with no time bound at all --
+    LeadsunProjectId doesn't change over a pole's own history, so that
+    matched EVERY historical row for EVERY pole PoleTelemetry has ever
+    recorded (6 months of retention, potentially many readings per pole
+    per day), not just each pole's own current state. update_leadsun_
+    project_details() ran immediately after load_pole_telemetry()
+    finished successfully, then itself failed after an unexplained ~30
+    second delay -- exactly the shape of a query trying to scan far more
+    data than intended.
+    """
+
+    def test_sql_has_a_last_upload_lower_bound(self):
+        sql = pole_telemetry_loader._FETCH_TELEMETRY_FOR_PROJECT_AGGREGATION_SQL
+        assert "LastUpload >= ?" in sql
+
+    def test_sql_takes_only_the_latest_row_per_pole_within_the_window(self):
+        """Not just time-bounded -- also deduplicated to ONE row per
+        LocationId (via ROW_NUMBER), since a pole can still have
+        multiple readings within the lookback window."""
+        sql = pole_telemetry_loader._FETCH_TELEMETRY_FOR_PROJECT_AGGREGATION_SQL
+        assert "ROW_NUMBER() OVER (PARTITION BY LocationId ORDER BY LastUpload DESC)" in sql
+        assert "WHERE rn = 1" in sql
+
+    def test_lookback_constant_is_a_small_bounded_window_not_the_full_retention(self):
+        """3 hours (or anything similarly small), never anywhere close
+        to PoleTelemetry's own 6-month retention window -- this
+        function runs every 30 minutes, immediately after
+        load_pole_telemetry() has just refreshed every currently-
+        reporting pole, so a wide lookback here was never actually
+        needed to find "current" poles."""
+        assert pole_telemetry_loader._PROJECT_DETAILS_LOOKBACK <= timedelta(hours=6)
+
+    def test_cutoff_is_passed_as_a_single_bound_parameter(
+        self, patch_get_connection_pole_telemetry, mock_conn, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = (99,)
+        mock_cursor.fetchall.side_effect = [[], []]
+
+        pole_telemetry_loader.update_leadsun_project_details()
+
+        telemetry_call = next(
+            c for c in mock_cursor.execute.call_args_list
+            if c.args[0] == pole_telemetry_loader._FETCH_TELEMETRY_FOR_PROJECT_AGGREGATION_SQL
+        )
+        assert len(telemetry_call.args) == 2  # sql + exactly one bound cutoff
+        cutoff = telemetry_call.args[1]
+        assert isinstance(cutoff, str)  # _to_dto_string()'d, not a raw datetime -- see that call's own comment
+
+    def test_cutoff_reflects_the_configured_lookback(
+        self, patch_get_connection_pole_telemetry, mock_conn, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = (99,)
+        mock_cursor.fetchall.side_effect = [[], []]
+        frozen_now = datetime(2026, 8, 26, 12, 0, 0, tzinfo=EASTERN)
+
+        with freeze_time(frozen_now):
+            pole_telemetry_loader.update_leadsun_project_details()
+
+        telemetry_call = next(
+            c for c in mock_cursor.execute.call_args_list
+            if c.args[0] == pole_telemetry_loader._FETCH_TELEMETRY_FOR_PROJECT_AGGREGATION_SQL
+        )
+        cutoff = telemetry_call.args[1]
+        expected = frozen_now - pole_telemetry_loader._PROJECT_DETAILS_LOOKBACK
+        assert cutoff.startswith(expected.strftime("%Y-%m-%d %H:%M"))
+
+
+class TestUpdateLeadsunProjectDetailsFailureHandling:
+    def test_genuine_failure_propagates_and_is_recorded(
+        self, patch_get_connection_pole_telemetry, mocker, mock_conn, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = (99,)
+        mock_cursor.fetchall.side_effect = RuntimeError("connection lost mid-fetch")
+
+        recovery_conn = mocker.MagicMock(name="recovery_conn")
+        recovery_cursor = mocker.MagicMock(name="recovery_cursor")
+        recovery_conn.cursor.return_value = recovery_cursor
+        mocker.patch(
+            "shared.pole_telemetry_loader.get_connection",
+            side_effect=[mock_conn, recovery_conn],
+        )
+
+        with pytest.raises(RuntimeError, match="connection lost mid-fetch"):
+            pole_telemetry_loader.update_leadsun_project_details()
+
+        assert recovery_cursor.execute.called
+        update_sql, end_time, error_message, success, errors, sp_exec_id = (
+            recovery_cursor.execute.call_args.args
+        )
+        assert "UPDATE SP_Execution" in update_sql
+        assert "connection lost mid-fetch" in error_message
+        assert sp_exec_id == 99
+        recovery_conn.commit.assert_called_once()
+        mock_cursor.close.assert_called_once()
+        mock_conn.close.assert_called_once()

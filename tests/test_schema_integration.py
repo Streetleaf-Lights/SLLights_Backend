@@ -79,7 +79,7 @@ EXPECTED_PROJECTS_COLUMNS = {
     "PolesUnderContract",
     "EffectiveDate",
     "InstallDates",
-    "LeadsunProjectId",
+    "LeadsunProject",
     "AirTableCreatedDateTime",
 }
 
@@ -187,10 +187,15 @@ class TestProjectsSchemaConsistency:
         assert cols == EXPECTED_PROJECTS_COLUMNS
 
     def test_merge_update_set_columns_are_known(self):
+        """Line-based parsing (not the naive comma-split every other
+        table's own equivalent test uses) -- LeadsunProject's own value
+        expression is JSON_MODIFY(...), which has internal commas of its
+        own (separating that function's three arguments), so a plain
+        comma-split would incorrectly treat those as separate column
+        assignments."""
         sql = projects_loader._PROJECT_UPSERT_SQL
-        match = re.search(r"THEN UPDATE SET\s*(.+?)\s*WHEN NOT MATCHED", sql, re.DOTALL)
-        assignments = match.group(1).strip().rstrip(",").split(",")
-        cols = {a.split("=")[0].strip() for a in assignments}
+        set_clause = re.search(r"THEN UPDATE SET\s*(.+?)\s*WHEN NOT MATCHED", sql, re.DOTALL).group(1)
+        cols = set(re.findall(r"^\s*(\w+)\s*=", set_clause, re.MULTILINE))
         # Update path intentionally never touches Id or AirTableCreatedDateTime
         assert cols == EXPECTED_PROJECTS_COLUMNS - {"Id", "AirTableCreatedDateTime"}
 

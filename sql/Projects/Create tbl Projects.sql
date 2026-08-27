@@ -14,14 +14,23 @@
 --     install date), so it's stored the same way as PoleNumbers/PoleIds --
 --     JSON-encoded text in NVARCHAR(MAX), not a native DATE/date-list type.
 --   * SP_ExecId has no FK either, consistent with Customers.SP_ExecId.
---   * LeadsunProjectId is INT, matching PoleTelemetry.LeadsunProjectId's
---     own type (confirmed INT in a real Leadsun /lamps response, e.g.
---     442, 314) -- correlates a Project directly with its own
---     PoleTelemetry rows via this shared identifier, rather than only
---     indirectly through Poles. Sourced from Airtable's own "Leadsun
---     Projectid" field (ASSUMED exact spelling, per what was reported --
---     confirm against the real base if this comes back NULL for every
---     project).
+--   * LeadsunProject is a JSON object (NVARCHAR(MAX), not native SQL
+--     JSON -- this project stores all its JSON columns as plain text,
+--     e.g. PoleNumbers/PoleIds/InstallDates above, and reads them via
+--     JSON_VALUE/JSON_QUERY/JSON_MODIFY rather than a dedicated JSON
+--     type, since SQL Server itself has none). Always has at least a
+--     "ProjectId" key (Airtable's own "Leadsun ProjectID" field, written
+--     by projects_loader.py); ProjectName/UserName/groups are filled in
+--     SEPARATELY, later, by
+--     pole_telemetry_loader.update_leadsun_project_details(), which
+--     aggregates fresh from PoleTelemetry after each loadPoleTelemetry
+--     run -- see that function's own docstring for the full shape and
+--     field-mapping reasoning. No index on this column -- at this
+--     table's own modest scale (low hundreds of rows), a full scan to
+--     resolve JSON_VALUE(LeadsunProject, '$.ProjectId') = ? is more than
+--     fast enough; a computed column + index on that same expression
+--     would be the way to add one later if this table ever grows large
+--     enough to need it.
 
 -- DROP TABLE IF EXISTS Projects;
 
@@ -38,7 +47,7 @@ BEGIN
         PolesUnderContract      INT                  NULL,
         EffectiveDate           DATE                 NULL,
         InstallDates            NVARCHAR(MAX)        NULL,
-        LeadsunProjectId        INT                  NULL,
+        LeadsunProject          NVARCHAR(MAX)        NULL,
         AirTableCreatedDateTime DATETIMEOFFSET(3)    NULL
     );
 
@@ -50,7 +59,4 @@ BEGIN
 
     CREATE NONCLUSTERED INDEX IX_Projects_Name
         ON Projects (Name);
-
-    CREATE NONCLUSTERED INDEX IX_Projects_LeadsunProjectId
-        ON Projects (LeadsunProjectId);
 END

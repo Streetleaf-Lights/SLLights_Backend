@@ -29,21 +29,53 @@ ENVIRONMENT = os.environ.get("ENVIRONMENT", "Dev")
 # to INTERSECT/UNION/EXCEPT ("data type ntext ... is not comparable").
 # Casting forces the server to treat these as proper nvarchar(max), which IS
 # comparable, regardless of what type the driver guessed for the parameter.
+# LeadsunProject: a JSON OBJECT column, not a plain scalar -- replaces an
+# earlier, simpler LeadsunProjectId INT column entirely, per explicit
+# request. This loader only EVER knows Airtable's own "ProjectId" value;
+# the richer shape (ProjectName/UserName/groups/products, all sourced
+# from Leadsun telemetry) gets filled in SEPARATELY, LATER, by
+# pole_telemetry_loader.update_leadsun_project_details() after
+# load_pole_telemetry() runs on its own, independent schedule (every 30
+# minutes, vs this loader's twice-a-day cadence -- see function_app.py's
+# own loadAirTableData/loadLeadsunData comments).
+#
+# Given that, THIS loader's own UPDATE must be a SURGICAL merge into just
+# the "ProjectId" key -- NEVER a full-column overwrite. A plain
+# `LeadsunProject = source.LeadsunProject` (replacing the whole column,
+# the way every other column here works) would silently DESTROY whatever
+# groups/products structure the Leadsun pipeline already built for this
+# project on its own, most recent run -- a real, repeating data-loss bug
+# (every single time this loader runs, twice a day), not a hypothetical
+# edge case. JSON_MODIFY(ISNULL(target.LeadsunProject, '{}'), '$.ProjectId',
+# ...) reads the row's OWN CURRENT value first and only replaces that one
+# key within it, leaving groups/products (or anything else already
+# there) completely untouched.
+#
+# A NULL source.LeadsunProjectIdValue (Airtable's own field is empty for
+# this project) makes JSON_MODIFY REMOVE the "ProjectId" key entirely,
+# rather than setting it to a JSON null -- SQL Server's own default
+# behavior for JSON_MODIFY(..., NULL), not something worked around here.
+# Accepted as-is: a project with no Leadsun ProjectID recorded simply
+# has no "ProjectId" key at all until Airtable provides one, which is a
+# reasonable, if not the only valid, way to represent "no value" in this
+# JSON document.
 _PROJECT_UPSERT_SQL = """
 MERGE Projects AS target
 USING (
     SELECT
         ? AS Id, ? AS Name, CAST(? AS NVARCHAR(MAX)) AS PoleNumbers, CAST(? AS NVARCHAR(MAX)) AS PoleIds, ? AS SP_ExecId,
         ? AS CustomerId, ? AS PolesUnderContract, ? AS EffectiveDate,
-        CAST(? AS NVARCHAR(MAX)) AS InstallDates, ? AS LeadsunProjectId, ? AS AirTableCreatedDateTime
+        CAST(? AS NVARCHAR(MAX)) AS InstallDates, CAST(? AS NVARCHAR(MAX)) AS LeadsunProjectIdValue, ? AS AirTableCreatedDateTime
 ) AS source
 ON target.Id = source.Id
 WHEN MATCHED AND NOT EXISTS (
     SELECT target.Name, target.PoleNumbers, target.PoleIds, target.CustomerId,
-           target.PolesUnderContract, target.EffectiveDate, target.InstallDates, target.LeadsunProjectId
+           target.PolesUnderContract, target.EffectiveDate, target.InstallDates,
+           JSON_VALUE(target.LeadsunProject, '$.ProjectId')
     INTERSECT
     SELECT source.Name, source.PoleNumbers, source.PoleIds, source.CustomerId,
-           source.PolesUnderContract, source.EffectiveDate, source.InstallDates, source.LeadsunProjectId
+           source.PolesUnderContract, source.EffectiveDate, source.InstallDates,
+           source.LeadsunProjectIdValue
 )
 THEN UPDATE SET
     Name               = source.Name,
@@ -54,12 +86,12 @@ THEN UPDATE SET
     PolesUnderContract = source.PolesUnderContract,
     EffectiveDate      = source.EffectiveDate,
     InstallDates       = source.InstallDates,
-    LeadsunProjectId   = source.LeadsunProjectId
+    LeadsunProject     = JSON_MODIFY(ISNULL(target.LeadsunProject, '{}'), '$.ProjectId', source.LeadsunProjectIdValue)
 WHEN NOT MATCHED THEN
-    INSERT (Id, Name, PoleNumbers, PoleIds, SP_ExecId, CustomerId, PolesUnderContract, EffectiveDate, InstallDates, LeadsunProjectId, AirTableCreatedDateTime)
+    INSERT (Id, Name, PoleNumbers, PoleIds, SP_ExecId, CustomerId, PolesUnderContract, EffectiveDate, InstallDates, LeadsunProject, AirTableCreatedDateTime)
     VALUES (source.Id, source.Name, source.PoleNumbers, source.PoleIds, source.SP_ExecId,
             source.CustomerId, source.PolesUnderContract, source.EffectiveDate,
-            source.InstallDates, source.LeadsunProjectId, source.AirTableCreatedDateTime);
+            source.InstallDates, JSON_MODIFY('{}', '$.ProjectId', source.LeadsunProjectIdValue), source.AirTableCreatedDateTime);
 """
 
 
@@ -98,15 +130,15 @@ def _map_record_to_project(record: dict) -> dict:
         "InstallDates": (
             json.dumps(install_dates) if isinstance(install_dates, list) else install_dates
         ),
-        # Correlates with PoleTelemetry.LeadsunProjectId -- Leadsun's own
-        # numeric project identifier (confirmed INT in a real /lamps
-        # response, e.g. 442, 314), now also recorded on the Airtable side
-        # per explicit request, so a Project can be joined directly to its
-        # own PoleTelemetry rows via this shared identifier rather than
-        # only indirectly (Project -> Poles.ProjectId -> Poles.LocationId
-        # -> PoleTelemetry.LocationId). Airtable's own field name confirmed
-        # to be "Leadsun ProjectID".
-        "LeadsunProjectId": fields.get("Leadsun ProjectID"),
+        # The RAW value only -- NOT a pre-built JSON string. Deliberately
+        # NOT json.dumps()'d here the way PoleNumbers/PoleIds/InstallDates
+        # above are: LeadsunProject is a JSON OBJECT (not a plain scalar),
+        # and _PROJECT_UPSERT_SQL's own JSON_MODIFY() call needs this raw
+        # value to surgically update JUST the "ProjectId" key within
+        # whatever JSON is already stored there -- see that SQL's own
+        # comment for why a full-column overwrite here would be a real
+        # data-loss bug, not just a style choice.
+        "LeadsunProjectIdValue": fields.get("Leadsun ProjectID"),
         "AirTableCreatedDateTime": _airtable_created_time_to_eastern(
             record.get("createdTime")
         ),
@@ -165,7 +197,7 @@ def load_projects() -> None:
                     project["PolesUnderContract"],
                     project["EffectiveDate"],
                     project["InstallDates"],
-                    project["LeadsunProjectId"],
+                    project["LeadsunProjectIdValue"],
                     project["AirTableCreatedDateTime"],
                 )
                 total_success += 1

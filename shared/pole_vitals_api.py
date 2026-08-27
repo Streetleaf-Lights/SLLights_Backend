@@ -141,7 +141,7 @@ SELECT
     ISNULL(pa.TotalLights, 0) AS TotalLights,
     ISNULL(pa.ConnectedLights, 0) AS ConnectedLights,
     ISNULL(pa.TotalFaults, 0) AS TotalFaults,
-    proj.LeadsunProjectId AS LeadsunProjectId
+    proj.LeadsunProject AS LeadsunProject
 FROM Customers c
 LEFT JOIN Projects proj ON proj.CustomerId = c.Id
 LEFT JOIN ProjectAgg pa ON pa.ProjectId = proj.Id
@@ -241,6 +241,7 @@ SELECT
     latest_pt.BatteryElecCurrent2 AS BatteryElecCurrent2,
     latest_pt.SolarBoardVoltage AS SolarBoardVoltage,
     latest_pt.SolarBoardElecCurrent AS SolarBoardElecCurrent,
+    latest_pt.IsDaylightForPanelFault AS IsDaylightForPanelFault,
     rps_online.IsOnline AS IsOnline,
     rps.IsLedFault AS IsLedFault,
     rps.IsBatteryFault AS IsBatteryFault,
@@ -275,7 +276,7 @@ OUTER APPLY (
         pt.BatteryVoltage1, pt.BatteryVoltage2,
         pt.LampPower1, pt.LampPower2,
         pt.BatteryElecCurrent1, pt.BatteryElecCurrent2,
-        pt.SolarBoardVoltage, pt.SolarBoardElecCurrent
+        pt.SolarBoardVoltage, pt.SolarBoardElecCurrent, pt.IsDaylightForPanelFault
     FROM PoleTelemetry pt
     WHERE pt.LocationId = p.LocationId
     ORDER BY pt.LastUpload DESC
@@ -295,6 +296,113 @@ def _percent_working(total_lights: int, total_faults: int) -> float:
     if total_lights == 0:
         return 0.0
     return round(((total_lights - total_faults) / total_lights) * 100, 2)
+
+
+def _compute_pole_status_labels(
+    has_telemetry: bool,
+    lamp_power_1,
+    lamp_power_2,
+    battery_elec_current_1,
+    battery_elec_current_2,
+    solar_board_voltage,
+    solar_board_elec_current,
+    is_daylight_for_panel_fault,
+) -> dict:
+    """
+    Five presentation-oriented derived fields, per explicit request --
+    computed here in Python from values ALREADY being fetched for other
+    fields in _pole_row_to_dict() above (lampPower1/2,
+    batteryElecCurrent1/2, solarBoardVoltage/solarBoardElecCurrent,
+    plus the one new addition, IsDaylightForPanelFault), not a new
+    database round-trip or aggregation of their own.
+
+    has_telemetry gates all five together -- True/False, not inferred
+    separately per field from whichever specific inputs each one
+    happens to use. Every one of these inputs comes from the exact same
+    OUTER APPLY row in _POLE_DETAILS_SQL_TEMPLATE, so they're already
+    either all NULL together (no PoleTelemetry row for this pole at
+    all) or all populated together -- has_telemetry should be passed as
+    `last_update is not None`, the same "does this pole have ANY
+    telemetry" signal _pole_row_to_dict() already establishes for its
+    other latest-reading fields. All five come back None together when
+    False -- a definite "ON"/"OFF"/etc. label would misleadingly claim
+    to know a state this pole's own data can't actually support.
+
+    Within a genuinely-telemetry-having pole, an individual reading
+    (e.g. just lampPower2) could still itself be NULL -- treated as 0
+    for these sums, matching this project's own established
+    ISNULL(x,0)+ISNULL(y,0) convention for these exact same
+    LampPower/BatteryElecCurrent pairs elsewhere (e.g.
+    pole_vitals_loader.py's own IsPanelFault formula).
+
+    lightStatusLabel: "ON" if LampPower1+LampPower2 > 0, else "OFF".
+
+    panelStatusLabel: "Charging" if SolarBoardVoltage *
+    SolarBoardElecCurrent > 0, else "Idle".
+
+    panelIdleReason: only computed when panelStatusLabel is actually
+    "Idle" -- None otherwise (including for "Charging"), per explicit
+    correction (an earlier version computed this unconditionally,
+    alongside panelStatusLabel rather than gated by it). "Sundown" if
+    IsDaylightForPanelFault = 0 (using pole_vitals_loader.py's own
+    established daylight signal for panel-fault purposes, not a
+    separate day/night calculation); else "Battery Full" if
+    BatteryElecCurrent1+BatteryElecCurrent2 = 200 (this project's own
+    established "battery fully charged" threshold -- see pole_vitals_
+    loader.py's own IsPanelFault formula, the same exact condition);
+    else "N/A". A NULL IsDaylightForPanelFault (possible even on an
+    otherwise-telemetry-having pole, e.g. before pole_daylight_flags_
+    loader.py has ever processed it) falls through to the
+    battery-current check, same as an explicit non-zero value would --
+    NULL is not equal to 0.
+
+    batteryStatusLabel: "Full" if BatteryElecCurrent1+
+    BatteryElecCurrent2 = 200 (same threshold as panelIdleReason's own
+    "Battery Full" case); else "Discharging" if LampPower1+LampPower2 >
+    0 (drawing from the battery to power the lamp); else "Charging".
+
+    electricCurrentAverage: (BatteryElecCurrent1+BatteryElecCurrent2) /
+    2 -- the average of the two battery current readings, not rounded.
+    """
+    if not has_telemetry:
+        return {
+            "lightStatusLabel": None,
+            "panelStatusLabel": None,
+            "panelIdleReason": None,
+            "batteryStatusLabel": None,
+            "electricCurrentAverage": None,
+        }
+
+    lamp_power_sum = (lamp_power_1 or 0) + (lamp_power_2 or 0)
+    panel_power = (solar_board_voltage or 0) * (solar_board_elec_current or 0)
+    battery_current_sum = (battery_elec_current_1 or 0) + (battery_elec_current_2 or 0)
+
+    light_status_label = "ON" if lamp_power_sum > 0 else "OFF"
+    panel_status_label = "Charging" if panel_power > 0 else "Idle"
+
+    panel_idle_reason = None
+    if panel_status_label == "Idle":
+        if is_daylight_for_panel_fault == 0:
+            panel_idle_reason = "Sundown"
+        elif battery_current_sum == 200:
+            panel_idle_reason = "Battery Full"
+        else:
+            panel_idle_reason = "N/A"
+
+    if battery_current_sum == 200:
+        battery_status_label = "Full"
+    elif lamp_power_sum > 0:
+        battery_status_label = "Discharging"
+    else:
+        battery_status_label = "Charging"
+
+    return {
+        "lightStatusLabel": light_status_label,
+        "panelStatusLabel": panel_status_label,
+        "panelIdleReason": panel_idle_reason,
+        "batteryStatusLabel": battery_status_label,
+        "electricCurrentAverage": battery_current_sum / 2,
+    }
 
 
 def _pole_row_to_dict(row) -> dict:
@@ -376,6 +484,7 @@ def _pole_row_to_dict(row) -> dict:
         battery_elec_current_2,
         solar_board_voltage,
         solar_board_elec_current,
+        is_daylight_for_panel_fault,
         is_online,
         is_led_fault,
         is_battery_fault,
@@ -416,11 +525,21 @@ def _pole_row_to_dict(row) -> dict:
         "avgBatteryPercentage": json_safe(battery_percentage),
         "avgPanelPercentage": json_safe(panel_percentage),
         "avgLightPercentage": json_safe(light_percentage),
+        **_compute_pole_status_labels(
+            has_telemetry=last_update is not None,
+            lamp_power_1=lamp_power_1,
+            lamp_power_2=lamp_power_2,
+            battery_elec_current_1=battery_elec_current_1,
+            battery_elec_current_2=battery_elec_current_2,
+            solar_board_voltage=solar_board_voltage,
+            solar_board_elec_current=solar_board_elec_current,
+            is_daylight_for_panel_fault=is_daylight_for_panel_fault,
+        ),
     }
 
 
 def _row_to_project_dict(row, poles: list) -> dict:
-    _, _, project_id, project_name, total_lights, connected_lights, total_faults, leadsun_project_id = row
+    _, _, project_id, project_name, total_lights, connected_lights, total_faults, leadsun_project = row
     return {
         "id": json_safe(project_id),
         "name": json_safe(project_name),
@@ -428,7 +547,7 @@ def _row_to_project_dict(row, poles: list) -> dict:
         "connectedLights": json_safe(connected_lights),
         "totalFaults": json_safe(total_faults),
         "percentWorking": _percent_working(total_lights, total_faults),
-        "leadsunProjectId": json_safe(leadsun_project_id),
+        "leadsunProject": json_safe(leadsun_project),
         "poles": poles,
     }
 
@@ -482,10 +601,15 @@ def get_pole_vitals(customer_id: str = None, project_id: str = None, limit: int 
     PoleVitals row, _ROLLUP_PERIOD_TYPE; see that constant's own comment
     for why a silent pole is deliberately NOT counted as currently
     connected here, even though its per-pole fields below still show its
-    last-known state), leadsunProjectId (that Project's own
-    LeadsunProjectId column -- Leadsun's own numeric project identifier,
-    correlating with PoleTelemetry.LeadsunProjectId; None for a project
-    Airtable hasn't recorded one for), and a "poles" list (one entry per
+    last-known state), leadsunProject (that Project's own LeadsunProject
+    column, passed through AS-IS -- a JSON-encoded STRING, not parsed
+    into a nested object, same convention as poleNumbers/poleIds/
+    installDates above; always at least {"ProjectId": ...} once Airtable
+    has provided one, further enriched with ProjectName/UserName/groups/
+    products by pole_telemetry_loader.update_leadsun_project_details()
+    once matching PoleTelemetry data exists -- see that function's own
+    docstring for the full shape; None for a project Airtable hasn't
+    recorded a Leadsun ProjectID for at all yet), and a "poles" list (one entry per
     Pole belonging to that project: id, poleNumber, locationId,
     installDate, lat, long, lastUpdate, controllerCode, groupId,
     productId, userName, batteryVoltage1, batteryVoltage2, lampPower1,

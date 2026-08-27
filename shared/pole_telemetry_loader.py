@@ -2,7 +2,7 @@ import os
 import json
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from shared.leadsun_client import fetch_lamps
 from shared.sql_client import get_connection
@@ -711,6 +711,341 @@ def backfill_is_open_issue_fault_for_all_poles() -> None:
                     "backfillIsOpenIssueFault: additionally failed to record this run's failure "
                     "in SP_Execution (Id=%s): %s -- that row will be left with EndDateTime still "
                     "NULL. The ORIGINAL failure (%s) is what's actually raised below, not this one.",
+                    sp_exec_id,
+                    recording_error,
+                    ex,
+                )
+        raise
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def _aggregate_telemetry_by_leadsun_project(telemetry_rows) -> dict:
+    """
+    Groups PoleTelemetry rows into the nested structure explicitly
+    requested for Projects.LeadsunProject's own "groups"/"products"
+    shape -- one entry per distinct LeadsunProjectId, each holding that
+    project's own ProjectName/UserName (both confirmed constant within a
+    project -- validated directly against a real 11,837-record Leadsun
+    /lamps response: 176 distinct projects, 0 with more than one distinct
+    ProjectName or UserName across their own records) plus a list of
+    distinct GroupId groups, each holding a list of that group's own
+    distinct products.
+
+    Field mapping, deliberately NOT a 1:1 rename of PoleTelemetry's own
+    column names -- this disambiguates two genuinely different Leadsun
+    identifiers that are easy to confuse with each other:
+      ProductId        <- PoleTelemetry.LeadsunId (Leadsun's own raw "id"
+                           field -- a plain integer, e.g. 10358)
+      ProductName      <- PoleTelemetry.LocationId (Leadsun's own raw
+                           "productName" field -- e.g. "12009-1000")
+      ControllerCode   <- PoleTelemetry.ControllerCode (unchanged name)
+      ProvidedProductId <- PoleTelemetry.ProductId (Leadsun's own raw
+                           "productId" field -- a separate, ALPHANUMERIC
+                           value, e.g. "AE3SAP7323113143", confirmed via
+                           a real /lamps response -- genuinely NOT the
+                           same identifier as ProductId/LeadsunId above,
+                           despite the similar name)
+
+    Keyed by LeadsunProjectId CAST TO STRING (via str()) -- matching how
+    Projects.LeadsunProject's own "ProjectId" is stored (a JSON STRING,
+    from Airtable, via json.dumps() in projects_loader.py), even though
+    PoleTelemetry.LeadsunProjectId itself is a plain INT column. This is
+    the join key between the two independently-sourced systems, so both
+    sides need to agree on ONE common representation to match correctly
+    -- string was chosen since Airtable's own side is the naturally
+    string-shaped one (a text field), not because either representation
+    is inherently more "correct".
+
+    A group is identified by its own GroupId; a product is included
+    exactly once per (project, group) it actually appears under in this
+    telemetry snapshot -- NOT deduplicated further than that (e.g. two
+    different rows for the very same pole, differing only in a field
+    this function doesn't read, would still only contribute ONE product
+    entry here, since GroupId/GatewayCode/ProductId/ControllerCode/
+    LeadsunId/LocationId together are expected to already be that pole's
+    own stable identity; if a genuinely different reading arrived for
+    the exact same pole later in this same batch, the SECOND one's own
+    values would silently replace the first's, since products are keyed
+    by ProductId internally before being flattened into a plain list at
+    the end).
+    """
+    projects: dict = {}
+
+    for row in telemetry_rows:
+        (
+            leadsun_project_id,
+            leadsun_project_name,
+            user_name,
+            group_id,
+            group_name,
+            gateway_code,
+            leadsun_id,
+            location_id,
+            controller_code,
+            product_id,
+        ) = row
+
+        if leadsun_project_id is None or group_id is None:
+            # Can't place this reading into the nested structure at all
+            # without knowing which project and group it belongs to --
+            # skipped, not an error (a pole legitimately not yet
+            # assigned to a Leadsun project/group shouldn't block every
+            # OTHER pole's own aggregation).
+            continue
+
+        project_key = str(leadsun_project_id)
+        project_entry = projects.setdefault(
+            project_key,
+            {"ProjectName": leadsun_project_name, "UserName": user_name, "groups": {}},
+        )
+
+        group_entry = project_entry["groups"].setdefault(
+            group_id,
+            {
+                "GroupId": group_id,
+                "GroupName": group_name,
+                "GatewayCode": gateway_code,
+                "products": {},
+            },
+        )
+
+        group_entry["products"][leadsun_id] = {
+            "ProductId": leadsun_id,
+            "ProductName": location_id,
+            "ControllerCode": controller_code,
+            "ProvidedProductId": product_id,
+        }
+
+    # Flatten the internal, dedup-friendly dicts (keyed by GroupId/
+    # ProductId) into the plain lists the requested JSON shape actually
+    # needs -- the keying above only ever existed to make "have I
+    # already seen this group/product" a cheap lookup while building
+    # this structure, not part of the final, serialized shape itself.
+    result = {}
+    for project_key, project_entry in projects.items():
+        result[project_key] = {
+            "ProjectName": project_entry["ProjectName"],
+            "UserName": project_entry["UserName"],
+            "groups": [
+                {
+                    "GroupId": group_entry["GroupId"],
+                    "GroupName": group_entry["GroupName"],
+                    "GatewayCode": group_entry["GatewayCode"],
+                    "products": list(group_entry["products"].values()),
+                }
+                for group_entry in project_entry["groups"].values()
+            ],
+        }
+    return result
+
+
+_FETCH_PROJECT_LEADSUN_IDS_SQL = """
+SELECT Id, JSON_VALUE(LeadsunProject, '$.ProjectId') AS LeadsunProjectIdValue
+FROM Projects
+WHERE JSON_VALUE(LeadsunProject, '$.ProjectId') IS NOT NULL
+"""
+
+_FETCH_TELEMETRY_FOR_PROJECT_AGGREGATION_SQL = """
+;WITH RecentTelemetry AS (
+    SELECT
+        LeadsunProjectId, LeadsunProjectName, UserName, GroupId, GroupName,
+        GatewayCode, LeadsunId, LocationId, ControllerCode, ProductId,
+        ROW_NUMBER() OVER (PARTITION BY LocationId ORDER BY LastUpload DESC) AS rn
+    FROM PoleTelemetry
+    WHERE LeadsunProjectId IS NOT NULL
+      AND LastUpload >= ?
+)
+SELECT LeadsunProjectId, LeadsunProjectName, UserName, GroupId, GroupName,
+       GatewayCode, LeadsunId, LocationId, ControllerCode, ProductId
+FROM RecentTelemetry
+WHERE rn = 1
+"""
+
+# How far back to look for "currently reporting" telemetry when building
+# each Project's own groups/products -- NOT a scan of PoleTelemetry's
+# entire 6-month retention window, which is what an earlier, buggy
+# version of this query did (WHERE LeadsunProjectId IS NOT NULL alone,
+# with no time bound at all -- LeadsunProjectId doesn't change over a
+# pole's own history, so that matched EVERY historical row for EVERY
+# pole ever recorded, not just its current state; a real production
+# incident -- update_leadsun_project_details() ran immediately after
+# load_pole_telemetry() finished, then failed itself after a long,
+# unexplained delay, root-caused to exactly this unbounded scan).
+#
+# This function runs every 30 minutes, immediately after
+# load_pole_telemetry() has just refreshed every currently-reporting
+# pole's own row -- so a pole that's genuinely still active will always
+# have a LastUpload well within this window. 3 hours (matching this
+# project's own established "recent lookback" convention elsewhere,
+# e.g. pole_vitals_loader.py's own _DEFAULT_LOOKBACK["Hour"]) gives
+# comfortable headroom for a late/delayed reading without ever
+# approaching a full-table scan. A pole that hasn't reported at all
+# within this window simply drops out of its project's own groups/
+# products until it reports again -- an accepted tradeoff, not an
+# oversight: the whole point of this structure is to reflect what's
+# CURRENTLY active, not a pole's own full historical presence.
+_PROJECT_DETAILS_LOOKBACK = timedelta(hours=3)
+
+_UPDATE_PROJECT_LEADSUN_PROJECT_SQL = """
+UPDATE Projects SET LeadsunProject = ? WHERE Id = ?
+"""
+
+
+def update_leadsun_project_details() -> None:
+    """
+    Enriches every Project's own LeadsunProject JSON with the full
+    ProjectName/UserName/groups/products structure, aggregated fresh
+    from whatever PoleTelemetry currently holds -- run this AFTER
+    load_pole_telemetry() has refreshed that table (see
+    function_app.py's own loadLeadsunData/loadLeadsunDataManual, where
+    this is wired in immediately after it), not on its own separate
+    schedule -- there would be nothing new to aggregate otherwise.
+
+    Deliberately does NOT touch a Project whose own "ProjectId" has no
+    matching PoleTelemetry rows at all (e.g. Airtable hasn't been given
+    a Leadsun ProjectID for it yet, or none of its poles have reported
+    telemetry yet) -- that Project's own LeadsunProject value (whatever
+    it currently is, even just the bare {"ProjectId": ...} shape
+    projects_loader.py itself writes) is left completely alone, not
+    cleared out or reset. Only a Project that DOES have at least one
+    matching telemetry reading gets its own groups/products rebuilt,
+    fresh, from this run's own data -- overwriting whatever groups/
+    products it had from a PREVIOUS run of this same function, but never
+    touching the "ProjectId" key that projects_loader.py itself owns.
+
+    See _aggregate_telemetry_by_leadsun_project()'s own docstring for the
+    full field-mapping/structure reasoning.
+    """
+    start_time = _to_dto_string(_now_eastern())
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    sp_exec_id = None
+    total_success = 0
+    total_errors = 0
+
+    try:
+        # 1. Open an SP_Execution row for this run
+        cursor.execute(
+            """
+            INSERT INTO SP_Execution (Name, Environment, StartDateTime, Source, BatchCount, IsFinalBatch)
+            OUTPUT INSERTED.Id
+            VALUES (?, ?, ?, ?, 0, 0)
+            """,
+            "updateLeadsunProjectDetails",
+            ENVIRONMENT,
+            start_time,
+            SOURCE_NAME,
+        )
+        sp_exec_id = cursor.fetchone()[0]
+        conn.commit()
+
+        # 2. Which Projects even have a Leadsun ProjectID recorded at all
+        cursor.execute(_FETCH_PROJECT_LEADSUN_IDS_SQL)
+        project_id_by_leadsun_project_id = {
+            leadsun_project_id_value: project_id
+            for project_id, leadsun_project_id_value in cursor.fetchall()
+        }
+
+        # 3. Only RECENT telemetry (see _PROJECT_DETAILS_LOOKBACK's own
+        # comment for why this must be bounded, not a scan of this
+        # table's entire 6-month retention window). _to_dto_string(),
+        # not the raw datetime object -- same fix, same reasoning, as
+        # this project's other DATETIMEOFFSET bindings: pyodbc silently
+        # converts a timezone-aware Python datetime to UTC on bind
+        # unless it's already an explicit offset string.
+        cutoff = _to_dto_string(_now_eastern() - _PROJECT_DETAILS_LOOKBACK)
+        cursor.execute(_FETCH_TELEMETRY_FOR_PROJECT_AGGREGATION_SQL, cutoff)
+        telemetry_rows = cursor.fetchall()
+
+        # 4. Group in Python (see that function's own docstring for the
+        # full field-mapping reasoning)
+        aggregated_by_leadsun_project_id = _aggregate_telemetry_by_leadsun_project(
+            telemetry_rows
+        )
+
+        # 5. Update only the Projects that actually have matching
+        # telemetry -- see this function's own docstring for why a
+        # Project with none is deliberately left untouched, not cleared.
+        for leadsun_project_id_str, aggregated in aggregated_by_leadsun_project_id.items():
+            project_id = project_id_by_leadsun_project_id.get(leadsun_project_id_str)
+            if project_id is None:
+                continue
+
+            leadsun_project_json = json.dumps(
+                {
+                    "ProjectId": leadsun_project_id_str,
+                    "ProjectName": aggregated["ProjectName"],
+                    "UserName": aggregated["UserName"],
+                    "groups": aggregated["groups"],
+                }
+            )
+            cursor.execute(_UPDATE_PROJECT_LEADSUN_PROJECT_SQL, leadsun_project_json, project_id)
+            total_success += 1
+        conn.commit()
+
+        logging.info(
+            "updateLeadsunProjectDetails: %d project(s) updated with fresh "
+            "groups/products from %d telemetry reading(s).",
+            total_success,
+            len(telemetry_rows),
+        )
+
+        # 6. Close out the SP_Execution row with final counts
+        cursor.execute(
+            """
+            UPDATE SP_Execution
+            SET EndDateTime = ?,
+                TotalSuccessfulRecords = ?,
+                TotalErrorRecords = ?,
+                BatchCount = ?,
+                IsFinalBatch = 1
+            WHERE Id = ?
+            """,
+            _to_dto_string(_now_eastern()),
+            total_success,
+            total_errors,
+            1,
+            sp_exec_id,
+        )
+        conn.commit()
+
+    except Exception as ex:
+        logging.error("updateLeadsunProjectDetails: run failed: %s", ex)
+        if sp_exec_id:
+            # Fresh connection for recording the failure -- same fix,
+            # same reasoning, as this project's other loaders (a
+            # connection-level failure mid-run can leave the ORIGINAL
+            # conn/cursor unusable for anything further, including
+            # recording that same failure).
+            try:
+                recovery_conn = get_connection()
+                recovery_cursor = recovery_conn.cursor()
+                try:
+                    recovery_cursor.execute(
+                        """
+                        UPDATE SP_Execution
+                        SET EndDateTime = ?, ErrorMessage = ?, TotalSuccessfulRecords = ?, TotalErrorRecords = ?
+                        WHERE Id = ?
+                        """,
+                        _to_dto_string(_now_eastern()),
+                        str(ex),
+                        total_success,
+                        total_errors,
+                        sp_exec_id,
+                    )
+                    recovery_conn.commit()
+                finally:
+                    recovery_cursor.close()
+                    recovery_conn.close()
+            except Exception as recording_error:
+                logging.error(
+                    "updateLeadsunProjectDetails: additionally failed to record this run's "
+                    "failure in SP_Execution (Id=%s): %s -- that row will be left with "
+                    "EndDateTime still NULL. The ORIGINAL failure (%s) is what's actually "
+                    "raised below, not this one.",
                     sp_exec_id,
                     recording_error,
                     ex,

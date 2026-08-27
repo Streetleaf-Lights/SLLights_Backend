@@ -11,7 +11,7 @@ from shared.projects_loader import load_projects
 from shared.poles_loader import load_poles
 from shared.pole_open_issues_loader import load_pole_open_issues
 from shared.pole_models_loader import load_pole_models
-from shared.pole_telemetry_loader import load_pole_telemetry
+from shared.pole_telemetry_loader import load_pole_telemetry, update_leadsun_project_details
 from shared.pole_timezones_loader import load_pole_timezones
 from shared.pole_daylight_flags_loader import load_pole_daylight_flags
 from shared.pole_vitals_loader import load_pole_vitals
@@ -198,6 +198,7 @@ def loadLeadsunData(myTimer: func.TimerRequest) -> None:
     logging.info("loadLeadsunData: starting run.")
     load_pole_models()
     load_pole_telemetry()
+    update_leadsun_project_details()
     load_pole_timezones()
     load_pole_daylight_flags()
     load_pole_vitals()
@@ -218,14 +219,15 @@ def loadLeadsunDataManual(req: func.HttpRequest) -> func.HttpResponse:
     logging.info("loadLeadsunDataManual: manual run triggered.")
     load_pole_models()
     load_pole_telemetry()
+    update_leadsun_project_details()
     load_pole_timezones()
     load_pole_daylight_flags()
     load_pole_vitals()
     logging.info("loadLeadsunDataManual: run complete.")
 
     return func.HttpResponse(
-        "loadPoleModels + loadPoleTelemetry + loadPoleTimeZones + "
-        "loadPoleDaylightFlags + loadPoleVitals run complete.",
+        "loadPoleModels + loadPoleTelemetry + updateLeadsunProjectDetails + "
+        "loadPoleTimeZones + loadPoleDaylightFlags + loadPoleVitals run complete.",
         status_code=200,
     )
 

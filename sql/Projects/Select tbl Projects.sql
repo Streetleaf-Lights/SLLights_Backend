@@ -7,7 +7,7 @@ SELECT TOP (1000) [Id]
       ,[PolesUnderContract]
       ,[EffectiveDate]
       ,[InstallDates]
-      ,[LeadsunProjectId]
+      ,[LeadsunProject]
       ,[AirTableCreatedDateTime]
   FROM [dbo].[Projects]
   WHERE 1 = 1
@@ -15,7 +15,7 @@ SELECT TOP (1000) [Id]
   -- AND [CustomerId] = 'recwx649JfiRmWqxF'
   -- AND PoleNumbers LIKE '%HIL-1333%'
     -- AND Name LIKE '%acacia%'
-    AND LeadsunProjectId IS NOT NULL
+    AND LeadsunProject IS NOT NULL
   ORDER BY [AirTableCreatedDateTime] DESC
 
 -- SELECT DISTINCT t.LocationId

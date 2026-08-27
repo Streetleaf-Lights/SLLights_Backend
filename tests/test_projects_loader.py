@@ -39,21 +39,24 @@ class TestMapRecordToProject:
         assert result["PolesUnderContract"] == 42
         assert result["EffectiveDate"] == "2026-02-01"
         assert result["InstallDates"] == json.dumps(["2026-04-15", "2026-05-01"])
-        assert result["LeadsunProjectId"] == 482
+        assert result["LeadsunProjectIdValue"] == 482
 
     def test_leadsun_project_id_read_from_its_own_airtable_field(self, make_project_record):
         """Correlates with PoleTelemetry.LeadsunProjectId -- Leadsun's own
         numeric project identifier -- but sourced independently here from
         Airtable's own field, not derived from or joined against
-        PoleTelemetry at load time."""
+        PoleTelemetry at load time. This is the RAW value only -- see
+        _PROJECT_UPSERT_SQL's own comment for why the full LeadsunProject
+        JSON object itself is built in SQL (via JSON_MODIFY), not here in
+        Python."""
         record = make_project_record(leadsun_project_id=999)
         result = projects_loader._map_record_to_project(record)
-        assert result["LeadsunProjectId"] == 999
+        assert result["LeadsunProjectIdValue"] == 999
 
     def test_missing_leadsun_project_id_becomes_none(self, make_project_record):
         record = make_project_record(leadsun_project_id=None)
         result = projects_loader._map_record_to_project(record)
-        assert result["LeadsunProjectId"] is None
+        assert result["LeadsunProjectIdValue"] is None
 
     def test_non_list_pole_and_install_dates_fields_pass_through_unchanged(self, make_project_record):
         record = make_project_record(
@@ -125,10 +128,30 @@ class TestProjectUpsertSqlStructure:
         assert sql_text.count("?") == len(params) == 11
 
     def test_insert_column_list_matches_values_list_length(self):
+        """Splits on top-level commas only (parenthesis-depth 0) -- the
+        VALUES list's own LeadsunProject entry is a JSON_MODIFY(...) call
+        with three arguments of its own, whose internal commas must NOT
+        be counted as separate top-level values."""
         sql = projects_loader._PROJECT_UPSERT_SQL
         insert_cols = re.search(r"INSERT \(([^)]+)\)", sql).group(1)
-        values_cols = re.search(r"VALUES \(([^)]+)\)", sql, re.DOTALL).group(1)
-        assert len(insert_cols.split(",")) == len(values_cols.split(",")) == 11
+        values_cols = re.search(r"VALUES \((.+)\);", sql, re.DOTALL).group(1)
+
+        def split_top_level(text):
+            parts, depth, current = [], 0, ""
+            for ch in text:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                if ch == "," and depth == 0:
+                    parts.append(current)
+                    current = ""
+                else:
+                    current += ch
+            parts.append(current)
+            return parts
+
+        assert len(insert_cols.split(",")) == len(split_top_level(values_cols)) == 11
 
     def test_merge_match_key_is_id(self):
         assert "ON target.Id = source.Id" in projects_loader._PROJECT_UPSERT_SQL

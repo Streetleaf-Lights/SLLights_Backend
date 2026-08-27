@@ -229,6 +229,15 @@ class TestPoleDetailsSqlStructure:
         ):
             assert col in apply_block
 
+    def test_is_daylight_for_panel_fault_added_to_the_same_outer_apply(self):
+        """Needed for panelIdleReason's own "Sundown" case -- sourced
+        from this same latest-reading OUTER APPLY, same reasoning as
+        every other latest-telemetry column here, not a second query."""
+        sql = m._POLE_DETAILS_SQL_TEMPLATE
+        assert "latest_pt.IsDaylightForPanelFault AS IsDaylightForPanelFault" in sql
+        apply_block = sql.split("OUTER APPLY (")[1].split(") AS latest_pt")[0]
+        assert "pt.IsDaylightForPanelFault" in apply_block
+
     def test_battery_charging_min_removed_entirely(self):
         """Removed entirely per explicit request -- not just from the
         IsPanelFaultFlag check, but from the API surface, the SQL, and
@@ -243,6 +252,159 @@ class TestPoleDetailsSqlStructure:
 # --------------------------------------------------------------------------
 # Dict-mapping functions
 # --------------------------------------------------------------------------
+
+
+class TestComputePoleStatusLabels:
+    """
+    Direct unit tests for the five calculated fields, per explicit
+    request -- exercised standalone rather than only indirectly through
+    TestPoleRowToDict, since these five have their own genuinely
+    branching logic worth covering on its own terms.
+    """
+
+    def _labels(
+        self,
+        has_telemetry=True,
+        lamp_power_1=0,
+        lamp_power_2=0,
+        battery_elec_current_1=0,
+        battery_elec_current_2=0,
+        solar_board_voltage=0,
+        solar_board_elec_current=0,
+        is_daylight_for_panel_fault=1,
+    ):
+        return m._compute_pole_status_labels(
+            has_telemetry, lamp_power_1, lamp_power_2,
+            battery_elec_current_1, battery_elec_current_2,
+            solar_board_voltage, solar_board_elec_current,
+            is_daylight_for_panel_fault,
+        )
+
+    def test_no_telemetry_at_all_gives_all_five_none(self):
+        result = self._labels(has_telemetry=False)
+        assert result == {
+            "lightStatusLabel": None,
+            "panelStatusLabel": None,
+            "panelIdleReason": None,
+            "batteryStatusLabel": None,
+            "electricCurrentAverage": None,
+        }
+
+    # -- lightStatusLabel --
+
+    def test_light_status_on_when_lamp_power_sum_positive(self):
+        assert self._labels(lamp_power_1=5.0, lamp_power_2=0)["lightStatusLabel"] == "ON"
+
+    def test_light_status_off_when_lamp_power_sum_zero(self):
+        assert self._labels(lamp_power_1=0, lamp_power_2=0)["lightStatusLabel"] == "OFF"
+
+    def test_light_status_treats_a_null_individual_reading_as_zero(self):
+        assert self._labels(lamp_power_1=None, lamp_power_2=3.0)["lightStatusLabel"] == "ON"
+        assert self._labels(lamp_power_1=None, lamp_power_2=0)["lightStatusLabel"] == "OFF"
+
+    # -- panelStatusLabel --
+
+    def test_panel_status_charging_when_product_positive(self):
+        result = self._labels(solar_board_voltage=18.0, solar_board_elec_current=2.0)
+        assert result["panelStatusLabel"] == "Charging"
+
+    def test_panel_status_idle_when_either_factor_zero(self):
+        assert self._labels(solar_board_voltage=0, solar_board_elec_current=2.0)["panelStatusLabel"] == "Idle"
+        assert self._labels(solar_board_voltage=18.0, solar_board_elec_current=0)["panelStatusLabel"] == "Idle"
+
+    # -- panelIdleReason --
+
+    def test_panel_idle_reason_sundown_when_not_daylight(self):
+        result = self._labels(is_daylight_for_panel_fault=0, battery_elec_current_1=50, battery_elec_current_2=50)
+        assert result["panelIdleReason"] == "Sundown"
+
+    def test_panel_idle_reason_battery_full_when_daylight_and_current_sum_200(self):
+        result = self._labels(
+            is_daylight_for_panel_fault=1, battery_elec_current_1=100, battery_elec_current_2=100
+        )
+        assert result["panelIdleReason"] == "Battery Full"
+
+    def test_panel_idle_reason_na_when_daylight_and_current_sum_not_200(self):
+        result = self._labels(
+            is_daylight_for_panel_fault=1, battery_elec_current_1=50, battery_elec_current_2=50
+        )
+        assert result["panelIdleReason"] == "N/A"
+
+    def test_panel_idle_reason_null_daylight_falls_through_to_battery_check(self):
+        """NULL is not equal to 0 -- a genuinely unknown daylight state
+        must NOT be treated as "Sundown"."""
+        result = self._labels(
+            is_daylight_for_panel_fault=None, battery_elec_current_1=100, battery_elec_current_2=100
+        )
+        assert result["panelIdleReason"] == "Battery Full"
+
+        result = self._labels(
+            is_daylight_for_panel_fault=None, battery_elec_current_1=50, battery_elec_current_2=50
+        )
+        assert result["panelIdleReason"] == "N/A"
+
+    def test_panel_idle_reason_is_none_when_panel_status_is_charging(self):
+        """Only computed when panelStatusLabel is actually "Idle" -- per
+        explicit correction. A panel that's actively charging has no
+        "idle reason" at all, even if IsDaylightForPanelFault or the
+        battery-current sum would otherwise satisfy one of the idle
+        conditions."""
+        result = self._labels(
+            solar_board_voltage=18.0, solar_board_elec_current=2.0,
+            is_daylight_for_panel_fault=0,
+        )
+        assert result["panelStatusLabel"] == "Charging"
+        assert result["panelIdleReason"] is None
+
+        result = self._labels(
+            solar_board_voltage=18.0, solar_board_elec_current=2.0,
+            battery_elec_current_1=100, battery_elec_current_2=100,
+        )
+        assert result["panelStatusLabel"] == "Charging"
+        assert result["panelIdleReason"] is None
+
+    def test_panel_idle_reason_is_computed_when_panel_status_is_idle(self):
+        result = self._labels(
+            solar_board_voltage=0, solar_board_elec_current=0,
+            is_daylight_for_panel_fault=0,
+        )
+        assert result["panelStatusLabel"] == "Idle"
+        assert result["panelIdleReason"] == "Sundown"
+
+    # -- batteryStatusLabel --
+
+    def test_battery_status_full_when_current_sum_200(self):
+        result = self._labels(battery_elec_current_1=100, battery_elec_current_2=100, lamp_power_1=5.0)
+        assert result["batteryStatusLabel"] == "Full"
+
+    def test_battery_status_discharging_when_not_full_and_lamp_on(self):
+        result = self._labels(battery_elec_current_1=50, battery_elec_current_2=50, lamp_power_1=5.0)
+        assert result["batteryStatusLabel"] == "Discharging"
+
+    def test_battery_status_charging_when_not_full_and_lamp_off(self):
+        result = self._labels(battery_elec_current_1=50, battery_elec_current_2=50, lamp_power_1=0, lamp_power_2=0)
+        assert result["batteryStatusLabel"] == "Charging"
+
+    def test_battery_status_full_takes_priority_over_discharging(self):
+        """Full is checked BEFORE the lamp-on check, per the requested
+        ordering -- a fully-charged battery reports Full even if the
+        lamp also happens to be on."""
+        result = self._labels(battery_elec_current_1=100, battery_elec_current_2=100, lamp_power_1=5.0)
+        assert result["batteryStatusLabel"] == "Full"
+
+    # -- electricCurrentAverage --
+
+    def test_electric_current_average_is_the_mean_of_the_two_readings(self):
+        result = self._labels(battery_elec_current_1=30.0, battery_elec_current_2=40.0)
+        assert result["electricCurrentAverage"] == 35.0
+
+    def test_electric_current_average_treats_a_null_individual_reading_as_zero(self):
+        result = self._labels(battery_elec_current_1=None, battery_elec_current_2=40.0)
+        assert result["electricCurrentAverage"] == 20.0
+
+    def test_electric_current_average_not_rounded(self):
+        result = self._labels(battery_elec_current_1=1.0, battery_elec_current_2=2.0)
+        assert result["electricCurrentAverage"] == 1.5
 
 
 class TestPoleRowToDict:
@@ -268,6 +430,7 @@ class TestPoleRowToDict:
         battery_elec_current_2=15.2,
         solar_board_voltage=18.0,
         solar_board_elec_current=2.0,
+        is_daylight_for_panel_fault=1,
         is_online=True,
         is_led_fault=False,
         is_battery_fault=False,
@@ -284,7 +447,7 @@ class TestPoleRowToDict:
             last_update, controller_code, group_id, product_id, user_name,
             battery_voltage_1, battery_voltage_2,
             lamp_power_1, lamp_power_2, battery_elec_current_1, battery_elec_current_2,
-            solar_board_voltage, solar_board_elec_current,
+            solar_board_voltage, solar_board_elec_current, is_daylight_for_panel_fault,
             is_online, is_led_fault, is_battery_fault, is_panel_fault, is_open_issue_fault, is_pole_fault,
             battery_percentage, panel_percentage, light_percentage, customer_id,
         )
@@ -320,6 +483,11 @@ class TestPoleRowToDict:
             "avgBatteryPercentage": 89.0,
             "avgPanelPercentage": 45.0,
             "avgLightPercentage": 0.0,
+            "lightStatusLabel": "ON",
+            "panelStatusLabel": "Charging",
+            "panelIdleReason": None,
+            "batteryStatusLabel": "Discharging",
+            "electricCurrentAverage": 15.1,
         }
 
     def test_discards_project_id_and_customer_id(self):
@@ -346,7 +514,8 @@ class TestPoleRowToDict:
 
     def test_pole_with_no_telemetry_has_null_last_update_and_latest_reading_fields(self):
         """A pole with no PoleTelemetry row at all -- every field sourced
-        from the OUTER APPLY must be null."""
+        from the OUTER APPLY must be null, including the calculated
+        labels derived from those same fields (has_telemetry=False)."""
         row = self._row(
             last_update=None, controller_code=None, group_id=None, product_id=None,
             user_name=None,
@@ -354,6 +523,7 @@ class TestPoleRowToDict:
             lamp_power_1=None, lamp_power_2=None,
             battery_elec_current_1=None, battery_elec_current_2=None,
             solar_board_voltage=None, solar_board_elec_current=None,
+            is_daylight_for_panel_fault=None,
         )
         result = m._pole_row_to_dict(row)
         assert result["lastUpdate"] is None
@@ -369,11 +539,16 @@ class TestPoleRowToDict:
         assert result["batteryElecCurrent2"] is None
         assert result["solarBoardVoltage"] is None
         assert result["solarBoardElecCurrent"] is None
+        assert result["lightStatusLabel"] is None
+        assert result["panelStatusLabel"] is None
+        assert result["panelIdleReason"] is None
+        assert result["batteryStatusLabel"] is None
+        assert result["electricCurrentAverage"] is None
 
 
 class TestRowToProjectDict:
     def test_maps_fields_and_computes_percent_working(self):
-        row = (None, None, "proj1", "Downtown", 8, 6, 3, 482)
+        row = (None, None, "proj1", "Downtown", 8, 6, 3, '{"ProjectId": "482"}')
         result = m._row_to_project_dict(row, poles=[])
         assert result["id"] == "proj1"
         assert result["name"] == "Downtown"
@@ -381,11 +556,11 @@ class TestRowToProjectDict:
         assert result["connectedLights"] == 6
         assert result["totalFaults"] == 3
         assert result["percentWorking"] == 62.5
-        assert result["leadsunProjectId"] == 482
+        assert result["leadsunProject"] == '{"ProjectId": "482"}'
         assert result["poles"] == []
 
     def test_no_optimistic_working_percentage_or_non_telemetry_fields(self):
-        row = (None, None, "proj1", "Downtown", 8, 6, 3, 482)
+        row = (None, None, "proj1", "Downtown", 8, 6, 3, '{"ProjectId": "482"}')
         result = m._row_to_project_dict(row, poles=[])
         assert "optimisticWorkingPercentage" not in result
         assert "totalNonTelemetryAvailable" not in result
@@ -393,7 +568,7 @@ class TestRowToProjectDict:
 
     def test_attaches_the_given_poles_list_as_is(self):
         poles = [{"id": "p1"}, {"id": "p2"}]
-        row = (None, None, "proj1", "Downtown", 2, 2, 0, 482)
+        row = (None, None, "proj1", "Downtown", 2, 2, 0, '{"ProjectId": "482"}')
         result = m._row_to_project_dict(row, poles=poles)
         assert result["poles"] == poles
 
@@ -402,7 +577,7 @@ class TestRowToProjectDict:
         must come back None, not raise or default to something else."""
         row = (None, None, "proj1", "Downtown", 2, 2, 0, None)
         result = m._row_to_project_dict(row, poles=[])
-        assert result["leadsunProjectId"] is None
+        assert result["leadsunProject"] is None
 
 
 # --------------------------------------------------------------------------
@@ -480,13 +655,13 @@ class TestGetPoleVitalsUnfiltered:
     def test_full_shape_with_one_customer_one_project_one_pole(
         self, patch_get_connection_pole_vitals_api, mock_cursor
     ):
-        agg_rows = [("cust1", "Acme", "proj1", "Downtown", 8, 6, 3, 482)]
+        agg_rows = [("cust1", "Acme", "proj1", "Downtown", 8, 6, 3, '{"ProjectId": "482"}')]
         pole_rows = [
             (
                 "proj1", "pole1", "PN-1", "LOC-1", "2025-01-01", 28.0, -82.0,
                 "2026-07-31 08:00:00 -04:00", "CC-100", 7, "PROD-42", "jdoe",
                 12.6, 12.4,
-                8.7, 8.6, 15.0, 15.2, 18.0, 2.0,
+                8.7, 8.6, 15.0, 15.2, 18.0, 2.0, 1,
                 True, False, True, False, False, True,
                 89.0, 45.0, 0.0, "cust1",
             )
@@ -514,7 +689,9 @@ class TestGetPoleVitalsUnfiltered:
         assert project["poles"][0]["productId"] == "PROD-42"
         assert project["poles"][0]["userName"] == "jdoe"
         assert project["poles"][0]["solarBoardVoltage"] == 18.0
-        assert project["leadsunProjectId"] == 482
+        assert project["poles"][0]["lightStatusLabel"] == "ON"
+        assert project["poles"][0]["panelStatusLabel"] == "Charging"
+        assert project["leadsunProject"] == '{"ProjectId": "482"}'
 
     def test_customer_with_zero_projects_gets_empty_projects_and_zeroed_rollup(
         self, patch_get_connection_pole_vitals_api, mock_cursor
@@ -558,7 +735,7 @@ class TestGetPoleVitalsCustomerIdFilter:
     def test_returns_a_single_dict_not_a_list(
         self, patch_get_connection_pole_vitals_api, mock_cursor
     ):
-        agg_rows = [("cust1", "Acme", "proj1", "Downtown", 1, 1, 0, 482)]
+        agg_rows = [("cust1", "Acme", "proj1", "Downtown", 1, 1, 0, '{"ProjectId": "482"}')]
         mock_cursor.fetchall.side_effect = [agg_rows, []]
 
         result = m.get_pole_vitals(customer_id="cust1")
@@ -599,7 +776,7 @@ class TestGetPoleVitalsProjectIdFilter:
     def test_returns_a_flat_dict_with_customer_context_not_nested(
         self, patch_get_connection_pole_vitals_api, mock_cursor
     ):
-        agg_rows = [("cust1", "Acme", "proj1", "Downtown", 1, 1, 0, 482)]
+        agg_rows = [("cust1", "Acme", "proj1", "Downtown", 1, 1, 0, '{"ProjectId": "482"}')]
         mock_cursor.fetchall.side_effect = [agg_rows, []]
 
         result = m.get_pole_vitals(project_id="proj1")
