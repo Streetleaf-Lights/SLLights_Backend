@@ -11,13 +11,18 @@ from shared import pole_vitals_api as m
 
 
 class TestPercentWorking:
-    def test_zero_total_lights_returns_zero_not_error(self):
+    """Based on connectedLights, not totalLights, per explicit
+    correction -- _percent_working()'s own first parameter represents
+    "how many poles are connected", not "how many poles exist in
+    total"."""
+
+    def test_zero_total_connected_returns_zero_not_error(self):
         assert m._percent_working(0, 0) == 0.0
 
     def test_no_faults_is_100_percent(self):
         assert m._percent_working(10, 0) == 100.0
 
-    def test_all_faulted_is_zero_percent(self):
+    def test_all_connected_poles_faulted_is_zero_percent(self):
         assert m._percent_working(10, 10) == 0.0
 
     def test_partial_faults(self):
@@ -25,6 +30,13 @@ class TestPercentWorking:
 
     def test_rounds_to_two_decimals(self):
         assert m._percent_working(3, 1) == round((2 / 3) * 100, 2)
+
+    def test_disconnected_poles_do_not_affect_the_result(self):
+        """The whole point of the correction: a pole that isn't even
+        connected no longer drags this percentage down just for being
+        disconnected -- totalLights (however large) never enters this
+        calculation at all."""
+        assert m._percent_working(4, 1) == 75.0  # same result regardless of how many DISCONNECTED poles also exist
 
 
 class TestSumPoleStats:
@@ -56,16 +68,20 @@ class TestCustomerRollupFields:
         project's own already-rounded percentage. A tiny project must not
         get equal weight to a huge one."""
         rows = [
-            (None, None, "p1", "Tiny Project", 2, 2, 0),  # 100% working
-            (None, None, "p2", "Huge Project", 1000, 500, 500),  # 50% working
+            (None, None, "p1", "Tiny Project", 2, 2, 0),  # 100% working (2 connected, 0 faults)
+            (None, None, "p2", "Huge Project", 1000, 500, 500),  # 0% working (500 connected, ALL 500 faulted)
         ]
         result = m._customer_rollup_fields(rows)
-        # Naive average of percentages would be 75%; pole-weighted is
-        # (1002 - 500) / 1002 = ~50.1%, dominated by the huge project.
+        # Naive average of the two projects' own percentages (100% and
+        # 0%) would be 50%; pole-weighted, using connectedLights as the
+        # base (not totalLights), is (502 - 500) / 502 = ~0.4%, correctly
+        # dominated by the huge project's own near-total failure among
+        # its own connected poles, not diluted by the tiny project's
+        # perfect score.
         assert result["totalLights"] == 1002
         assert result["connectedLights"] == 502
         assert result["totalFaults"] == 500
-        assert result["percentWorking"] == round((1002 - 500) / 1002 * 100, 2)
+        assert result["percentWorking"] == round((502 - 500) / 502 * 100, 2)
         assert result["percentWorking"] < 60  # nowhere near the naive 75% average
 
 
@@ -254,159 +270,6 @@ class TestPoleDetailsSqlStructure:
 # --------------------------------------------------------------------------
 
 
-class TestComputePoleStatusLabels:
-    """
-    Direct unit tests for the five calculated fields, per explicit
-    request -- exercised standalone rather than only indirectly through
-    TestPoleRowToDict, since these five have their own genuinely
-    branching logic worth covering on its own terms.
-    """
-
-    def _labels(
-        self,
-        has_telemetry=True,
-        lamp_power_1=0,
-        lamp_power_2=0,
-        battery_elec_current_1=0,
-        battery_elec_current_2=0,
-        solar_board_voltage=0,
-        solar_board_elec_current=0,
-        is_daylight_for_panel_fault=1,
-    ):
-        return m._compute_pole_status_labels(
-            has_telemetry, lamp_power_1, lamp_power_2,
-            battery_elec_current_1, battery_elec_current_2,
-            solar_board_voltage, solar_board_elec_current,
-            is_daylight_for_panel_fault,
-        )
-
-    def test_no_telemetry_at_all_gives_all_five_none(self):
-        result = self._labels(has_telemetry=False)
-        assert result == {
-            "lightStatusLabel": None,
-            "panelStatusLabel": None,
-            "panelIdleReason": None,
-            "batteryStatusLabel": None,
-            "electricCurrentAverage": None,
-        }
-
-    # -- lightStatusLabel --
-
-    def test_light_status_on_when_lamp_power_sum_positive(self):
-        assert self._labels(lamp_power_1=5.0, lamp_power_2=0)["lightStatusLabel"] == "ON"
-
-    def test_light_status_off_when_lamp_power_sum_zero(self):
-        assert self._labels(lamp_power_1=0, lamp_power_2=0)["lightStatusLabel"] == "OFF"
-
-    def test_light_status_treats_a_null_individual_reading_as_zero(self):
-        assert self._labels(lamp_power_1=None, lamp_power_2=3.0)["lightStatusLabel"] == "ON"
-        assert self._labels(lamp_power_1=None, lamp_power_2=0)["lightStatusLabel"] == "OFF"
-
-    # -- panelStatusLabel --
-
-    def test_panel_status_charging_when_product_positive(self):
-        result = self._labels(solar_board_voltage=18.0, solar_board_elec_current=2.0)
-        assert result["panelStatusLabel"] == "Charging"
-
-    def test_panel_status_idle_when_either_factor_zero(self):
-        assert self._labels(solar_board_voltage=0, solar_board_elec_current=2.0)["panelStatusLabel"] == "Idle"
-        assert self._labels(solar_board_voltage=18.0, solar_board_elec_current=0)["panelStatusLabel"] == "Idle"
-
-    # -- panelIdleReason --
-
-    def test_panel_idle_reason_sundown_when_not_daylight(self):
-        result = self._labels(is_daylight_for_panel_fault=0, battery_elec_current_1=50, battery_elec_current_2=50)
-        assert result["panelIdleReason"] == "Sundown"
-
-    def test_panel_idle_reason_battery_full_when_daylight_and_current_sum_200(self):
-        result = self._labels(
-            is_daylight_for_panel_fault=1, battery_elec_current_1=100, battery_elec_current_2=100
-        )
-        assert result["panelIdleReason"] == "Battery Full"
-
-    def test_panel_idle_reason_na_when_daylight_and_current_sum_not_200(self):
-        result = self._labels(
-            is_daylight_for_panel_fault=1, battery_elec_current_1=50, battery_elec_current_2=50
-        )
-        assert result["panelIdleReason"] == "N/A"
-
-    def test_panel_idle_reason_null_daylight_falls_through_to_battery_check(self):
-        """NULL is not equal to 0 -- a genuinely unknown daylight state
-        must NOT be treated as "Sundown"."""
-        result = self._labels(
-            is_daylight_for_panel_fault=None, battery_elec_current_1=100, battery_elec_current_2=100
-        )
-        assert result["panelIdleReason"] == "Battery Full"
-
-        result = self._labels(
-            is_daylight_for_panel_fault=None, battery_elec_current_1=50, battery_elec_current_2=50
-        )
-        assert result["panelIdleReason"] == "N/A"
-
-    def test_panel_idle_reason_is_none_when_panel_status_is_charging(self):
-        """Only computed when panelStatusLabel is actually "Idle" -- per
-        explicit correction. A panel that's actively charging has no
-        "idle reason" at all, even if IsDaylightForPanelFault or the
-        battery-current sum would otherwise satisfy one of the idle
-        conditions."""
-        result = self._labels(
-            solar_board_voltage=18.0, solar_board_elec_current=2.0,
-            is_daylight_for_panel_fault=0,
-        )
-        assert result["panelStatusLabel"] == "Charging"
-        assert result["panelIdleReason"] is None
-
-        result = self._labels(
-            solar_board_voltage=18.0, solar_board_elec_current=2.0,
-            battery_elec_current_1=100, battery_elec_current_2=100,
-        )
-        assert result["panelStatusLabel"] == "Charging"
-        assert result["panelIdleReason"] is None
-
-    def test_panel_idle_reason_is_computed_when_panel_status_is_idle(self):
-        result = self._labels(
-            solar_board_voltage=0, solar_board_elec_current=0,
-            is_daylight_for_panel_fault=0,
-        )
-        assert result["panelStatusLabel"] == "Idle"
-        assert result["panelIdleReason"] == "Sundown"
-
-    # -- batteryStatusLabel --
-
-    def test_battery_status_full_when_current_sum_200(self):
-        result = self._labels(battery_elec_current_1=100, battery_elec_current_2=100, lamp_power_1=5.0)
-        assert result["batteryStatusLabel"] == "Full"
-
-    def test_battery_status_discharging_when_not_full_and_lamp_on(self):
-        result = self._labels(battery_elec_current_1=50, battery_elec_current_2=50, lamp_power_1=5.0)
-        assert result["batteryStatusLabel"] == "Discharging"
-
-    def test_battery_status_charging_when_not_full_and_lamp_off(self):
-        result = self._labels(battery_elec_current_1=50, battery_elec_current_2=50, lamp_power_1=0, lamp_power_2=0)
-        assert result["batteryStatusLabel"] == "Charging"
-
-    def test_battery_status_full_takes_priority_over_discharging(self):
-        """Full is checked BEFORE the lamp-on check, per the requested
-        ordering -- a fully-charged battery reports Full even if the
-        lamp also happens to be on."""
-        result = self._labels(battery_elec_current_1=100, battery_elec_current_2=100, lamp_power_1=5.0)
-        assert result["batteryStatusLabel"] == "Full"
-
-    # -- electricCurrentAverage --
-
-    def test_electric_current_average_is_the_mean_of_the_two_readings(self):
-        result = self._labels(battery_elec_current_1=30.0, battery_elec_current_2=40.0)
-        assert result["electricCurrentAverage"] == 35.0
-
-    def test_electric_current_average_treats_a_null_individual_reading_as_zero(self):
-        result = self._labels(battery_elec_current_1=None, battery_elec_current_2=40.0)
-        assert result["electricCurrentAverage"] == 20.0
-
-    def test_electric_current_average_not_rounded(self):
-        result = self._labels(battery_elec_current_1=1.0, battery_elec_current_2=2.0)
-        assert result["electricCurrentAverage"] == 1.5
-
-
 class TestPoleRowToDict:
     def _row(
         self,
@@ -555,7 +418,7 @@ class TestRowToProjectDict:
         assert result["totalLights"] == 8
         assert result["connectedLights"] == 6
         assert result["totalFaults"] == 3
-        assert result["percentWorking"] == 62.5
+        assert result["percentWorking"] == 50.0
         assert result["leadsunProject"] == '{"ProjectId": "482"}'
         assert result["poles"] == []
 
@@ -676,7 +539,7 @@ class TestGetPoleVitalsUnfiltered:
         assert customer["totalLights"] == 8
         assert customer["connectedLights"] == 6
         assert customer["totalFaults"] == 3
-        assert customer["percentWorking"] == 62.5
+        assert customer["percentWorking"] == 50.0
         assert len(customer["projects"]) == 1
         project = customer["projects"][0]
         assert len(project["poles"]) == 1

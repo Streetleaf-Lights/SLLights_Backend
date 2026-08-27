@@ -1,4 +1,4 @@
-from shared.api_utils import clamp_limit, json_safe
+from shared.api_utils import clamp_limit, compute_pole_status_labels, json_safe
 from shared.sql_client import get_connection
 
 # Which PoleVitals period type drives the ROLLUP classification
@@ -74,18 +74,19 @@ _POLE_DETAIL_PERIOD_TYPE = "LastKnown48Hours"
 #     neither online nor has an open issue can never contribute to
 #     totalFaults, regardless of its own IsPoleFault value, exactly as
 #     before this change.
-#   percentWorking = (totalLights - totalFaults) / totalLights * 100 --
-#     the FORMULA itself is unchanged, computed in Python
-#     (_percent_working()), not SQL, same reasoning as everywhere else
-#     numeric rollups are computed here. Its own RESULT changes as a
-#     direct consequence of totalLights' own redefinition above, though:
-#     every pole now folded into totalLights that ISN'T also captured by
-#     totalFaults' own narrower population (e.g. a silent pole with no
-#     open issue, previously excluded from both entirely) enlarges the
-#     denominator without enlarging the numerator's subtraction,
-#     pushing percentWorking upward for a project with such poles,
-#     purely as a byproduct of the population mismatch above -- not a
-#     claim that those specific poles are actually confirmed working.
+#   percentWorking = (connectedLights - totalFaults) / connectedLights *
+#     100 -- per explicit correction (an earlier version divided by
+#     totalLights instead). Computed in Python (_percent_working()),
+#     not SQL, same reasoning as everywhere else numeric rollups are
+#     computed here. Basing this on connectedLights rather than
+#     totalLights means a pole that isn't even connected no longer
+#     drags this percentage down purely for being disconnected -- that
+#     fact is already reflected separately, in connectedLights itself.
+#     Since totalFaults' own population is scoped differently from
+#     connectedLights' own population (see above), total_faults is not
+#     strictly guaranteed to be <= connectedLights in every possible
+#     case -- see _percent_working()'s own docstring for why this
+#     formula doesn't clamp or guard against that.
 #
 # "IsOnline = 1 OR IsOpenIssueFault = 1" (in TotalFaults' own CASE
 # below) needs no explicit NULL-handling: a pole with no Last48Hours row
@@ -286,123 +287,35 @@ ORDER BY proj.Id, p.PoleNumber
 """
 
 
-def _percent_working(total_lights: int, total_faults: int) -> float:
+def _percent_working(total_connected: int, total_faults: int) -> float:
     """
-    0 when total_lights is 0 (nothing to be a percentage OF), not a
+    0 when total_connected is 0 (nothing to be a percentage OF), not a
     divide-by-zero error and not None -- a plain 0.0 is a safer default
     for a numeric field a consuming website will likely render directly
     (e.g. into a progress bar) than a null it may not expect.
+
+    Based on CONNECTED lights, not total lights, per explicit
+    correction (an earlier version divided by totalLights instead) --
+    this now answers "of the poles actually connected right now, what
+    fraction are fault-free", not "of every pole regardless of
+    connectivity, including ones not even reporting". A pole that isn't
+    connected at all no longer drags this percentage down just for
+    being disconnected -- that's already reflected separately, in
+    connectedLights itself.
+
+    Worth knowing: totalFaults' own population is scoped differently
+    from connectedLights' own population (a pole can be counted as
+    "faulted" under different criteria than "connected" -- see
+    totalLights' own history of this exact kind of population
+    mismatch), so total_faults is not strictly guaranteed to be <=
+    total_connected in every possible case. This formula doesn't clamp
+    or guard against that -- a genuine mismatch would surface as a
+    percentWorking outside the usual 0-100 range, which is preferable
+    to silently hiding a real data inconsistency behind a clamped value.
     """
-    if total_lights == 0:
+    if total_connected == 0:
         return 0.0
-    return round(((total_lights - total_faults) / total_lights) * 100, 2)
-
-
-def _compute_pole_status_labels(
-    has_telemetry: bool,
-    lamp_power_1,
-    lamp_power_2,
-    battery_elec_current_1,
-    battery_elec_current_2,
-    solar_board_voltage,
-    solar_board_elec_current,
-    is_daylight_for_panel_fault,
-) -> dict:
-    """
-    Five presentation-oriented derived fields, per explicit request --
-    computed here in Python from values ALREADY being fetched for other
-    fields in _pole_row_to_dict() above (lampPower1/2,
-    batteryElecCurrent1/2, solarBoardVoltage/solarBoardElecCurrent,
-    plus the one new addition, IsDaylightForPanelFault), not a new
-    database round-trip or aggregation of their own.
-
-    has_telemetry gates all five together -- True/False, not inferred
-    separately per field from whichever specific inputs each one
-    happens to use. Every one of these inputs comes from the exact same
-    OUTER APPLY row in _POLE_DETAILS_SQL_TEMPLATE, so they're already
-    either all NULL together (no PoleTelemetry row for this pole at
-    all) or all populated together -- has_telemetry should be passed as
-    `last_update is not None`, the same "does this pole have ANY
-    telemetry" signal _pole_row_to_dict() already establishes for its
-    other latest-reading fields. All five come back None together when
-    False -- a definite "ON"/"OFF"/etc. label would misleadingly claim
-    to know a state this pole's own data can't actually support.
-
-    Within a genuinely-telemetry-having pole, an individual reading
-    (e.g. just lampPower2) could still itself be NULL -- treated as 0
-    for these sums, matching this project's own established
-    ISNULL(x,0)+ISNULL(y,0) convention for these exact same
-    LampPower/BatteryElecCurrent pairs elsewhere (e.g.
-    pole_vitals_loader.py's own IsPanelFault formula).
-
-    lightStatusLabel: "ON" if LampPower1+LampPower2 > 0, else "OFF".
-
-    panelStatusLabel: "Charging" if SolarBoardVoltage *
-    SolarBoardElecCurrent > 0, else "Idle".
-
-    panelIdleReason: only computed when panelStatusLabel is actually
-    "Idle" -- None otherwise (including for "Charging"), per explicit
-    correction (an earlier version computed this unconditionally,
-    alongside panelStatusLabel rather than gated by it). "Sundown" if
-    IsDaylightForPanelFault = 0 (using pole_vitals_loader.py's own
-    established daylight signal for panel-fault purposes, not a
-    separate day/night calculation); else "Battery Full" if
-    BatteryElecCurrent1+BatteryElecCurrent2 = 200 (this project's own
-    established "battery fully charged" threshold -- see pole_vitals_
-    loader.py's own IsPanelFault formula, the same exact condition);
-    else "N/A". A NULL IsDaylightForPanelFault (possible even on an
-    otherwise-telemetry-having pole, e.g. before pole_daylight_flags_
-    loader.py has ever processed it) falls through to the
-    battery-current check, same as an explicit non-zero value would --
-    NULL is not equal to 0.
-
-    batteryStatusLabel: "Full" if BatteryElecCurrent1+
-    BatteryElecCurrent2 = 200 (same threshold as panelIdleReason's own
-    "Battery Full" case); else "Discharging" if LampPower1+LampPower2 >
-    0 (drawing from the battery to power the lamp); else "Charging".
-
-    electricCurrentAverage: (BatteryElecCurrent1+BatteryElecCurrent2) /
-    2 -- the average of the two battery current readings, not rounded.
-    """
-    if not has_telemetry:
-        return {
-            "lightStatusLabel": None,
-            "panelStatusLabel": None,
-            "panelIdleReason": None,
-            "batteryStatusLabel": None,
-            "electricCurrentAverage": None,
-        }
-
-    lamp_power_sum = (lamp_power_1 or 0) + (lamp_power_2 or 0)
-    panel_power = (solar_board_voltage or 0) * (solar_board_elec_current or 0)
-    battery_current_sum = (battery_elec_current_1 or 0) + (battery_elec_current_2 or 0)
-
-    light_status_label = "ON" if lamp_power_sum > 0 else "OFF"
-    panel_status_label = "Charging" if panel_power > 0 else "Idle"
-
-    panel_idle_reason = None
-    if panel_status_label == "Idle":
-        if is_daylight_for_panel_fault == 0:
-            panel_idle_reason = "Sundown"
-        elif battery_current_sum == 200:
-            panel_idle_reason = "Battery Full"
-        else:
-            panel_idle_reason = "N/A"
-
-    if battery_current_sum == 200:
-        battery_status_label = "Full"
-    elif lamp_power_sum > 0:
-        battery_status_label = "Discharging"
-    else:
-        battery_status_label = "Charging"
-
-    return {
-        "lightStatusLabel": light_status_label,
-        "panelStatusLabel": panel_status_label,
-        "panelIdleReason": panel_idle_reason,
-        "batteryStatusLabel": battery_status_label,
-        "electricCurrentAverage": battery_current_sum / 2,
-    }
+    return round(((total_connected - total_faults) / total_connected) * 100, 2)
 
 
 def _pole_row_to_dict(row) -> dict:
@@ -525,7 +438,7 @@ def _pole_row_to_dict(row) -> dict:
         "avgBatteryPercentage": json_safe(battery_percentage),
         "avgPanelPercentage": json_safe(panel_percentage),
         "avgLightPercentage": json_safe(light_percentage),
-        **_compute_pole_status_labels(
+        **compute_pole_status_labels(
             has_telemetry=last_update is not None,
             lamp_power_1=lamp_power_1,
             lamp_power_2=lamp_power_2,
@@ -546,7 +459,7 @@ def _row_to_project_dict(row, poles: list) -> dict:
         "totalLights": json_safe(total_lights),
         "connectedLights": json_safe(connected_lights),
         "totalFaults": json_safe(total_faults),
-        "percentWorking": _percent_working(total_lights, total_faults),
+        "percentWorking": _percent_working(connected_lights, total_faults),
         "leadsunProject": json_safe(leadsun_project),
         "poles": poles,
     }
@@ -589,7 +502,7 @@ def _customer_rollup_fields(rows) -> dict:
         "totalLights": total_lights,
         "connectedLights": connected_lights,
         "totalFaults": total_faults,
-        "percentWorking": _percent_working(total_lights, total_faults),
+        "percentWorking": _percent_working(connected_lights, total_faults),
     }
 
 
@@ -640,10 +553,11 @@ def get_pole_vitals(customer_id: str = None, project_id: str = None, limit: int 
     poles, plus poles that aren't online but DO have an open issue) --
     not updated to match totalLights' own broader "every pole" scope, by
     explicit request, so the two are now computed over different
-    populations. percentWorking is (totalLights - totalFaults) /
-    totalLights * 100. See _FETCH_SQL_TEMPLATE's own comment for the
-    full reasoning, including the practical consequence of totalLights
-    and totalFaults no longer sharing one population.
+    populations. percentWorking is (connectedLights - totalFaults) /
+    connectedLights * 100, per explicit correction (an earlier version
+    divided by totalLights instead). See _FETCH_SQL_TEMPLATE's own
+    comment for the full reasoning, including the practical consequence
+    of totalLights and totalFaults no longer sharing one population.
 
     installDate/lat/long come straight from Poles -- static, unrelated to
     any telemetry or vitals data (present even for a pole with neither).
