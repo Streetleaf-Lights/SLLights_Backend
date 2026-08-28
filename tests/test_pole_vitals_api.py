@@ -1,6 +1,7 @@
 """Tests for shared/pole_vitals_api.py"""
 
 import pytest
+from freezegun import freeze_time
 
 from shared import pole_vitals_api as m
 
@@ -248,11 +249,24 @@ class TestPoleDetailsSqlStructure:
     def test_is_daylight_for_panel_fault_added_to_the_same_outer_apply(self):
         """Needed for panelIdleReason's own "Sundown" case -- sourced
         from this same latest-reading OUTER APPLY, same reasoning as
-        every other latest-telemetry column here, not a second query."""
+        every other latest-telemetry column here, not a second query.
+        """
         sql = m._POLE_DETAILS_SQL_TEMPLATE
         assert "latest_pt.IsDaylightForPanelFault AS IsDaylightForPanelFault" in sql
         apply_block = sql.split("OUTER APPLY (")[1].split(") AS latest_pt")[0]
         assert "pt.IsDaylightForPanelFault" in apply_block
+
+    def test_pole_time_zone_columns_added_for_sunset_time(self):
+        """Needed for sunsetTime's own calculation -- sourced from the
+        PoleTimeZones join already present for the lastUpdate
+        conversion, not a new join. Distinct aliases (TimeZoneLatitude/
+        TimeZoneLongitude), not Latitude/Longitude, since p.Lat/p.Long
+        (Poles' own, less trusted coordinates) are already selected
+        elsewhere in this same query under different names."""
+        sql = m._POLE_DETAILS_SQL_TEMPLATE
+        assert "ptz.Latitude AS TimeZoneLatitude" in sql
+        assert "ptz.Longitude AS TimeZoneLongitude" in sql
+        assert "ptz.IanaTimeZone AS IanaTimeZone" in sql
 
     def test_battery_charging_min_removed_entirely(self):
         """Removed entirely per explicit request -- not just from the
@@ -294,6 +308,9 @@ class TestPoleRowToDict:
         solar_board_voltage=18.0,
         solar_board_elec_current=2.0,
         is_daylight_for_panel_fault=1,
+        timezone_latitude=28.2,
+        timezone_longitude=-80.7,
+        iana_timezone="America/New_York",
         is_online=True,
         is_led_fault=False,
         is_battery_fault=False,
@@ -311,12 +328,14 @@ class TestPoleRowToDict:
             battery_voltage_1, battery_voltage_2,
             lamp_power_1, lamp_power_2, battery_elec_current_1, battery_elec_current_2,
             solar_board_voltage, solar_board_elec_current, is_daylight_for_panel_fault,
+            timezone_latitude, timezone_longitude, iana_timezone,
             is_online, is_led_fault, is_battery_fault, is_panel_fault, is_open_issue_fault, is_pole_fault,
             battery_percentage, panel_percentage, light_percentage, customer_id,
         )
 
     def test_maps_every_field_correctly(self):
-        result = m._pole_row_to_dict(self._row())
+        with freeze_time("2026-08-28 12:00:00"):
+            result = m._pole_row_to_dict(self._row())
         assert result == {
             "id": "pole1",
             "poleNumber": "PN-001",
@@ -351,6 +370,7 @@ class TestPoleRowToDict:
             "panelIdleReason": None,
             "batteryStatusLabel": "Discharging",
             "electricCurrentAverage": 15.1,
+            "sunsetTime": "2026-08-28 19:47:58.596527-04:00",
         }
 
     def test_discards_project_id_and_customer_id(self):
@@ -525,13 +545,15 @@ class TestGetPoleVitalsUnfiltered:
                 "2026-07-31 08:00:00 -04:00", "CC-100", 7, "PROD-42", "jdoe",
                 12.6, 12.4,
                 8.7, 8.6, 15.0, 15.2, 18.0, 2.0, 1,
+                28.2, -80.7, "America/New_York",
                 True, False, True, False, False, True,
                 89.0, 45.0, 0.0, "cust1",
             )
         ]
         mock_cursor.fetchall.side_effect = [agg_rows, pole_rows]
 
-        result = m.get_pole_vitals()
+        with freeze_time("2026-08-28 12:00:00"):
+            result = m.get_pole_vitals()
 
         assert len(result) == 1
         customer = result[0]
@@ -554,6 +576,7 @@ class TestGetPoleVitalsUnfiltered:
         assert project["poles"][0]["solarBoardVoltage"] == 18.0
         assert project["poles"][0]["lightStatusLabel"] == "ON"
         assert project["poles"][0]["panelStatusLabel"] == "Charging"
+        assert project["poles"][0]["sunsetTime"] == "2026-08-28 19:47:58.596527-04:00"
         assert project["leadsunProject"] == '{"ProjectId": "482"}'
 
     def test_customer_with_zero_projects_gets_empty_projects_and_zeroed_rollup(

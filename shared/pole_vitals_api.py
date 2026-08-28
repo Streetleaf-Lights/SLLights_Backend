@@ -1,4 +1,4 @@
-from shared.api_utils import clamp_limit, compute_pole_status_labels, json_safe
+from shared.api_utils import clamp_limit, compute_pole_local_sunset, compute_pole_status_labels, json_safe
 from shared.sql_client import get_connection
 
 # Which PoleVitals period type drives the ROLLUP classification
@@ -243,6 +243,9 @@ SELECT
     latest_pt.SolarBoardVoltage AS SolarBoardVoltage,
     latest_pt.SolarBoardElecCurrent AS SolarBoardElecCurrent,
     latest_pt.IsDaylightForPanelFault AS IsDaylightForPanelFault,
+    ptz.Latitude AS TimeZoneLatitude,
+    ptz.Longitude AS TimeZoneLongitude,
+    ptz.IanaTimeZone AS IanaTimeZone,
     rps_online.IsOnline AS IsOnline,
     rps.IsLedFault AS IsLedFault,
     rps.IsBatteryFault AS IsBatteryFault,
@@ -398,6 +401,9 @@ def _pole_row_to_dict(row) -> dict:
         solar_board_voltage,
         solar_board_elec_current,
         is_daylight_for_panel_fault,
+        timezone_latitude,
+        timezone_longitude,
+        iana_timezone,
         is_online,
         is_led_fault,
         is_battery_fault,
@@ -438,6 +444,9 @@ def _pole_row_to_dict(row) -> dict:
         "avgBatteryPercentage": json_safe(battery_percentage),
         "avgPanelPercentage": json_safe(panel_percentage),
         "avgLightPercentage": json_safe(light_percentage),
+        "sunsetTime": json_safe(
+            compute_pole_local_sunset(timezone_latitude, timezone_longitude, iana_timezone)
+        ),
         **compute_pole_status_labels(
             has_telemetry=last_update is not None,
             lamp_power_1=lamp_power_1,
@@ -529,7 +538,19 @@ def get_pole_vitals(customer_id: str = None, project_id: str = None, limit: int 
     lampPower2, batteryElecCurrent1, batteryElecCurrent2,
     solarBoardVoltage, solarBoardElecCurrent, isOnline, isLedFault,
     isBatteryFault, isPanelFault, isOpenIssueFault, isPoleFault,
-    avgBatteryPercentage, avgPanelPercentage, avgLightPercentage --
+    avgBatteryPercentage, avgPanelPercentage, avgLightPercentage,
+    lightStatusLabel, panelStatusLabel, panelIdleReason,
+    batteryStatusLabel, electricCurrentAverage (these five calculated
+    via api_utils.compute_pole_status_labels() -- see that function's
+    own docstring for the full logic), and sunsetTime (today's sunset
+    for THIS pole's own location, expressed in that same pole's own
+    local time -- via api_utils.compute_pole_local_sunset(), which
+    itself relies on PoleTimeZones' own Latitude/Longitude/
+    IanaTimeZone; None for a pole with no resolved coordinates, or one
+    whose location has no sunset at all on its own current local date,
+    e.g. polar day/night at extreme Alaska latitudes -- see that
+    function's and shared/daylight_utils.get_sunset()'s own docstrings)
+    --
     isLedFault/isBatteryFault/isPanelFault/isOpenIssueFault/isPoleFault
     and the three avg*Percentage fields, unlike the rollup stats above,
     come from each pole's own LastKnown48Hours PoleVitals row,

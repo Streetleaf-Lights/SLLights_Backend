@@ -20,7 +20,7 @@ underscore-prefixed names" for code this tightly coupled and this
 unlikely to be used by anything outside this codebase.
 """
 
-from shared.api_utils import clamp_limit, compute_pole_status_labels, json_safe
+from shared.api_utils import clamp_limit, compute_pole_local_sunset, compute_pole_status_labels, json_safe
 from shared.pole_vitals_api import (
     _POLE_DETAIL_PERIOD_TYPE,
     _POLE_DETAILS_SQL_TEMPLATE,
@@ -79,6 +79,13 @@ def _clamp_summary_limit(limit) -> int:
 # distinguish "Disconnected" (was online, has gone quiet recently)
 # from "Unknown" (no recent-enough reading to say either way) -- a
 # distinction that can't be made from IsOnline alone.
+#
+# ptz.Latitude/Longitude/IanaTimeZone (from the PoleTimeZones join
+# already present here for WindowsTimeZone's own sake) are ALSO now
+# selected -- the inputs api_utils.compute_pole_local_sunset() needs
+# for sunsetTime. Unlike the OUTER APPLY widening above, this one adds
+# no new join and no new per-pole cost of any real significance: these
+# three columns come from a LEFT JOIN this query already performs.
 _POLE_SUMMARY_SQL_TEMPLATE = """
 SELECT
     proj.Id AS ProjectId,
@@ -96,6 +103,9 @@ SELECT
     latest_pt.SolarBoardVoltage AS SolarBoardVoltage,
     latest_pt.SolarBoardElecCurrent AS SolarBoardElecCurrent,
     latest_pt.IsDaylightForPanelFault AS IsDaylightForPanelFault,
+    ptz.Latitude AS TimeZoneLatitude,
+    ptz.Longitude AS TimeZoneLongitude,
+    ptz.IanaTimeZone AS IanaTimeZone,
     rps_online.IsOnline AS IsOnline,
     rps.IsLedFault AS IsLedFault,
     rps.IsBatteryFault AS IsBatteryFault,
@@ -199,6 +209,9 @@ def _summary_row_to_dict(row) -> dict:
         solar_board_voltage,
         solar_board_elec_current,
         is_daylight_for_panel_fault,
+        timezone_latitude,
+        timezone_longitude,
+        iana_timezone,
         is_online,
         is_led_fault,
         is_battery_fault,
@@ -222,6 +235,9 @@ def _summary_row_to_dict(row) -> dict:
         is_daylight_for_panel_fault=is_daylight_for_panel_fault,
     )
     status_labels.pop("electricCurrentAverage", None)
+    sunset_time = json_safe(
+        compute_pole_local_sunset(timezone_latitude, timezone_longitude, iana_timezone)
+    )
 
     return {
         "id": json_safe(pole_id),
@@ -240,6 +256,7 @@ def _summary_row_to_dict(row) -> dict:
         "avgBatteryPercentage": json_safe(battery_percentage),
         "avgPanelPercentage": json_safe(panel_percentage),
         "avgLightPercentage": json_safe(light_percentage),
+        "sunsetTime": sunset_time,
         "projectId": json_safe(project_id),
         "customerId": json_safe(customer_id),
         **status_labels,
@@ -260,7 +277,8 @@ def get_poles(
     isLedFault, isBatteryFault, isPanelFault, isOpenIssueFault,
     isPoleFault, avgBatteryPercentage, avgPanelPercentage,
     avgLightPercentage, lightStatusLabel, panelStatusLabel,
-    panelIdleReason, batteryStatusLabel, electricCurrentAverage -- see
+    panelIdleReason, batteryStatusLabel, electricCurrentAverage,
+    sunsetTime -- see
     pole_vitals_api.get_pole_vitals()'s own docstring for what each of
     these means and where it comes from), plus two additions beyond
     that literal field set: projectId and customerId, needed so a
@@ -298,15 +316,21 @@ def get_poles(
     _POLE_SUMMARY_SQL_TEMPLATE's own comment for why lastUpdate earns
     that cost while the two voltage fields don't: the web frontend needs
     lastUpdate to distinguish "Disconnected" from "Unknown", a
-    distinction IsOnline alone can't make). Built for a "give me every
-    pole" consumer (e.g. a map rendering all ~14K poles at once) that
-    needs location, status, staleness, and now these four status labels
-    too, to plot/color a pin, not full per-pole telemetry detail --
-    that fuller detail (including electricCurrentAverage) is still
-    available cheaply for one specific pole via pole_id, which always
-    uses the full query regardless of this flag. Also raises the
-    unfiltered case's limit ceiling to _SUMMARY_MAX_LIMIT instead of
-    api_utils.MAX_LIMIT, since summary mode's whole reason to exist is
+    distinction IsOnline alone can't make). sunsetTime IS also included
+    here -- unlike the status labels above, it never needed the
+    cost/benefit tradeoff those did: it's a pure Python calculation over
+    PoleTimeZones' own Latitude/Longitude/IanaTimeZone columns, already
+    joined into this query for the WindowsTimeZone-based lastUpdate
+    conversion, not a new expensive PoleTelemetry column to fetch.
+    Built for a "give me every pole" consumer (e.g. a map rendering all
+    ~14K poles at once) that needs location, status, staleness, and now
+    these four status labels plus sunsetTime too, to plot/color a pin,
+    not full per-pole telemetry detail -- that fuller detail (including
+    electricCurrentAverage) is still available cheaply for one specific
+    pole via pole_id, which always uses the full query regardless of
+    this flag. Also raises the unfiltered case's limit ceiling to
+    _SUMMARY_MAX_LIMIT instead of api_utils.MAX_LIMIT, since summary
+    mode's whole reason to exist is
     making "every pole in one call" practical.
     """
     if pole_id or project_id or customer_id:

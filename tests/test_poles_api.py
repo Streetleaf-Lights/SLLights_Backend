@@ -1,6 +1,7 @@
 """Tests for shared/poles_api.py"""
 
 import pytest
+from freezegun import freeze_time
 
 from shared import poles_api as m
 
@@ -36,6 +37,19 @@ class TestPoleSummarySqlStructure:
         assert "BatteryVoltage1" not in sql
         assert "BatteryVoltage2" not in sql
 
+    def test_pole_time_zone_columns_added_for_sunset_time(self):
+        """Needed for sunsetTime's own calculation, per explicit
+        request -- sourced from the PoleTimeZones join already present
+        for the lastUpdate conversion, not a new join. Distinct
+        aliases (TimeZoneLatitude/TimeZoneLongitude), not Latitude/
+        Longitude, since p.Lat/p.Long (Poles' own, less trusted
+        coordinates) are already selected elsewhere in this same query
+        under different names."""
+        sql = m._POLE_SUMMARY_SQL_TEMPLATE
+        assert "ptz.Latitude AS TimeZoneLatitude" in sql
+        assert "ptz.Longitude AS TimeZoneLongitude" in sql
+        assert "ptz.IanaTimeZone AS IanaTimeZone" in sql
+
     def test_outer_apply_still_a_single_correlated_lookup(self):
         """Widened, not duplicated -- still exactly one seek into
         PoleTelemetry per pole, not a second OUTER APPLY added
@@ -61,6 +75,9 @@ def _summary_row(
     solar_board_voltage=18.0,
     solar_board_elec_current=2.0,
     is_daylight_for_panel_fault=1,
+    timezone_latitude=28.2,
+    timezone_longitude=-80.7,
+    iana_timezone="America/New_York",
     is_online=True,
     is_led_fault=False,
     is_battery_fault=False,
@@ -78,6 +95,7 @@ def _summary_row(
         last_update,
         lamp_power_1, lamp_power_2, battery_elec_current_1, battery_elec_current_2,
         solar_board_voltage, solar_board_elec_current, is_daylight_for_panel_fault,
+        timezone_latitude, timezone_longitude, iana_timezone,
         is_online, is_led_fault, is_battery_fault, is_panel_fault, is_open_issue_fault, is_pole_fault,
         battery_percentage, panel_percentage, light_percentage, customer_id,
     )
@@ -85,8 +103,9 @@ def _summary_row(
 
 class TestSummaryRowToDict:
     def test_maps_every_base_field_correctly(self):
-        row = _summary_row()
-        result = m._summary_row_to_dict(row)
+        with freeze_time("2026-08-28 12:00:00"):
+            row = _summary_row()
+            result = m._summary_row_to_dict(row)
         assert result["id"] == "pole1"
         assert result["poleNumber"] == "PN-1"
         assert result["locationId"] == "LOC-1"
@@ -100,6 +119,7 @@ class TestSummaryRowToDict:
         assert result["avgBatteryPercentage"] == 89.0
         assert result["avgPanelPercentage"] == 45.0
         assert result["avgLightPercentage"] == 0.0
+        assert result["sunsetTime"] == "2026-08-28 19:47:58.596527-04:00"
         assert result["projectId"] == "proj1"
         assert result["customerId"] == "cust1"
 
@@ -165,6 +185,43 @@ class TestSummaryRowToDict:
         result = m._summary_row_to_dict(row)
         assert result["panelStatusLabel"] == "Idle"
         assert result["panelIdleReason"] == "Sundown"
+
+    def test_sunset_time_independent_of_telemetry_state(self):
+        """Unlike the four status labels (gated by has_telemetry, i.e.
+        last_update is not None), sunsetTime depends only on
+        TimeZoneLatitude/TimeZoneLongitude/IanaTimeZone -- a pole with
+        NO recent telemetry at all still has a real, computable sunset
+        for its own location, so this must NOT come back None just
+        because last_update is None."""
+        row = _summary_row(
+            last_update=None,
+            lamp_power_1=None, lamp_power_2=None,
+            battery_elec_current_1=None, battery_elec_current_2=None,
+            solar_board_voltage=None, solar_board_elec_current=None,
+            is_daylight_for_panel_fault=None,
+        )
+        with freeze_time("2026-08-28 12:00:00"):
+            result = m._summary_row_to_dict(row)
+        assert result["lastUpdate"] is None
+        assert result["lightStatusLabel"] is None  # confirms telemetry-gated fields still behave as before
+        assert result["sunsetTime"] == "2026-08-28 19:47:58.596527-04:00"
+
+    def test_sunset_time_none_when_pole_time_zone_coordinates_missing(self):
+        """No PoleTimeZones row resolved for this pole at all -- nothing
+        to compute a sunset from, regardless of telemetry state."""
+        row = _summary_row(timezone_latitude=None, timezone_longitude=None)
+        result = m._summary_row_to_dict(row)
+        assert result["sunsetTime"] is None
+
+    def test_sunset_time_falls_back_to_eastern_when_iana_zone_missing(self):
+        """Coordinates present, but no resolved IANA zone (e.g. outside
+        timezone_utils.py's deliberately US-scoped mapping) -- still a
+        real, computable sunset, just displayed in the project's
+        established Eastern-time fallback rather than coming back None."""
+        with freeze_time("2026-08-28 12:00:00"):
+            with_iana = m._summary_row_to_dict(_summary_row(iana_timezone="America/New_York"))
+            without_iana = m._summary_row_to_dict(_summary_row(iana_timezone=None))
+        assert without_iana["sunsetTime"] == with_iana["sunsetTime"]
 
 
 class TestGetPolesSummaryMode:

@@ -6,6 +6,11 @@ rather than duplicated per-module with the risk of the copies drifting
 apart later.
 """
 
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+from shared.daylight_utils import get_sunset
+
 MAX_LIMIT = 1000
 
 # No-limit-specified means "everything, up to MAX_LIMIT" -- these are
@@ -154,3 +159,52 @@ def compute_pole_status_labels(
         "batteryStatusLabel": battery_status_label,
         "electricCurrentAverage": battery_current_sum / 2,
     }
+
+
+# Matches pole_vitals_loader.py's own established fallback for a pole
+# whose own timezone couldn't be resolved (see PoleTimeZones' own
+# comments on WindowsTimeZone/IanaTimeZone both being NULL in that
+# case) -- this project's own default assumption when a pole's real
+# location-derived timezone isn't available, not an arbitrary new
+# choice made just for this one field.
+_DEFAULT_TIMEZONE_NAME = "America/New_York"
+
+
+def compute_pole_local_sunset(latitude, longitude, iana_timezone):
+    """
+    Returns today's sunset moment for a pole, expressed in that SAME
+    pole's own local time -- "today" meaning the pole's OWN local
+    calendar date, not the server's, or any other single shared
+    reference point's, own "today". These can genuinely differ: at a
+    moment just after midnight UTC, a pole in Hawaii is still living in
+    the PREVIOUS calendar day while a pole in Maine has already rolled
+    over to the next one -- get_sunset()'s own tzinfo parameter (see its
+    own docstring) is what makes datetime.now(tz).date() resolve to
+    each pole's own correct day here, not a single shared UTC date
+    applied uniformly to every pole regardless of where it actually is.
+
+    Returns None if latitude/longitude are missing entirely (no
+    PoleTimeZones row resolved for this pole at all -- see
+    shared/timezone_utils.py's own resolve_windows_timezone() for when
+    that happens), or if the sun genuinely doesn't set at all on this
+    pole's own local date at that location (polar day/night -- see
+    daylight_utils.get_sunset()'s own docstring).
+
+    iana_timezone falls back to "America/New_York" if not given/
+    resolved for this pole -- matching this project's own established
+    Eastern-time fallback elsewhere (see pole_vitals_loader.py's own
+    comments on the same fallback for WindowsTimeZone) -- deliberately
+    NOT returning None in that case: a pole with unresolved coordinates
+    already gets None from the check above; a pole WITH resolved
+    coordinates but no successfully-mapped IANA zone (e.g. resolves to
+    a real timezone outside timezone_utils.py's deliberately US-scoped
+    IANA_TO_WINDOWS mapping) still has a real, computable sunset moment
+    -- it's specifically the DISPLAY timezone that's unknown, not
+    whether a sunset happened.
+    """
+    if latitude is None or longitude is None:
+        return None
+
+    tz = ZoneInfo(iana_timezone) if iana_timezone else ZoneInfo(_DEFAULT_TIMEZONE_NAME)
+    today_in_pole_local_time = datetime.now(tz).date()
+    return get_sunset(today_in_pole_local_time, latitude, longitude, tzinfo=tz)

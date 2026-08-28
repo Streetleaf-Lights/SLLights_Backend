@@ -1,6 +1,10 @@
 """Tests for shared/api_utils.py"""
 
+from datetime import date
+from zoneinfo import ZoneInfo
+
 import pytest
+from freezegun import freeze_time
 
 from shared import api_utils
 
@@ -196,3 +200,68 @@ class TestComputePoleStatusLabels:
     def test_electric_current_average_not_rounded(self):
         result = self._labels(battery_elec_current_1=1.0, battery_elec_current_2=2.0)
         assert result["electricCurrentAverage"] == 1.5
+
+
+class TestComputePoleLocalSunset:
+    """
+    Direct unit tests for compute_pole_local_sunset(), per explicit
+    request. Uses freeze_time throughout since "today" is inherent to
+    this function's own job -- without freezing, these assertions would
+    be checking against a different sunset every day this suite runs.
+    """
+
+    _FL_LAT, _FL_LONG = 28.2, -80.7
+
+    def test_missing_latitude_returns_none(self):
+        assert api_utils.compute_pole_local_sunset(None, self._FL_LONG, "America/New_York") is None
+
+    def test_missing_longitude_returns_none(self):
+        assert api_utils.compute_pole_local_sunset(self._FL_LAT, None, "America/New_York") is None
+
+    def test_returns_a_datetime_for_a_normal_pole(self):
+        with freeze_time("2026-08-28 12:00:00"):
+            result = api_utils.compute_pole_local_sunset(self._FL_LAT, self._FL_LONG, "America/New_York")
+        assert result is not None
+        assert result.tzinfo is not None
+
+    def test_result_expressed_in_the_poles_own_timezone_not_utc(self):
+        with freeze_time("2026-08-28 12:00:00"):
+            eastern_result = api_utils.compute_pole_local_sunset(
+                self._FL_LAT, self._FL_LONG, "America/New_York"
+            )
+            pacific_result = api_utils.compute_pole_local_sunset(
+                34.05, -118.24, "America/Los_Angeles"
+            )
+        assert eastern_result.utcoffset().total_seconds() == -4 * 3600  # EDT
+        assert pacific_result.utcoffset().total_seconds() == -7 * 3600  # PDT
+
+    def test_missing_iana_timezone_falls_back_to_eastern(self):
+        """Matches pole_vitals_loader.py's own established Eastern-time
+        fallback for a pole whose own timezone couldn't be resolved --
+        NOT None, since the pole's coordinates ARE present here (only
+        the resolved timezone name is missing), and a real sunset moment
+        still exists regardless of which timezone it gets displayed in."""
+        with freeze_time("2026-08-28 12:00:00"):
+            result = api_utils.compute_pole_local_sunset(self._FL_LAT, self._FL_LONG, None)
+            eastern_result = api_utils.compute_pole_local_sunset(
+                self._FL_LAT, self._FL_LONG, "America/New_York"
+            )
+        assert result == eastern_result
+
+    def test_todays_date_resolved_against_the_poles_own_timezone(self):
+        """Regression guard for the exact bug this design avoids: at a
+        moment just after midnight UTC, a pole far enough west (e.g.
+        Hawaii) is still living in the PREVIOUS calendar day while
+        UTC has already rolled over -- "today" must be resolved against
+        THAT pole's own local clock, not a single shared UTC date
+        applied uniformly regardless of where the pole actually is."""
+        with freeze_time("2026-08-28 02:00:00"):  # 2 AM UTC == still Aug 27 in Hawaii
+            hawaii_result = api_utils.compute_pole_local_sunset(21.3, -157.8, "Pacific/Honolulu")
+        assert hawaii_result.date() == date(2026, 8, 27)
+
+    def test_polar_night_returns_none(self):
+        """Propagates get_sunset()'s own None for a location/date with
+        no sunset at all, rather than raising."""
+        with freeze_time("2026-12-21 12:00:00"):
+            result = api_utils.compute_pole_local_sunset(71.29, -156.79, "America/Anchorage")
+        assert result is None
