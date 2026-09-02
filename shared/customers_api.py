@@ -16,11 +16,12 @@ _COLUMN_TO_JSON_KEY = [
     ("State", "state"),
     ("Zip", "zip"),
     ("Phone", "phone"),
+    ("Active", "active"),
     ("AirTableCreatedDateTime", "createdAt"),
 ]
 
 
-def get_customers(customer_id: str = None, limit: int = None) -> list:
+def get_customers(customer_id: str = None, limit: int = None, active: bool = None) -> list:
     """
     Queries Customers and returns a list of JSON-serializable dicts
     (camelCase keys -- see _COLUMN_TO_JSON_KEY).
@@ -33,6 +34,13 @@ def get_customers(customer_id: str = None, limit: int = None) -> list:
     DEFAULT_LIMIT, capped at MAX_LIMIT regardless of what's requested
     (see shared/api_utils.py). Ignored when customer_id is given (a
     single-Id lookup is already bounded to at most one row).
+    active: if given (True/False), filters to only customers whose
+    Active column matches. If None (default), returns customers
+    regardless of Active status -- unchanged default behavior. Ignored
+    when customer_id is given, same reasoning as limit: a lookup by its
+    own Id is a single specific resource, not a filtered list, so it
+    shouldn't return "not found" just because that one customer happens
+    to be inactive.
     """
     columns_sql = ", ".join(col for col, _ in _COLUMN_TO_JSON_KEY)
 
@@ -43,6 +51,12 @@ def get_customers(customer_id: str = None, limit: int = None) -> list:
             cursor.execute(
                 f"SELECT {columns_sql} FROM Customers WHERE Id = ?",
                 customer_id,
+            )
+        elif active is not None:
+            cursor.execute(
+                f"SELECT TOP (?) {columns_sql} FROM Customers WHERE Active = ? ORDER BY Name",
+                clamp_limit(limit),
+                1 if active else 0,
             )
         else:
             cursor.execute(

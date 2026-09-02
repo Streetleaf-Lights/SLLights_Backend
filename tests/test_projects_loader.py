@@ -225,7 +225,9 @@ class TestLoadProjectsSuccessFlow:
         projects_loader.load_projects()
 
         calls = mock_cursor.execute.call_args_list
-        assert len(calls) == 4  # insert SP_Execution + 2 upserts + final update
+        # insert SP_Execution + 2 upserts + flag-removed staging create +
+        # flag-removed UPDATE + final update
+        assert len(calls) == 6
 
         insert_sql, name, env, start_time, source = calls[0].args
         assert "INSERT INTO SP_Execution" in insert_sql
@@ -239,14 +241,25 @@ class TestLoadProjectsSuccessFlow:
         assert upsert2_args[1] == "recProj2"
         assert upsert2_args[5] == 99
 
-        update_sql, end_time, success, errors, batch_count, sp_exec_id = calls[3].args
+        staging_create_sql = calls[3].args[0]
+        assert "CurrentAirtableIds_Projects" in staging_create_sql
+        flag_update_sql = calls[4].args[0]
+        assert "UPDATE t" in flag_update_sql
+        assert "Projects" in flag_update_sql
+        assert "Active" in flag_update_sql
+
+        staging_insert_sql, id_batch = mock_cursor.executemany.call_args.args
+        assert "CurrentAirtableIds_Projects" in staging_insert_sql
+        assert id_batch == [("recProj1",), ("recProj2",)]
+
+        update_sql, end_time, success, errors, batch_count, sp_exec_id = calls[5].args
         assert "UPDATE SP_Execution" in update_sql
         assert (success, errors, batch_count, sp_exec_id) == (2, 0, 1, 99)
         assert DTO_PATTERN.match(end_time)
 
-        assert mock_conn.commit.call_count == 3
-        mock_cursor.close.assert_called_once()
-        mock_conn.close.assert_called_once()
+        assert mock_conn.commit.call_count == 4
+        assert mock_cursor.close.call_count == 2
+        assert mock_conn.close.call_count == 2
 
     def test_empty_airtable_result_still_closes_out_execution_row(
         self, patch_get_connection_projects, patch_fetch_all_records_projects, mock_cursor
@@ -273,7 +286,10 @@ class TestLoadProjectsPartialFailure:
             [make_project_record(record_id="recProj1"), make_project_record(record_id="recProj2")],
             [],
         )
-        mock_cursor.execute.side_effect = [None, None, RuntimeError("bad row"), None]
+        # calls in order: insert SP_Execution, upsert recProj1, upsert
+        # recProj2 (fails), flag-removed staging create, flag-removed
+        # UPDATE, final update
+        mock_cursor.execute.side_effect = [None, None, RuntimeError("bad row"), None, None, None]
 
         projects_loader.load_projects()  # must not raise
 
@@ -304,5 +320,5 @@ class TestLoadProjectsTopLevelFailure:
         assert err_msg == "airtable is down"
         assert sp_exec_id == 99
 
-        mock_cursor.close.assert_called_once()
-        mock_conn.close.assert_called_once()
+        assert mock_cursor.close.call_count == 2
+        assert mock_conn.close.call_count == 2

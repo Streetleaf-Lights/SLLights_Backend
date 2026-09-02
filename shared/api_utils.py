@@ -44,6 +44,25 @@ def clamp_limit(limit) -> int:
     return max(1, min(int(limit), MAX_LIMIT))
 
 
+def parse_bool_param(value: str, param_name: str) -> bool:
+    """
+    Parses a query-string boolean parameter ("true"/"false"/"1"/"0",
+    case-insensitive -- same values getPoles' existing `summary` param
+    already accepts, just factored out here so `active` doesn't duplicate
+    that logic inline a third time across getCustomers/getProjects/
+    getPoles).
+
+    Raises ValueError with a message safe to return directly in a 400
+    response if `value` doesn't match one of those four accepted forms.
+    """
+    normalized = value.strip().lower()
+    if normalized in ("true", "1"):
+        return True
+    if normalized in ("false", "0"):
+        return False
+    raise ValueError(f"{param_name} must be true/false or 1/0")
+
+
 def compute_pole_status_labels(
     has_telemetry: bool,
     lamp_power_1,

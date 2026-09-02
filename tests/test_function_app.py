@@ -654,12 +654,14 @@ class TestLoadLeadsunDataManual:
 # --------------------------------------------------------------------------
 
 
-def make_get_customers_http_request(customer_id=None, limit=None):
+def make_get_customers_http_request(customer_id=None, limit=None, active=None):
     params = {}
     if customer_id is not None:
         params["customerId"] = customer_id
     if limit is not None:
         params["limit"] = limit
+    if active is not None:
+        params["active"] = active
     return func.HttpRequest(
         method="GET",
         url="/api/getCustomers",
@@ -693,7 +695,7 @@ class TestGetCustomers:
         assert response.status_code == 200
         body = json.loads(response.get_body())
         assert body == {"id": "rec1", "name": "Acme"}
-        mock_get.assert_called_once_with(customer_id="rec1", limit=None)
+        mock_get.assert_called_once_with(customer_id="rec1", limit=None, active=None)
 
     def test_customer_id_not_found_returns_404(self, mocker):
         mocker.patch("function_app.get_customers", return_value=[])
@@ -709,7 +711,52 @@ class TestGetCustomers:
 
         function_app.getCustomers(make_get_customers_http_request(limit="5"))
 
-        mock_get.assert_called_once_with(customer_id=None, limit=5)
+        mock_get.assert_called_once_with(customer_id=None, limit=5, active=None)
+
+    def test_active_true_is_parsed_and_passed_through(self, mocker):
+        mock_get = mocker.patch("function_app.get_customers", return_value=[])
+
+        function_app.getCustomers(make_get_customers_http_request(active="true"))
+
+        mock_get.assert_called_once_with(customer_id=None, limit=None, active=True)
+
+    def test_active_1_is_also_treated_as_true(self, mocker):
+        mock_get = mocker.patch("function_app.get_customers", return_value=[])
+
+        function_app.getCustomers(make_get_customers_http_request(active="1"))
+
+        mock_get.assert_called_once_with(customer_id=None, limit=None, active=True)
+
+    def test_active_false_is_parsed_and_passed_through(self, mocker):
+        mock_get = mocker.patch("function_app.get_customers", return_value=[])
+
+        function_app.getCustomers(make_get_customers_http_request(active="false"))
+
+        mock_get.assert_called_once_with(customer_id=None, limit=None, active=False)
+
+    def test_active_is_case_insensitive(self, mocker):
+        mock_get = mocker.patch("function_app.get_customers", return_value=[])
+
+        function_app.getCustomers(make_get_customers_http_request(active="TRUE"))
+
+        mock_get.assert_called_once_with(customer_id=None, limit=None, active=True)
+
+    def test_active_absent_defaults_to_none(self, mocker):
+        mock_get = mocker.patch("function_app.get_customers", return_value=[])
+
+        function_app.getCustomers(make_get_customers_http_request())
+
+        mock_get.assert_called_once_with(customer_id=None, limit=None, active=None)
+
+    def test_invalid_active_returns_400_without_querying(self, mocker):
+        mock_get = mocker.patch("function_app.get_customers")
+
+        response = function_app.getCustomers(make_get_customers_http_request(active="yes"))
+
+        assert response.status_code == 400
+        body = json.loads(response.get_body())
+        assert "error" in body
+        mock_get.assert_not_called()
 
     def test_non_numeric_limit_returns_400_without_querying(self, mocker):
         mock_get = mocker.patch("function_app.get_customers")
@@ -742,7 +789,7 @@ class TestGetCustomers:
 # --------------------------------------------------------------------------
 
 
-def make_get_projects_http_request(project_id=None, customer_id=None, limit=None):
+def make_get_projects_http_request(project_id=None, customer_id=None, limit=None, active=None):
     params = {}
     if project_id is not None:
         params["projectId"] = project_id
@@ -750,6 +797,8 @@ def make_get_projects_http_request(project_id=None, customer_id=None, limit=None
         params["customerId"] = customer_id
     if limit is not None:
         params["limit"] = limit
+    if active is not None:
+        params["active"] = active
     return func.HttpRequest(
         method="GET",
         url="/api/getProjects",
@@ -777,7 +826,7 @@ def make_get_pole_vitals_http_request(project_id=None, customer_id=None, limit=N
 
 
 def make_get_poles_http_request(
-    pole_id=None, project_id=None, customer_id=None, limit=None, summary=None
+    pole_id=None, project_id=None, customer_id=None, limit=None, summary=None, active=None
 ):
     params = {}
     if pole_id is not None:
@@ -790,6 +839,8 @@ def make_get_poles_http_request(
         params["limit"] = limit
     if summary is not None:
         params["summary"] = summary
+    if active is not None:
+        params["active"] = active
     return func.HttpRequest(
         method="GET",
         url="/api/getPoles",
@@ -823,7 +874,7 @@ class TestGetProjects:
         assert response.status_code == 200
         body = json.loads(response.get_body())
         assert body == {"id": "rec1", "name": "Chaparral Ph3"}
-        mock_get.assert_called_once_with(project_id="rec1", customer_id=None, limit=None)
+        mock_get.assert_called_once_with(project_id="rec1", customer_id=None, limit=None, active=None)
 
     def test_project_id_not_found_returns_404(self, mocker):
         mocker.patch("function_app.get_projects", return_value=[])
@@ -848,7 +899,7 @@ class TestGetProjects:
         body = json.loads(response.get_body())
         assert body == [{"id": "rec1", "name": "Chaparral Ph3"}, {"id": "rec2", "name": "Elm St"}]
         mock_get.assert_called_once_with(
-            project_id=None, customer_id="recwx649JfiRmWqxF", limit=None
+            project_id=None, customer_id="recwx649JfiRmWqxF", limit=None, active=None
         )
 
     def test_customer_id_alone_with_no_matches_returns_empty_array_not_404(self, mocker):
@@ -877,7 +928,7 @@ class TestGetProjects:
 
         assert response.status_code == 200
         mock_get.assert_called_once_with(
-            project_id="rec1", customer_id="recwx649JfiRmWqxF", limit=None
+            project_id="rec1", customer_id="recwx649JfiRmWqxF", limit=None, active=None
         )
 
     def test_project_id_and_customer_id_combined_not_found_returns_404(self, mocker):
@@ -897,7 +948,7 @@ class TestGetProjects:
 
         function_app.getProjects(make_get_projects_http_request(limit="5"))
 
-        mock_get.assert_called_once_with(project_id=None, customer_id=None, limit=5)
+        mock_get.assert_called_once_with(project_id=None, customer_id=None, limit=5, active=None)
 
     def test_non_numeric_limit_returns_400_without_querying(self, mocker):
         mock_get = mocker.patch("function_app.get_projects")
@@ -915,6 +966,41 @@ class TestGetProjects:
         assert response.status_code == 500
         body = json.loads(response.get_body())
         assert "error" in body
+
+    def test_active_true_is_parsed_and_passed_through(self, mocker):
+        mock_get = mocker.patch("function_app.get_projects", return_value=[])
+
+        function_app.getProjects(make_get_projects_http_request(active="true"))
+
+        mock_get.assert_called_once_with(project_id=None, customer_id=None, limit=None, active=True)
+
+    def test_active_combined_with_customer_id_is_passed_through(self, mocker):
+        mock_get = mocker.patch("function_app.get_projects", return_value=[])
+
+        function_app.getProjects(
+            make_get_projects_http_request(customer_id="recwx649JfiRmWqxF", active="false")
+        )
+
+        mock_get.assert_called_once_with(
+            project_id=None, customer_id="recwx649JfiRmWqxF", limit=None, active=False
+        )
+
+    def test_active_absent_defaults_to_none(self, mocker):
+        mock_get = mocker.patch("function_app.get_projects", return_value=[])
+
+        function_app.getProjects(make_get_projects_http_request())
+
+        mock_get.assert_called_once_with(project_id=None, customer_id=None, limit=None, active=None)
+
+    def test_invalid_active_returns_400_without_querying(self, mocker):
+        mock_get = mocker.patch("function_app.get_projects")
+
+        response = function_app.getProjects(make_get_projects_http_request(active="maybe"))
+
+        assert response.status_code == 400
+        body = json.loads(response.get_body())
+        assert "error" in body
+        mock_get.assert_not_called()
 
     def test_response_is_valid_json_even_for_empty_list(self, mocker):
         mocker.patch("function_app.get_projects", return_value=[])
@@ -1115,7 +1201,7 @@ class TestGetPoles:
         body = json.loads(response.get_body())
         assert body["id"] == "pole1"
         mock_get.assert_called_once_with(
-            pole_id="pole1", project_id=None, customer_id=None, limit=None, summary=False
+            pole_id="pole1", project_id=None, customer_id=None, limit=None, summary=False, active=None
         )
 
     def test_pole_id_not_found_returns_404(self, mocker):
@@ -1135,7 +1221,7 @@ class TestGetPoles:
         assert response.status_code == 200
         assert json.loads(response.get_body()) == []
         mock_get.assert_called_once_with(
-            pole_id=None, project_id="proj-empty", customer_id=None, limit=None, summary=False
+            pole_id=None, project_id="proj-empty", customer_id=None, limit=None, summary=False, active=None
         )
 
     def test_customer_id_alone_returns_array_with_200(self, mocker):
@@ -1148,7 +1234,7 @@ class TestGetPoles:
 
         assert response.status_code == 200
         mock_get.assert_called_once_with(
-            pole_id=None, project_id=None, customer_id="cust1", limit=None, summary=False
+            pole_id=None, project_id=None, customer_id="cust1", limit=None, summary=False, active=None
         )
 
     def test_pole_id_and_project_id_both_passed_through(self, mocker):
@@ -1163,7 +1249,7 @@ class TestGetPoles:
 
         assert response.status_code == 200
         mock_get.assert_called_once_with(
-            pole_id="pole1", project_id="proj1", customer_id=None, limit=None, summary=False
+            pole_id="pole1", project_id="proj1", customer_id=None, limit=None, summary=False, active=None
         )
 
     def test_pole_id_belonging_to_different_project_returns_404(self, mocker):
@@ -1181,7 +1267,7 @@ class TestGetPoles:
         function_app.getPoles(make_get_poles_http_request(limit="5"))
 
         mock_get.assert_called_once_with(
-            pole_id=None, project_id=None, customer_id=None, limit=5, summary=False
+            pole_id=None, project_id=None, customer_id=None, limit=5, summary=False, active=None
         )
 
     def test_non_numeric_limit_returns_400_without_querying(self, mocker):
@@ -1215,7 +1301,7 @@ class TestGetPoles:
         function_app.getPoles(make_get_poles_http_request(summary="true"))
 
         mock_get.assert_called_once_with(
-            pole_id=None, project_id=None, customer_id=None, limit=None, summary=True
+            pole_id=None, project_id=None, customer_id=None, limit=None, summary=True, active=None
         )
 
     def test_summary_is_case_insensitive(self, mocker):
@@ -1224,7 +1310,7 @@ class TestGetPoles:
         function_app.getPoles(make_get_poles_http_request(summary="TRUE"))
 
         mock_get.assert_called_once_with(
-            pole_id=None, project_id=None, customer_id=None, limit=None, summary=True
+            pole_id=None, project_id=None, customer_id=None, limit=None, summary=True, active=None
         )
 
     def test_summary_1_is_also_treated_as_true(self, mocker):
@@ -1233,7 +1319,7 @@ class TestGetPoles:
         function_app.getPoles(make_get_poles_http_request(summary="1"))
 
         mock_get.assert_called_once_with(
-            pole_id=None, project_id=None, customer_id=None, limit=None, summary=True
+            pole_id=None, project_id=None, customer_id=None, limit=None, summary=True, active=None
         )
 
     def test_summary_absent_defaults_to_false(self, mocker):
@@ -1242,7 +1328,7 @@ class TestGetPoles:
         function_app.getPoles(make_get_poles_http_request())
 
         mock_get.assert_called_once_with(
-            pole_id=None, project_id=None, customer_id=None, limit=None, summary=False
+            pole_id=None, project_id=None, customer_id=None, limit=None, summary=False, active=None
         )
 
     def test_summary_false_string_is_treated_as_false(self, mocker):
@@ -1251,8 +1337,45 @@ class TestGetPoles:
         function_app.getPoles(make_get_poles_http_request(summary="false"))
 
         mock_get.assert_called_once_with(
-            pole_id=None, project_id=None, customer_id=None, limit=None, summary=False
+            pole_id=None, project_id=None, customer_id=None, limit=None, summary=False, active=None
         )
+
+    def test_active_true_is_parsed_and_passed_through(self, mocker):
+        mock_get = mocker.patch("function_app.get_poles", return_value=[])
+
+        function_app.getPoles(make_get_poles_http_request(active="true"))
+
+        mock_get.assert_called_once_with(
+            pole_id=None, project_id=None, customer_id=None, limit=None, summary=False, active=True
+        )
+
+    def test_active_combined_with_project_id_is_passed_through(self, mocker):
+        mock_get = mocker.patch("function_app.get_poles", return_value=[])
+
+        function_app.getPoles(make_get_poles_http_request(project_id="proj1", active="false"))
+
+        mock_get.assert_called_once_with(
+            pole_id=None, project_id="proj1", customer_id=None, limit=None, summary=False, active=False
+        )
+
+    def test_active_absent_defaults_to_none(self, mocker):
+        mock_get = mocker.patch("function_app.get_poles", return_value=[])
+
+        function_app.getPoles(make_get_poles_http_request())
+
+        mock_get.assert_called_once_with(
+            pole_id=None, project_id=None, customer_id=None, limit=None, summary=False, active=None
+        )
+
+    def test_invalid_active_returns_400_without_querying(self, mocker):
+        mock_get = mocker.patch("function_app.get_poles")
+
+        response = function_app.getPoles(make_get_poles_http_request(active="nope"))
+
+        assert response.status_code == 400
+        body = json.loads(response.get_body())
+        assert "error" in body
+        mock_get.assert_not_called()
 
 
 

@@ -4,6 +4,7 @@ import logging
 import time
 
 from shared.airtable_client import fetch_all_records
+from shared.airtable_removal_utils import flag_records_removed_from_airtable
 from shared.sql_client import get_connection
 from shared.datetime_utils import (
     now_eastern as _now_eastern,
@@ -147,15 +148,23 @@ def _map_record_to_project(record: dict) -> dict:
 
 def load_projects() -> None:
     start_time = _to_dto_string(_now_eastern())
-    conn = get_connection()
-    cursor = conn.cursor()
-
     sp_exec_id = None
     total_success = 0
     total_errors = 0
+    conn = None
+    cursor = None
 
     try:
-        # 1. Open an SP_Execution row for this run
+        # 1. Short-lived connection just to open the SP_Execution row --
+        # closed immediately rather than held open through the Airtable
+        # fetch below. A multi-page fetch can run for minutes; holding a
+        # SQL connection open and completely idle for that whole window
+        # risks an intermediate network hop (VPN, NAT/firewall) silently
+        # dropping it, which then surfaces later as a communication-link
+        # failure on the next DB write, well after the real problem
+        # occurred.
+        conn = get_connection()
+        cursor = conn.cursor()
         cursor.execute(
             """
             INSERT INTO SP_Execution (Name, Environment, StartDateTime, Source, BatchCount, IsFinalBatch)
@@ -169,8 +178,13 @@ def load_projects() -> None:
         )
         sp_exec_id = cursor.fetchone()[0]
         conn.commit()
+        cursor.close()
+        conn.close()
+        conn = None
+        cursor = None
 
-        # 2. Pull every page from Airtable before doing any DB writes
+        # 2. Pull every page from Airtable before doing any DB writes --
+        # no SQL connection open at all while this runs.
         fetch_start = time.perf_counter()
         records, offsets_seen = fetch_all_records(AIRTABLE_PROJECTS_TABLE)
         fetch_seconds = time.perf_counter() - fetch_start
@@ -180,6 +194,10 @@ def load_projects() -> None:
             len(offsets_seen) + 1,
             fetch_seconds,
         )
+
+        # 3. Re-open a fresh connection for the write-heavy phase.
+        conn = get_connection()
+        cursor = conn.cursor()
 
         # 3. Upsert each project -- insert if new, update only if something changed
         upsert_start = time.perf_counter()
@@ -216,6 +234,21 @@ def load_projects() -> None:
             len(records),
         )
 
+        # 3b. Flag any existing Project whose own Id wasn't in this run's
+        # Airtable fetch at all -- based on `records` (everything actually
+        # fetched), not on total_success, so a record that failed to
+        # upsert above (still present in Airtable, just a transient DB
+        # write failure) is never mistakenly flagged as removed.
+        removed_flag_changes = flag_records_removed_from_airtable(
+            cursor, "Projects", [record["id"] for record in records]
+        )
+        conn.commit()
+        if removed_flag_changes:
+            logging.info(
+                "loadProjects: %d record(s) changed Active status.",
+                removed_flag_changes,
+            )
+
         # 4. Close out the SP_Execution row with final counts
         cursor.execute(
             """
@@ -238,20 +271,31 @@ def load_projects() -> None:
     except Exception as ex:
         logging.error("loadProjects: run failed: %s", ex)
         if sp_exec_id:
-            cursor.execute(
-                """
-                UPDATE SP_Execution
-                SET EndDateTime = ?, ErrorMessage = ?, TotalSuccessfulRecords = ?, TotalErrorRecords = ?
-                WHERE Id = ?
-                """,
-                _to_dto_string(_now_eastern()),
-                str(ex),
-                total_success,
-                total_errors,
-                sp_exec_id,
-            )
-            conn.commit()
+            try:
+                if conn is None:
+                    conn = get_connection()
+                    cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    UPDATE SP_Execution
+                    SET EndDateTime = ?, ErrorMessage = ?, TotalSuccessfulRecords = ?, TotalErrorRecords = ?
+                    WHERE Id = ?
+                    """,
+                    _to_dto_string(_now_eastern()),
+                    str(ex),
+                    total_success,
+                    total_errors,
+                    sp_exec_id,
+                )
+                conn.commit()
+            except Exception as log_error:
+                logging.error(
+                    "loadProjects: also failed to record ErrorMessage on SP_Execution: %s",
+                    log_error,
+                )
         raise
     finally:
-        cursor.close()
-        conn.close()
+        if cursor is not None:
+            cursor.close()
+        if conn is not None:
+            conn.close()

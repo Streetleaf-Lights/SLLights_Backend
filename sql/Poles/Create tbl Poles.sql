@@ -28,6 +28,19 @@
 --     see shared/poles_loader.py's own comment on _map_record_to_pole()'s
 --     ControllerId mapping for the full reasoning. NVARCHAR(50), matching
 --     PoleTelemetry.ProductId's own type/width.
+--   * Active -- per explicit request, flags whether a Pole's own Id is
+--     still present in loadPoles' own Airtable fetch, without deleting
+--     the row when it isn't (PoleTelemetry/PoleVitals/PoleTimeZones all
+--     reference this same LocationId, and deleting outright would lose
+--     that history). Named generically (not e.g. "IsRemovedFromAirtable")
+--     so it reads sensibly if a future source OTHER than Airtable ever
+--     needs to reconcile against this same table. Set by shared/
+--     airtable_removal_utils.flag_records_removed_from_airtable(),
+--     called once per run from load_poles(), separately from this
+--     table's own MERGE -- see that function's own docstring for why.
+--     BIT NOT NULL DEFAULT 1: every row starts as "active", correct as
+--     a starting assumption since the very next loadPoles run
+--     re-evaluates every row anyway.
 
 -- DROP TABLE IF EXISTS Poles;
 
@@ -46,6 +59,7 @@ BEGIN
         Long                    FLOAT                NULL,
         ControllerId            NVARCHAR(50)         NULL,
         SP_ExecId               INT                  NULL,
+        Active                  BIT                  NOT NULL DEFAULT 1,
         AirTableCreatedDateTime DATETIMEOFFSET(3)    NULL
     );
 

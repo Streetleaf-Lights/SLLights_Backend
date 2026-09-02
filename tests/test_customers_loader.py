@@ -169,6 +169,21 @@ class TestUpsertSqlStructure:
 
 
 class TestLoadCustomersSuccessFlow:
+    def test_fetch_scoped_to_the_customers_view(
+        self, patch_get_connection, patch_fetch_all_records, mock_cursor, make_airtable_record
+    ):
+        """The Customers feed comes down through this specific Airtable
+        view, per explicit request, not the whole table unfiltered."""
+        patch_fetch_all_records.return_value = ([make_airtable_record()], [])
+
+        customers_loader.load_customers()
+
+        patch_fetch_all_records.assert_called_once_with(
+            customers_loader.AIRTABLE_CUSTOMERS_TABLE,
+            view=customers_loader.AIRTABLE_CUSTOMERS_VIEW,
+        )
+        assert customers_loader.AIRTABLE_CUSTOMERS_VIEW == "viwzsXbUJmIWqAiI7"
+
     def test_logs_fetch_and_upsert_phase_timings(
         self,
         patch_get_connection,
@@ -202,7 +217,9 @@ class TestLoadCustomersSuccessFlow:
         customers_loader.load_customers()
 
         calls = mock_cursor.execute.call_args_list
-        assert len(calls) == 4  # insert SP_Execution + 2 upserts + final update
+        # insert SP_Execution + 2 upserts + flag-removed staging create +
+        # flag-removed UPDATE + final update
+        assert len(calls) == 6
 
         # 1. Opening SP_Execution insert
         insert_sql, name, env, start_time, source = calls[0].args
@@ -218,15 +235,27 @@ class TestLoadCustomersSuccessFlow:
         assert upsert2_args[1] == "rec2"
         assert upsert2_args[5] == 42
 
-        # 4. Final SP_Execution update with success/error counts
-        update_sql, end_time, success, errors, batch_count, sp_exec_id = calls[3].args
+        # 4 & 5. flag_records_removed_from_airtable()'s own two statements
+        staging_create_sql = calls[3].args[0]
+        assert "CurrentAirtableIds_Customers" in staging_create_sql
+        flag_update_sql = calls[4].args[0]
+        assert "UPDATE t" in flag_update_sql
+        assert "Customers" in flag_update_sql
+        assert "Active" in flag_update_sql
+
+        staging_insert_sql, id_batch = mock_cursor.executemany.call_args.args
+        assert "CurrentAirtableIds_Customers" in staging_insert_sql
+        assert id_batch == [("rec1",), ("rec2",)]
+
+        # 6. Final SP_Execution update with success/error counts
+        update_sql, end_time, success, errors, batch_count, sp_exec_id = calls[5].args
         assert "UPDATE SP_Execution" in update_sql
         assert (success, errors, batch_count, sp_exec_id) == (2, 0, 1, 42)
         assert DTO_PATTERN.match(end_time)
 
-        assert mock_conn.commit.call_count == 3  # after insert, after loop, after final update
-        mock_cursor.close.assert_called_once()
-        mock_conn.close.assert_called_once()
+        assert mock_conn.commit.call_count == 4  # after insert, after loop, after flag step, after final update
+        assert mock_cursor.close.call_count == 2
+        assert mock_conn.close.call_count == 2
 
     def test_empty_airtable_result_still_closes_out_execution_row(
         self, patch_get_connection, patch_fetch_all_records, mock_cursor
@@ -260,8 +289,10 @@ class TestLoadCustomersPartialFailure:
             [make_airtable_record(record_id="rec1"), make_airtable_record(record_id="rec2")],
             [],
         )
-        # calls in order: insert SP_Execution, upsert rec1, upsert rec2 (fails), final update
-        mock_cursor.execute.side_effect = [None, None, RuntimeError("bad row"), None]
+        # calls in order: insert SP_Execution, upsert rec1, upsert rec2
+        # (fails), flag-removed staging create, flag-removed UPDATE, final
+        # update
+        mock_cursor.execute.side_effect = [None, None, RuntimeError("bad row"), None, None, None]
 
         customers_loader.load_customers()  # must not raise
 
@@ -269,7 +300,7 @@ class TestLoadCustomersPartialFailure:
         success, errors = final_update_args[2], final_update_args[3]
         assert (success, errors) == (1, 1)
         mock_conn = patch_get_connection.return_value
-        mock_conn.close.assert_called_once()
+        assert mock_conn.close.call_count == 2
 
 
 class TestLoadCustomersTopLevelFailure:
@@ -293,8 +324,8 @@ class TestLoadCustomersTopLevelFailure:
         assert sp_exec_id == 42
 
         # cursor/connection must still be cleaned up even on failure
-        mock_cursor.close.assert_called_once()
-        mock_conn.close.assert_called_once()
+        assert mock_cursor.close.call_count == 2
+        assert mock_conn.close.call_count == 2
 
     def test_failure_before_sp_exec_id_assigned_skips_error_update(
         self, patch_get_connection, patch_fetch_all_records, mock_cursor

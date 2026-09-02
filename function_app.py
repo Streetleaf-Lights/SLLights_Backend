@@ -19,6 +19,7 @@ from shared.customers_api import get_customers
 from shared.projects_api import get_projects
 from shared.pole_vitals_api import get_pole_vitals, get_pole_vitals_by_period
 from shared.poles_api import get_poles
+from shared.api_utils import parse_bool_param
 from shared.users_api import get_users
 from shared.auth_utils import AuthError, require_auth
 from shared.users_management_api import (
@@ -265,9 +266,15 @@ def getCustomers(req: func.HttpRequest) -> func.HttpResponse:
         (404 if not found) instead of an array.
       limit -- optional, default/max 1000 (see shared/api_utils.py).
         Ignored if customerId is given.
+      active -- optional, "true"/"1" or "false"/"0" (case-insensitive).
+        Filters to only customers whose Active column matches. Ignored
+        if customerId is given (a single-Id lookup is a specific
+        resource, not a filtered list). Omitted entirely -> no filter,
+        same as before this param existed.
     """
     customer_id = req.params.get("customerId")
     limit_param = req.params.get("limit")
+    active_param = req.params.get("active")
 
     if limit_param is not None and not limit_param.isdigit():
         return func.HttpResponse(
@@ -276,9 +283,22 @@ def getCustomers(req: func.HttpRequest) -> func.HttpResponse:
             mimetype="application/json",
         )
 
+    active = None
+    if active_param is not None:
+        try:
+            active = parse_bool_param(active_param, "active")
+        except ValueError as ve:
+            return func.HttpResponse(
+                json.dumps({"error": str(ve)}),
+                status_code=400,
+                mimetype="application/json",
+            )
+
     try:
         customers = get_customers(
-            customer_id=customer_id, limit=int(limit_param) if limit_param else None
+            customer_id=customer_id,
+            limit=int(limit_param) if limit_param else None,
+            active=active,
         )
     except Exception as ex:
         logging.error("getCustomers: query failed: %s", ex)
@@ -331,10 +351,16 @@ def getProjects(req: func.HttpRequest) -> func.HttpResponse:
         customer has no projects", not "not found" (no 404 here).
       limit -- optional, default/max 1000 (see shared/api_utils.py).
         Ignored if projectId is given.
+      active -- optional, "true"/"1" or "false"/"0" (case-insensitive).
+        Filters to only projects whose Active column matches. Applies to
+        both the customerId-filtered list and the fully unfiltered list;
+        ignored if projectId is given. Omitted entirely -> no filter,
+        same as before this param existed.
     """
     project_id = req.params.get("projectId")
     customer_id = req.params.get("customerId")
     limit_param = req.params.get("limit")
+    active_param = req.params.get("active")
 
     if limit_param is not None and not limit_param.isdigit():
         return func.HttpResponse(
@@ -343,11 +369,23 @@ def getProjects(req: func.HttpRequest) -> func.HttpResponse:
             mimetype="application/json",
         )
 
+    active = None
+    if active_param is not None:
+        try:
+            active = parse_bool_param(active_param, "active")
+        except ValueError as ve:
+            return func.HttpResponse(
+                json.dumps({"error": str(ve)}),
+                status_code=400,
+                mimetype="application/json",
+            )
+
     try:
         projects = get_projects(
             project_id=project_id,
             customer_id=customer_id,
             limit=int(limit_param) if limit_param else None,
+            active=active,
         )
     except Exception as ex:
         logging.error("getProjects: query failed: %s", ex)
@@ -491,12 +529,18 @@ def getPoles(req: func.HttpRequest) -> func.HttpResponse:
         built for a "give me every pole" consumer (e.g. a map rendering
         all ~14K poles at once) that only needs location/status, not
         per-pole telemetry detail.
+      active -- optional, "true"/"1" or "false"/"0" (case-insensitive).
+        Filters to only poles whose Active column matches. Applies to
+        the projectId-filtered list, the customerId-filtered list, and
+        the fully unfiltered list; ignored if poleId is given. Omitted
+        entirely -> no filter, same as before this param existed.
     """
     pole_id = req.params.get("poleId")
     project_id = req.params.get("projectId")
     customer_id = req.params.get("customerId")
     limit_param = req.params.get("limit")
     summary = (req.params.get("summary") or "").strip().lower() in ("true", "1")
+    active_param = req.params.get("active")
 
     if limit_param is not None and not limit_param.isdigit():
         return func.HttpResponse(
@@ -505,6 +549,17 @@ def getPoles(req: func.HttpRequest) -> func.HttpResponse:
             mimetype="application/json",
         )
 
+    active = None
+    if active_param is not None:
+        try:
+            active = parse_bool_param(active_param, "active")
+        except ValueError as ve:
+            return func.HttpResponse(
+                json.dumps({"error": str(ve)}),
+                status_code=400,
+                mimetype="application/json",
+            )
+
     try:
         result = get_poles(
             pole_id=pole_id,
@@ -512,6 +567,7 @@ def getPoles(req: func.HttpRequest) -> func.HttpResponse:
             customer_id=customer_id,
             limit=int(limit_param) if limit_param else None,
             summary=summary,
+            active=active,
         )
     except Exception as ex:
         logging.error("getPoles: query failed: %s", ex)

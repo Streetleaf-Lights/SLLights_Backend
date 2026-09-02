@@ -283,9 +283,15 @@ class TestPoleUpsertSqlStructure:
         patch_fetch_all_records_poles.return_value = ([make_pole_record()], [])
         poles_loader.load_poles()
 
-        assert mock_cursor.executemany.call_count == 1
-        sql_text, batch = mock_cursor.executemany.call_args.args
-        assert "INSERT INTO #PolesStaging" in sql_text
+        # Two executemany() calls now exist -- the Poles staging insert
+        # itself, and flag_records_removed_from_airtable()'s own separate
+        # staging insert -- filter to just the one this test cares about.
+        poles_staging_calls = [
+            c for c in mock_cursor.executemany.call_args_list
+            if "INSERT INTO #PolesStaging" in c.args[0]
+        ]
+        assert len(poles_staging_calls) == 1
+        sql_text, batch = poles_staging_calls[0].args
         assert len(batch) == 1
         assert sql_text.count("?") == len(batch[0]) == 12
 
@@ -384,9 +390,16 @@ class TestPolesBatchingPerformance:
 
         poles_loader.load_poles()
 
-        assert mock_cursor.executemany.call_count == 2
-        first_batch = mock_cursor.executemany.call_args_list[0].args[1]
-        second_batch = mock_cursor.executemany.call_args_list[1].args[1]
+        # Filter to just the Poles staging calls -- flag_records_removed_
+        # from_airtable() also calls executemany() once, for its own,
+        # separate staging table.
+        poles_staging_calls = [
+            c for c in mock_cursor.executemany.call_args_list
+            if "INSERT INTO #PolesStaging" in c.args[0]
+        ]
+        assert len(poles_staging_calls) == 2
+        first_batch = poles_staging_calls[0].args[1]
+        second_batch = poles_staging_calls[1].args[1]
         assert len(first_batch) == batch_size
         assert len(second_batch) == 1
 
@@ -398,8 +411,12 @@ class TestPolesBatchingPerformance:
 
         poles_loader.load_poles()
 
-        assert mock_cursor.executemany.call_count == 1
-        batch = mock_cursor.executemany.call_args.args[1]
+        poles_staging_calls = [
+            c for c in mock_cursor.executemany.call_args_list
+            if "INSERT INTO #PolesStaging" in c.args[0]
+        ]
+        assert len(poles_staging_calls) == 1
+        batch = poles_staging_calls[0].args[1]
         assert len(batch) == 5
 
 
@@ -442,9 +459,10 @@ class TestLoadPolesSuccessFlow:
 
         calls = mock_cursor.execute.call_args_list
         # insert SP_Execution, staging table create, merge-from-staging,
-        # truncate staging, final update (upserts themselves go via
-        # executemany into the staging table)
-        assert len(calls) == 5
+        # truncate staging, flag-removed staging create, flag-removed
+        # UPDATE, final update (upserts themselves go via executemany
+        # into the staging table)
+        assert len(calls) == 7
 
         insert_sql, name, env, start_time, source = calls[0].args
         assert "INSERT INTO SP_Execution" in insert_sql
@@ -461,9 +479,22 @@ class TestLoadPolesSuccessFlow:
         truncate_sql = calls[3].args[0]
         assert "TRUNCATE TABLE #PolesStaging" in truncate_sql
 
-        assert mock_cursor.executemany.call_count == 1
-        staging_insert_sql, batch = mock_cursor.executemany.call_args.args
-        assert "INSERT INTO #PolesStaging" in staging_insert_sql
+        flag_staging_create_sql = calls[4].args[0]
+        assert "CurrentAirtableIds_Poles" in flag_staging_create_sql
+        flag_update_sql = calls[5].args[0]
+        assert "UPDATE t" in flag_update_sql
+        assert "Poles" in flag_update_sql
+        assert "Active" in flag_update_sql
+
+        # Two executemany() calls now exist -- the Poles staging insert
+        # itself, and flag_records_removed_from_airtable()'s own separate
+        # staging insert.
+        poles_staging_calls = [
+            c for c in mock_cursor.executemany.call_args_list
+            if "INSERT INTO #PolesStaging" in c.args[0]
+        ]
+        assert len(poles_staging_calls) == 1
+        staging_insert_sql, batch = poles_staging_calls[0].args
         assert len(batch) == 2
         assert batch[0][0] == "recPole1"
         assert batch[0][3] == "12057"  # CountyFips position
@@ -471,14 +502,21 @@ class TestLoadPolesSuccessFlow:
         assert batch[1][0] == "recPole2"
         assert batch[1][10] == 7
 
-        update_sql, end_time, success, errors, batch_count, sp_exec_id = calls[4].args
+        flag_staging_calls = [
+            c for c in mock_cursor.executemany.call_args_list
+            if "CurrentAirtableIds_Poles" in c.args[0]
+        ]
+        assert len(flag_staging_calls) == 1
+        assert flag_staging_calls[0].args[1] == [("recPole1",), ("recPole2",)]
+
+        update_sql, end_time, success, errors, batch_count, sp_exec_id = calls[6].args
         assert "UPDATE SP_Execution" in update_sql
         assert (success, errors, batch_count, sp_exec_id) == (2, 0, 1, 7)
         assert DTO_PATTERN.match(end_time)
 
-        assert mock_conn.commit.call_count == 3
-        mock_cursor.close.assert_called_once()
-        mock_conn.close.assert_called_once()
+        assert mock_conn.commit.call_count == 4
+        assert mock_cursor.close.call_count == 2
+        assert mock_conn.close.call_count == 2
 
     def test_empty_airtable_result_still_closes_out_execution_row(
         self, patch_get_connection_poles, patch_fetch_all_records_poles, mock_cursor
@@ -495,6 +533,17 @@ class TestLoadPolesSuccessFlow:
 
 
 class TestLoadPolesPartialFailure:
+    @staticmethod
+    def _fail_only_poles_staging_executemany(sql, *args, **kwargs):
+        """A targeted side_effect, not a blanket exception -- flag_records_
+        removed_from_airtable() also calls executemany() once, for its own,
+        unrelated staging table; these tests are specifically about the
+        Poles staging chunk failing, not every executemany() call in the
+        whole run."""
+        if "INSERT INTO #PolesStaging" in sql:
+            raise RuntimeError("chunk failed")
+        return None
+
     def test_one_bad_row_is_counted_but_does_not_abort_the_run(
         self,
         patch_get_connection_poles,
@@ -508,13 +557,15 @@ class TestLoadPolesPartialFailure:
         )
         # The chunk's bulk staging+merge fails, so load_poles() falls back
         # to executing each row individually; the second one fails there.
-        mock_cursor.executemany.side_effect = RuntimeError("chunk failed")
+        mock_cursor.executemany.side_effect = self._fail_only_poles_staging_executemany
         mock_cursor.execute.side_effect = [
             None,  # insert SP_Execution
             None,  # staging table create
             None,  # truncate after chunk failure
             None,  # row1 fallback succeeds
             RuntimeError("bad row"),  # row2 fallback fails
+            None,  # flag-removed staging create
+            None,  # flag-removed UPDATE
             None,  # final update
         ]
 
@@ -535,14 +586,17 @@ class TestLoadPolesPartialFailure:
             [make_pole_record(record_id="recPole1"), make_pole_record(record_id="recPole2")],
             [],
         )
-        mock_cursor.executemany.side_effect = RuntimeError("chunk failed")
-        mock_cursor.execute.side_effect = [None] * 6  # insert, staging create, truncate, row1, row2, final update
+        mock_cursor.executemany.side_effect = self._fail_only_poles_staging_executemany
+        # insert, staging create, truncate, row1, row2, flag staging
+        # create, flag UPDATE, final update
+        mock_cursor.execute.side_effect = [None] * 8
 
         poles_loader.load_poles()
 
         # insert, staging create, truncate-after-failure, 2 fallback row
-        # upserts, final update
-        assert mock_cursor.execute.call_count == 6
+        # upserts, flag-removed staging create, flag-removed UPDATE,
+        # final update
+        assert mock_cursor.execute.call_count == 8
         row1_args = mock_cursor.execute.call_args_list[3].args
         row2_args = mock_cursor.execute.call_args_list[4].args
         assert row1_args[1][0] == "recPole1"
@@ -561,8 +615,10 @@ class TestLoadPolesPartialFailure:
         back to row-by-row, so a retried run doesn't re-merge stale rows.
         """
         patch_fetch_all_records_poles.return_value = ([make_pole_record(record_id="recPole1")], [])
-        mock_cursor.executemany.side_effect = RuntimeError("chunk failed")
-        mock_cursor.execute.side_effect = [None] * 5  # insert, staging create, truncate, row1, final update
+        mock_cursor.executemany.side_effect = self._fail_only_poles_staging_executemany
+        # insert, staging create, truncate, row1, flag staging create,
+        # flag UPDATE, final update
+        mock_cursor.execute.side_effect = [None] * 7
 
         poles_loader.load_poles()
 
@@ -596,5 +652,5 @@ class TestLoadPolesTopLevelFailure:
         assert err_msg == "airtable is down"
         assert sp_exec_id == 7
 
-        mock_cursor.close.assert_called_once()
-        mock_conn.close.assert_called_once()
+        assert mock_cursor.close.call_count == 2
+        assert mock_conn.close.call_count == 2

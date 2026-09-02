@@ -48,6 +48,7 @@ BEGIN
         EffectiveDate           DATE                 NULL,
         InstallDates            NVARCHAR(MAX)        NULL,
         LeadsunProject          NVARCHAR(MAX)        NULL,
+        Active                  BIT                  NOT NULL DEFAULT 1,
         AirTableCreatedDateTime DATETIMEOFFSET(3)    NULL
     );
 

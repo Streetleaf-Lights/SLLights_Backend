@@ -216,6 +216,7 @@ SELECT
     p.InstallDate AS InstallDate,
     p.Lat AS Lat,
     p.Long AS Long,
+    p.Active AS Active,
     latest_pt.LastUpload AT TIME ZONE ISNULL(ptz.WindowsTimeZone, 'Eastern Standard Time') AS LastUpload,
     -- ControllerCode/GroupId/ProductId are device-identifying fields --
     -- fixed properties of a pole's own hardware, not a reading that
@@ -387,6 +388,7 @@ def _pole_row_to_dict(row) -> dict:
         install_date,
         lat,
         long_,
+        active,
         last_update,
         controller_code,
         group_id,
@@ -422,6 +424,7 @@ def _pole_row_to_dict(row) -> dict:
         "installDate": json_safe(install_date),
         "lat": json_safe(lat),
         "long": json_safe(long_),
+        "active": json_safe(active),
         "lastUpdate": json_safe(last_update),
         "controllerCode": json_safe(controller_code),
         "groupId": json_safe(group_id),

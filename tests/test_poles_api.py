@@ -67,6 +67,7 @@ def _summary_row(
     install_date="2025-01-01",
     lat=28.0,
     long_=-82.0,
+    active=True,
     last_update="2026-08-26 20:00:00 -04:00",
     lamp_power_1=0,
     lamp_power_2=0,
@@ -92,6 +93,7 @@ def _summary_row(
     """Matches _POLE_SUMMARY_SQL_TEMPLATE's own column order exactly."""
     return (
         project_id, pole_id, pole_number, location_id, install_date, lat, long_,
+        active,
         last_update,
         lamp_power_1, lamp_power_2, battery_elec_current_1, battery_elec_current_2,
         solar_board_voltage, solar_board_elec_current, is_daylight_for_panel_fault,
@@ -112,6 +114,7 @@ class TestSummaryRowToDict:
         assert result["installDate"] == "2025-01-01"
         assert result["lat"] == 28.0
         assert result["long"] == -82.0
+        assert result["active"] is True
         assert result["lastUpdate"] == "2026-08-26 20:00:00 -04:00"
         assert result["isOnline"] is True
         assert result["isLedFault"] is False
@@ -250,3 +253,84 @@ class TestGetPolesSummaryMode:
         executed_sql = mock_cursor.execute.call_args.args[0]
         assert executed_sql != m._POLE_SUMMARY_SQL_TEMPLATE.format(where_clause="WHERE 1=1")
         assert "BatteryVoltage1" in executed_sql  # only the full-detail template fetches this
+
+
+class TestGetPolesActiveFilter:
+    def test_active_true_unfiltered_adds_where_clause(
+        self, patch_get_connection_poles_api, mock_cursor
+    ):
+        mock_cursor.fetchall.return_value = []
+
+        m.get_poles(active=True)
+
+        executed_sql, *params = mock_cursor.execute.call_args.args
+        assert "AND p.Active = ?" in executed_sql
+        assert params[-1] == 1
+
+    def test_active_false_unfiltered_binds_zero(
+        self, patch_get_connection_poles_api, mock_cursor
+    ):
+        mock_cursor.fetchall.return_value = []
+
+        m.get_poles(active=False)
+
+        _, *params = mock_cursor.execute.call_args.args
+        assert params[-1] == 0
+
+    def test_active_none_unfiltered_omits_where_clause(
+        self, patch_get_connection_poles_api, mock_cursor
+    ):
+        mock_cursor.fetchall.return_value = []
+
+        m.get_poles()
+
+        executed_sql = mock_cursor.execute.call_args.args[0]
+        assert "AND p.Active" not in executed_sql
+        assert "WHERE p.Active" not in executed_sql
+
+    def test_active_combined_with_project_id_adds_condition(
+        self, patch_get_connection_poles_api, mock_cursor
+    ):
+        mock_cursor.fetchall.return_value = []
+
+        m.get_poles(project_id="proj1", active=True)
+
+        executed_sql, *params = mock_cursor.execute.call_args.args
+        assert "proj.Id = ?" in executed_sql
+        assert "p.Active = ?" in executed_sql
+        assert params[-1] == 1
+        assert "proj1" in params
+
+    def test_active_combined_with_customer_id_adds_condition(
+        self, patch_get_connection_poles_api, mock_cursor
+    ):
+        mock_cursor.fetchall.return_value = []
+
+        m.get_poles(customer_id="cust1", active=False)
+
+        executed_sql, *params = mock_cursor.execute.call_args.args
+        assert "c.Id = ?" in executed_sql
+        assert "p.Active = ?" in executed_sql
+        assert params[-1] == 0
+
+    def test_active_is_ignored_when_pole_id_given(
+        self, patch_get_connection_poles_api, mock_cursor
+    ):
+        mock_cursor.fetchall.return_value = []
+
+        m.get_poles(pole_id="pole1", active=True)
+
+        executed_sql = mock_cursor.execute.call_args.args[0]
+        assert "AND p.Active" not in executed_sql
+        assert "p.Active = ?" not in executed_sql
+
+    def test_active_combined_with_summary_mode(
+        self, patch_get_connection_poles_api, mock_cursor
+    ):
+        mock_cursor.fetchall.return_value = []
+
+        m.get_poles(summary=True, active=True)
+
+        executed_sql, *params = mock_cursor.execute.call_args.args
+        assert "AND p.Active = ?" in executed_sql
+        assert params[-1] == 1

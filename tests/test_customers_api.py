@@ -53,6 +53,46 @@ class TestGetCustomers:
         assert "TOP" not in sql
         assert cid == "rec123"
 
+    def test_active_true_adds_where_clause(self, patch_get_connection_customers_api, mock_cursor):
+        mock_cursor.fetchall.return_value = []
+
+        customers_api.get_customers(active=True)
+
+        sql, limit, active_val = mock_cursor.execute.call_args.args
+        assert "WHERE Active = ?" in sql
+        assert "ORDER BY Name" in sql
+        assert limit == api_utils.DEFAULT_LIMIT
+        assert active_val == 1
+
+    def test_active_false_binds_zero(self, patch_get_connection_customers_api, mock_cursor):
+        mock_cursor.fetchall.return_value = []
+
+        customers_api.get_customers(active=False)
+
+        _, _, active_val = mock_cursor.execute.call_args.args
+        assert active_val == 0
+
+    def test_active_none_omits_where_clause(self, patch_get_connection_customers_api, mock_cursor):
+        mock_cursor.fetchall.return_value = []
+
+        customers_api.get_customers()
+
+        sql, limit = mock_cursor.execute.call_args.args
+        assert "WHERE Active" not in sql
+        assert limit == api_utils.DEFAULT_LIMIT
+
+    def test_active_is_ignored_when_customer_id_given(
+        self, patch_get_connection_customers_api, mock_cursor
+    ):
+        mock_cursor.fetchall.return_value = []
+
+        customers_api.get_customers(customer_id="rec123", active=True)
+
+        sql, cid = mock_cursor.execute.call_args.args
+        assert "WHERE Id = ?" in sql
+        assert "WHERE Active" not in sql
+        assert cid == "rec123"
+
     def test_does_not_select_sp_exec_id(self, patch_get_connection_customers_api, mock_cursor):
         mock_cursor.fetchall.return_value = []
 
@@ -64,7 +104,7 @@ class TestGetCustomers:
     def test_maps_rows_to_camelcase_dicts(self, patch_get_connection_customers_api, mock_cursor):
         mock_cursor.fetchall.return_value = [
             ("rec123", "Acme Corp", "[]", "[]", "123 Main St", "Springfield", "IL", "62701",
-             "555-1234", datetime(2026, 1, 1, tzinfo=timezone.utc)),
+             "555-1234", True, datetime(2026, 1, 1, tzinfo=timezone.utc)),
         ]
 
         result = customers_api.get_customers()
@@ -75,6 +115,7 @@ class TestGetCustomers:
         assert customer["name"] == "Acme Corp"
         assert customer["city"] == "Springfield"
         assert customer["state"] == "IL"
+        assert customer["active"] is True
         assert isinstance(customer["createdAt"], str)
         assert "Id" not in customer  # PascalCase keys must not leak through
 

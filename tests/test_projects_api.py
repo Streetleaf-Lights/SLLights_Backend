@@ -99,6 +99,66 @@ class TestGetProjects:
         _, limit, _ = mock_cursor.execute.call_args.args
         assert limit == 5
 
+    def test_active_true_adds_where_clause_unfiltered(
+        self, patch_get_connection_projects_api, mock_cursor
+    ):
+        mock_cursor.fetchall.return_value = []
+
+        projects_api.get_projects(active=True)
+
+        sql, limit, active_val = mock_cursor.execute.call_args.args
+        assert "WHERE Active = ?" in sql
+        assert "ORDER BY Name" in sql
+        assert limit == api_utils.DEFAULT_LIMIT
+        assert active_val == 1
+
+    def test_active_false_binds_zero_unfiltered(
+        self, patch_get_connection_projects_api, mock_cursor
+    ):
+        mock_cursor.fetchall.return_value = []
+
+        projects_api.get_projects(active=False)
+
+        _, _, active_val = mock_cursor.execute.call_args.args
+        assert active_val == 0
+
+    def test_active_none_omits_where_clause_unfiltered(
+        self, patch_get_connection_projects_api, mock_cursor
+    ):
+        mock_cursor.fetchall.return_value = []
+
+        projects_api.get_projects()
+
+        sql, limit = mock_cursor.execute.call_args.args
+        assert "WHERE Active" not in sql
+        assert limit == api_utils.DEFAULT_LIMIT
+
+    def test_active_combined_with_customer_id_filters_both(
+        self, patch_get_connection_projects_api, mock_cursor
+    ):
+        mock_cursor.fetchall.return_value = []
+
+        projects_api.get_projects(customer_id="recwx649JfiRmWqxF", active=True)
+
+        sql, limit, cid, active_val = mock_cursor.execute.call_args.args
+        assert "WHERE CustomerId = ? AND Active = ?" in sql
+        assert "ORDER BY EffectiveDate DESC" in sql
+        assert limit == api_utils.DEFAULT_LIMIT
+        assert cid == "recwx649JfiRmWqxF"
+        assert active_val == 1
+
+    def test_active_is_ignored_when_project_id_given(
+        self, patch_get_connection_projects_api, mock_cursor
+    ):
+        mock_cursor.fetchall.return_value = []
+
+        projects_api.get_projects(project_id="rec456", active=True)
+
+        sql, pid = mock_cursor.execute.call_args.args
+        assert "WHERE Id = ?" in sql
+        assert "WHERE Active" not in sql
+        assert pid == "rec456"
+
     def test_project_id_and_customer_id_together_filters_by_both(
         self, patch_get_connection_projects_api, mock_cursor
     ):
@@ -137,7 +197,7 @@ class TestGetProjects:
     def test_maps_rows_to_camelcase_dicts(self, patch_get_connection_projects_api, mock_cursor):
         mock_cursor.fetchall.return_value = [
             ("rec456", "Chaparral Ph3", "[]", "[]", "recwx649JfiRmWqxF", 42,
-             date(2026, 1, 1), "[]", '{"ProjectId": "482"}', datetime(2026, 1, 1, tzinfo=timezone.utc)),
+             date(2026, 1, 1), "[]", '{"ProjectId": "482"}', True, datetime(2026, 1, 1, tzinfo=timezone.utc)),
         ]
 
         result = projects_api.get_projects()
@@ -150,6 +210,7 @@ class TestGetProjects:
         assert project["polesUnderContract"] == 42
         assert isinstance(project["effectiveDate"], str)  # DATE isn't natively JSON-safe either
         assert project["leadsunProject"] == '{"ProjectId": "482"}'
+        assert project["active"] is True
         assert isinstance(project["createdAt"], str)
         assert "Id" not in project  # PascalCase keys must not leak through
 

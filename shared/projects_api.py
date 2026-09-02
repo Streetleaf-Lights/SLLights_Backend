@@ -16,11 +16,14 @@ _COLUMN_TO_JSON_KEY = [
     ("EffectiveDate", "effectiveDate"),
     ("InstallDates", "installDates"),
     ("LeadsunProject", "leadsunProject"),
+    ("Active", "active"),
     ("AirTableCreatedDateTime", "createdAt"),
 ]
 
 
-def get_projects(project_id: str = None, customer_id: str = None, limit: int = None) -> list:
+def get_projects(
+    project_id: str = None, customer_id: str = None, limit: int = None, active: bool = None
+) -> list:
     """
     Queries Projects and returns a list of JSON-serializable dicts
     (camelCase keys -- see _COLUMN_TO_JSON_KEY). Same shape/contract as
@@ -48,6 +51,11 @@ def get_projects(project_id: str = None, customer_id: str = None, limit: int = N
     DEFAULT_LIMIT, capped at MAX_LIMIT regardless of what's requested
     (see shared/api_utils.py). Ignored when project_id is given (a
     single-Id lookup is already bounded to at most one row).
+    active: if given (True/False), filters to only projects whose
+    Active column matches. Applies to both the customer_id-filtered list
+    and the fully unfiltered list; ignored when project_id is given, same
+    reasoning as limit -- a lookup by its own Id is a single specific
+    resource, not a filtered list.
     """
     columns_sql = ", ".join(col for col, _ in _COLUMN_TO_JSON_KEY)
 
@@ -65,11 +73,25 @@ def get_projects(project_id: str = None, customer_id: str = None, limit: int = N
                 f"SELECT {columns_sql} FROM Projects WHERE Id = ?",
                 project_id,
             )
+        elif customer_id and active is not None:
+            cursor.execute(
+                f"SELECT TOP (?) {columns_sql} FROM Projects "
+                "WHERE CustomerId = ? AND Active = ? ORDER BY EffectiveDate DESC",
+                clamp_limit(limit),
+                customer_id,
+                1 if active else 0,
+            )
         elif customer_id:
             cursor.execute(
                 f"SELECT TOP (?) {columns_sql} FROM Projects WHERE CustomerId = ? ORDER BY EffectiveDate DESC",
                 clamp_limit(limit),
                 customer_id,
+            )
+        elif active is not None:
+            cursor.execute(
+                f"SELECT TOP (?) {columns_sql} FROM Projects WHERE Active = ? ORDER BY Name",
+                clamp_limit(limit),
+                1 if active else 0,
             )
         else:
             cursor.execute(

@@ -95,6 +95,7 @@ SELECT
     p.InstallDate AS InstallDate,
     p.Lat AS Lat,
     p.Long AS Long,
+    p.Active AS Active,
     latest_pt.LastUpload AT TIME ZONE ISNULL(ptz.WindowsTimeZone, 'Eastern Standard Time') AS LastUpload,
     latest_pt.LampPower1 AS LampPower1,
     latest_pt.LampPower2 AS LampPower2,
@@ -201,6 +202,7 @@ def _summary_row_to_dict(row) -> dict:
         install_date,
         lat,
         long_,
+        active,
         last_update,
         lamp_power_1,
         lamp_power_2,
@@ -246,6 +248,7 @@ def _summary_row_to_dict(row) -> dict:
         "installDate": json_safe(install_date),
         "lat": json_safe(lat),
         "long": json_safe(long_),
+        "active": json_safe(active),
         "lastUpdate": json_safe(last_update),
         "isOnline": json_safe(is_online),
         "isLedFault": json_safe(is_led_fault),
@@ -269,6 +272,7 @@ def get_poles(
     customer_id: str = None,
     limit: int = None,
     summary: bool = False,
+    active: bool = None,
 ):
     """
     Returns Poles, each with the exact same fields a pole carries inside
@@ -332,6 +336,11 @@ def get_poles(
     _SUMMARY_MAX_LIMIT instead of api_utils.MAX_LIMIT, since summary
     mode's whole reason to exist is
     making "every pole in one call" practical.
+    active: if given (True/False), filters to only poles whose Active
+    column matches. Applies to the project_id-filtered list, the
+    customer_id-filtered list, and the fully unfiltered list; ignored
+    when pole_id is given, same reasoning as limit -- a lookup by its
+    own Id is a single specific resource, not a filtered list.
     """
     if pole_id or project_id or customer_id:
         # Build up whichever of the three conditions were actually
@@ -357,6 +366,11 @@ def get_poles(
         if customer_id:
             conditions.append("c.Id = ?")
             params.append(customer_id)
+        # Ignored when pole_id is given -- a lookup by its own Id is a
+        # single specific resource, not a filtered list; see docstring.
+        if active is not None and not pole_id:
+            conditions.append("p.Active = ?")
+            params.append(1 if active else 0)
         where_clause = "WHERE " + " AND ".join(conditions)
         params = tuple(params)
     else:
@@ -371,7 +385,11 @@ def get_poles(
         # shape ever changes to produce more than one row per pole again.
         where_clause = "WHERE p.Id IN (SELECT TOP (?) Id FROM Poles ORDER BY PoleNumber)"
         row_limit = _clamp_summary_limit(limit) if summary else clamp_limit(limit)
-        params = (_POLE_DETAIL_PERIOD_TYPE, _ROLLUP_PERIOD_TYPE, row_limit)
+        params = [_POLE_DETAIL_PERIOD_TYPE, _ROLLUP_PERIOD_TYPE, row_limit]
+        if active is not None:
+            where_clause += " AND p.Active = ?"
+            params.append(1 if active else 0)
+        params = tuple(params)
 
     sql_template = _POLE_SUMMARY_SQL_TEMPLATE if summary else _POLE_DETAILS_SQL_TEMPLATE
     row_to_dict = _summary_row_to_dict if summary else _pole_row_to_dict_with_parents

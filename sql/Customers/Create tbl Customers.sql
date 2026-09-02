@@ -15,6 +15,7 @@ BEGIN
         State                   NVARCHAR(50)        NULL,
         Zip                     NVARCHAR(20)        NULL,
         Phone                   NVARCHAR(20)        NULL,
+        Active                  BIT                 NOT NULL DEFAULT 1,
         AirTableCreatedDateTime DATETIMEOFFSET(3)   NULL
 
         -- CONSTRAINT FK_Customers_SP_Execution FOREIGN KEY (SP_ExecId)

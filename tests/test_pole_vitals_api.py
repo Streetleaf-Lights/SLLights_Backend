@@ -294,6 +294,7 @@ class TestPoleRowToDict:
         install_date="2025-01-01",
         lat=28.0,
         long_=-82.0,
+        active=True,
         last_update="2026-07-31 08:00:00 -04:00",
         controller_code="CC-100",
         group_id=7,
@@ -324,6 +325,7 @@ class TestPoleRowToDict:
     ):
         return (
             project_id, pole_id, pole_number, location_id, install_date, lat, long_,
+            active,
             last_update, controller_code, group_id, product_id, user_name,
             battery_voltage_1, battery_voltage_2,
             lamp_power_1, lamp_power_2, battery_elec_current_1, battery_elec_current_2,
@@ -343,6 +345,7 @@ class TestPoleRowToDict:
             "installDate": "2025-01-01",
             "lat": 28.0,
             "long": -82.0,
+            "active": True,
             "lastUpdate": "2026-07-31 08:00:00 -04:00",
             "controllerCode": "CC-100",
             "groupId": 7,
@@ -541,7 +544,7 @@ class TestGetPoleVitalsUnfiltered:
         agg_rows = [("cust1", "Acme", "proj1", "Downtown", 8, 6, 3, '{"ProjectId": "482"}')]
         pole_rows = [
             (
-                "proj1", "pole1", "PN-1", "LOC-1", "2025-01-01", 28.0, -82.0,
+                "proj1", "pole1", "PN-1", "LOC-1", "2025-01-01", 28.0, -82.0, True,
                 "2026-07-31 08:00:00 -04:00", "CC-100", 7, "PROD-42", "jdoe",
                 12.6, 12.4,
                 8.7, 8.6, 15.0, 15.2, 18.0, 2.0, 1,
@@ -574,6 +577,7 @@ class TestGetPoleVitalsUnfiltered:
         assert project["poles"][0]["productId"] == "PROD-42"
         assert project["poles"][0]["userName"] == "jdoe"
         assert project["poles"][0]["solarBoardVoltage"] == 18.0
+        assert project["poles"][0]["active"] is True
         assert project["poles"][0]["lightStatusLabel"] == "ON"
         assert project["poles"][0]["panelStatusLabel"] == "Charging"
         assert project["poles"][0]["sunsetTime"] == "2026-08-28 19:47:58.596527-04:00"

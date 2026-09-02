@@ -2,6 +2,7 @@ SELECT TOP (1000) [Id]
       ,[Name]
       ,[PoleNumbers]
       ,[PoleIds]
+      ,Active
       ,[SP_ExecId]
       ,[CustomerId]
       ,[PolesUnderContract]
@@ -12,10 +13,11 @@ SELECT TOP (1000) [Id]
   FROM [dbo].[Projects]
   WHERE 1 = 1
     -- AND id = 'recN0tGiFX8nUkO2B'
-  -- AND [CustomerId] = 'recwx649JfiRmWqxF'
+--   AND [CustomerId] = 'recLWjsXN8vskXZbm'
   -- AND PoleNumbers LIKE '%HIL-1333%'
     -- AND Name LIKE '%acacia%'
-    AND LeadsunProject IS NOT NULL
+    -- AND LeadsunProject IS NOT NULL
+    -- AND Active = 1
   ORDER BY [AirTableCreatedDateTime] DESC
 
 -- SELECT DISTINCT t.LocationId
