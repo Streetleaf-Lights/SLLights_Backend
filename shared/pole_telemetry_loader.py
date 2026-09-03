@@ -770,6 +770,23 @@ def _aggregate_telemetry_by_leadsun_project(telemetry_rows) -> dict:
     values would silently replace the first's, since products are keyed
     by ProductId internally before being flattened into a plain list at
     the end).
+
+    Each project also gets two summary counts, and each of its groups
+    gets one:
+      ProjectEntry["totalGateways"] = the number of distinct groups
+        under that project -- "gateways" and "groups" are the same
+        concept here (each group is identified by its own GatewayCode,
+        per Leadsun's own data model), so this is just len(groups), not
+        a separately-tracked count.
+      ProjectEntry["totalPoles"]    = the number of distinct poles
+        (products) across ALL of that project's groups combined.
+      GroupEntry["totalPoles"]      = the number of distinct poles
+        (products) within that ONE group alone.
+    All three are derived counts, computed once at the very end after
+    every row's been placed -- not maintained incrementally as rows
+    stream in, since a product can still get overwritten/deduplicated
+    mid-loop (see the note above), so counting early could overcount
+    before the real, final product list settles.
     """
     projects: dict = {}
 
@@ -823,20 +840,29 @@ def _aggregate_telemetry_by_leadsun_project(telemetry_rows) -> dict:
     # needs -- the keying above only ever existed to make "have I
     # already seen this group/product" a cheap lookup while building
     # this structure, not part of the final, serialized shape itself.
+    # totalGateways/totalPoles (project-level) and totalPoles
+    # (group-level) are computed here too, from those same final,
+    # deduplicated group/product dicts -- see this function's own
+    # docstring for why that has to happen now, not incrementally
+    # during the loop above.
     result = {}
     for project_key, project_entry in projects.items():
+        groups = [
+            {
+                "GroupId": group_entry["GroupId"],
+                "GroupName": group_entry["GroupName"],
+                "GatewayCode": group_entry["GatewayCode"],
+                "totalPoles": len(group_entry["products"]),
+                "products": list(group_entry["products"].values()),
+            }
+            for group_entry in project_entry["groups"].values()
+        ]
         result[project_key] = {
             "ProjectName": project_entry["ProjectName"],
             "UserName": project_entry["UserName"],
-            "groups": [
-                {
-                    "GroupId": group_entry["GroupId"],
-                    "GroupName": group_entry["GroupName"],
-                    "GatewayCode": group_entry["GatewayCode"],
-                    "products": list(group_entry["products"].values()),
-                }
-                for group_entry in project_entry["groups"].values()
-            ],
+            "totalGateways": len(groups),
+            "totalPoles": sum(group["totalPoles"] for group in groups),
+            "groups": groups,
         }
     return result
 
@@ -979,6 +1005,8 @@ def update_leadsun_project_details() -> None:
                     "ProjectId": leadsun_project_id_str,
                     "ProjectName": aggregated["ProjectName"],
                     "UserName": aggregated["UserName"],
+                    "totalGateways": aggregated["totalGateways"],
+                    "totalPoles": aggregated["totalPoles"],
                     "groups": aggregated["groups"],
                 }
             )

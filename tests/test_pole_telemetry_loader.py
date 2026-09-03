@@ -767,6 +767,97 @@ class TestAggregateTelemetryByLeadsunProject:
     def test_empty_input_produces_empty_result(self):
         assert pole_telemetry_loader._aggregate_telemetry_by_leadsun_project([]) == {}
 
+    def test_total_gateways_counts_distinct_groups(self):
+        rows = [
+            _telemetry_row(group_id=100, leadsun_id=1),
+            _telemetry_row(group_id=200, leadsun_id=2),
+            _telemetry_row(group_id=300, leadsun_id=3),
+        ]
+        result = pole_telemetry_loader._aggregate_telemetry_by_leadsun_project(rows)
+        assert result["482"]["totalGateways"] == 3
+
+    def test_total_poles_at_project_level_sums_across_all_groups(self):
+        rows = [
+            _telemetry_row(group_id=100, leadsun_id=1),
+            _telemetry_row(group_id=100, leadsun_id=2),
+            _telemetry_row(group_id=200, leadsun_id=3),
+        ]
+        result = pole_telemetry_loader._aggregate_telemetry_by_leadsun_project(rows)
+        assert result["482"]["totalPoles"] == 3
+
+    def test_total_poles_at_group_level_counts_only_that_group(self):
+        rows = [
+            _telemetry_row(group_id=100, leadsun_id=1),
+            _telemetry_row(group_id=100, leadsun_id=2),
+            _telemetry_row(group_id=200, leadsun_id=3),
+        ]
+        result = pole_telemetry_loader._aggregate_telemetry_by_leadsun_project(rows)
+        groups_by_id = {g["GroupId"]: g for g in result["482"]["groups"]}
+        assert groups_by_id[100]["totalPoles"] == 2
+        assert groups_by_id[200]["totalPoles"] == 1
+
+    def test_total_gateways_and_poles_are_independent_per_project(self):
+        rows = [
+            _telemetry_row(leadsun_project_id=1, group_id=10, leadsun_id=1),
+            _telemetry_row(leadsun_project_id=1, group_id=20, leadsun_id=2),
+            _telemetry_row(leadsun_project_id=2, group_id=30, leadsun_id=3),
+        ]
+        result = pole_telemetry_loader._aggregate_telemetry_by_leadsun_project(rows)
+        assert result["1"]["totalGateways"] == 2
+        assert result["1"]["totalPoles"] == 2
+        assert result["2"]["totalGateways"] == 1
+        assert result["2"]["totalPoles"] == 1
+
+    def test_duplicate_product_within_a_group_is_not_double_counted(self):
+        """A second reading for the same pole (same leadsun_id) within
+        the same group overwrites the first entry rather than adding a
+        second one -- totalPoles must reflect that same deduplication,
+        not the raw row count."""
+        rows = [
+            _telemetry_row(group_id=100, leadsun_id=1, location_id="LOC-A"),
+            _telemetry_row(group_id=100, leadsun_id=1, location_id="LOC-A-updated"),
+        ]
+        result = pole_telemetry_loader._aggregate_telemetry_by_leadsun_project(rows)
+        group = result["482"]["groups"][0]
+        assert group["totalPoles"] == 1
+        assert result["482"]["totalPoles"] == 1
+
+    def test_real_dataset_total_poles_matches_total_products(self):
+        """Regression guard using the same real 11,837-record fixture as
+        test_real_dataset_matches_the_known_totals -- totalPoles summed
+        across every project must equal the same total_products count
+        that test already validates independently."""
+        import json as jsonlib
+        import os as oslib
+
+        fixture_path = oslib.path.join(
+            oslib.path.dirname(__file__), "fixtures", "leadsun_lamps_sample.json"
+        )
+        if not oslib.path.exists(fixture_path):
+            pytest.skip("Real-data fixture not present in this environment")
+
+        with open(fixture_path) as f:
+            records = jsonlib.load(f)
+
+        rows = [
+            (
+                r.get("projectId"), r.get("projectName"), r.get("userName"),
+                r.get("groupId"), r.get("groupName"), r.get("gatewayCode"),
+                r.get("id"), r.get("productName"), r.get("controllerCode"),
+                r.get("productId"),
+            )
+            for r in records
+        ]
+
+        result = pole_telemetry_loader._aggregate_telemetry_by_leadsun_project(rows)
+
+        total_poles_via_project_summary = sum(p["totalPoles"] for p in result.values())
+        total_poles_via_group_summary = sum(
+            group["totalPoles"] for project in result.values() for group in project["groups"]
+        )
+        assert total_poles_via_project_summary == len(records)
+        assert total_poles_via_group_summary == len(records)
+
     def test_real_dataset_matches_the_known_totals(self):
         """Regression guard using the exact numbers this function was
         validated against, from a real 11,837-record Leadsun /lamps
@@ -832,6 +923,28 @@ class TestUpdateLeadsunProjectDetailsSuccessFlow:
         assert parsed["ProjectName"] == "Chaparral"
         assert parsed["UserName"] == "12009-brevard"
         assert len(parsed["groups"]) == 1
+
+    def test_written_json_includes_total_gateways_and_poles(
+        self, patch_get_connection_pole_telemetry, mock_conn, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = (99,)
+        mock_cursor.fetchall.side_effect = [
+            [("recProj1", "482")],
+            [
+                _telemetry_row(group_id=100, leadsun_id=1),
+                _telemetry_row(group_id=200, leadsun_id=2),
+            ],
+        ]
+
+        pole_telemetry_loader.update_leadsun_project_details()
+
+        update_call = next(
+            c for c in mock_cursor.execute.call_args_list
+            if c.args[0] == pole_telemetry_loader._UPDATE_PROJECT_LEADSUN_PROJECT_SQL
+        )
+        parsed = json.loads(update_call.args[1])
+        assert parsed["totalGateways"] == 2
+        assert parsed["totalPoles"] == 2
 
     def test_project_with_no_matching_telemetry_is_left_untouched(
         self, patch_get_connection_pole_telemetry, mock_cursor
