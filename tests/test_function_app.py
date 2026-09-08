@@ -1502,3 +1502,325 @@ class TestGetUsers:
 
         assert response.status_code == 200
         assert json.loads(response.get_body()) == []
+
+
+def make_set_pole_lights_http_request(body=None, invalid_json=False):
+    if invalid_json:
+        raw_body = b"{not valid json"
+    else:
+        raw_body = json.dumps(body if body is not None else {}).encode()
+    return func.HttpRequest(
+        method="POST",
+        url="/api/setPoleLights",
+        headers={"Content-Type": "application/json"},
+        params={},
+        body=raw_body,
+    )
+
+
+class TestSetPoleLights:
+    # -- Pole scope --
+
+    def test_pole_scope_happy_path_returns_200_with_result(self, mocker):
+        mock_set = mocker.patch(
+            "function_app.set_pole_lights", return_value={"success": True, "data": None}
+        )
+
+        response = function_app.setPoleLights(
+            make_set_pole_lights_http_request(
+                {"poleNumber": "12009-1000-A", "brightness": 50, "time": 30}
+            )
+        )
+
+        assert response.status_code == 200
+        assert json.loads(response.get_body()) == {"success": True, "data": None}
+        mock_set.assert_called_once_with(
+            pole_number="12009-1000-A",
+            gateway_code=None,
+            project_id=None,
+            brightness=50,
+            time_minutes=30,
+        )
+
+    def test_pole_not_found_returns_404(self, mocker):
+        mocker.patch(
+            "function_app.set_pole_lights",
+            side_effect=function_app.PoleNotFoundError("No pole found with PoleNumber 'X'."),
+        )
+
+        response = function_app.setPoleLights(
+            make_set_pole_lights_http_request({"poleNumber": "X", "brightness": 50, "time": 30})
+        )
+
+        assert response.status_code == 404
+
+    def test_pole_telemetry_not_found_returns_404(self, mocker):
+        mocker.patch(
+            "function_app.set_pole_lights",
+            side_effect=function_app.PoleTelemetryNotFoundError("no telemetry yet"),
+        )
+
+        response = function_app.setPoleLights(
+            make_set_pole_lights_http_request({"poleNumber": "X", "brightness": 50, "time": 30})
+        )
+
+        assert response.status_code == 404
+
+    # -- Gateway scope --
+
+    def test_gateway_scope_happy_path(self, mocker):
+        mock_set = mocker.patch(
+            "function_app.set_pole_lights", return_value={"success": True, "data": None}
+        )
+
+        response = function_app.setPoleLights(
+            make_set_pole_lights_http_request(
+                {"gatewayCode": "GT18L94A25082883", "brightness": 100, "time": 0}
+            )
+        )
+
+        assert response.status_code == 200
+        mock_set.assert_called_once_with(
+            pole_number=None,
+            gateway_code="GT18L94A25082883",
+            project_id=None,
+            brightness=100,
+            time_minutes=0,
+        )
+
+    def test_gateway_not_found_returns_404(self, mocker):
+        mocker.patch(
+            "function_app.set_pole_lights",
+            side_effect=function_app.GatewayNotFoundError("No currently-reporting pole found"),
+        )
+
+        response = function_app.setPoleLights(
+            make_set_pole_lights_http_request({"gatewayCode": "GT-999", "brightness": 50, "time": 30})
+        )
+
+        assert response.status_code == 404
+
+    # -- Project scope --
+
+    def test_project_scope_happy_path(self, mocker):
+        mock_set = mocker.patch(
+            "function_app.set_pole_lights", return_value={"success": True, "data": None}
+        )
+
+        response = function_app.setPoleLights(
+            make_set_pole_lights_http_request(
+                {"projectId": "recProj1", "brightness": 0, "time": 0}
+            )
+        )
+
+        assert response.status_code == 200
+        mock_set.assert_called_once_with(
+            pole_number=None,
+            gateway_code=None,
+            project_id="recProj1",
+            brightness=0,
+            time_minutes=0,
+        )
+
+    def test_project_not_found_returns_404(self, mocker):
+        mocker.patch(
+            "function_app.set_pole_lights",
+            side_effect=function_app.ProjectNotFoundError("No project found"),
+        )
+
+        response = function_app.setPoleLights(
+            make_set_pole_lights_http_request({"projectId": "nonexistent", "brightness": 50, "time": 30})
+        )
+
+        assert response.status_code == 404
+
+    def test_project_telemetry_not_found_returns_404(self, mocker):
+        mocker.patch(
+            "function_app.set_pole_lights",
+            side_effect=function_app.ProjectTelemetryNotFoundError("no currently-reporting poles"),
+        )
+
+        response = function_app.setPoleLights(
+            make_set_pole_lights_http_request({"projectId": "recProj1", "brightness": 50, "time": 30})
+        )
+
+        assert response.status_code == 404
+
+    def test_project_has_no_leadsun_id_returns_400(self, mocker):
+        mocker.patch(
+            "function_app.set_pole_lights",
+            side_effect=function_app.ProjectHasNoLeadsunIdError("no Leadsun ProjectId configured"),
+        )
+
+        response = function_app.setPoleLights(
+            make_set_pole_lights_http_request({"projectId": "recProj1", "brightness": 50, "time": 30})
+        )
+
+        assert response.status_code == 400
+
+    # -- Scope validation --
+
+    def test_no_scope_field_returns_400(self, mocker):
+        mock_set = mocker.patch("function_app.set_pole_lights")
+
+        response = function_app.setPoleLights(
+            make_set_pole_lights_http_request({"brightness": 50, "time": 30})
+        )
+
+        assert response.status_code == 400
+        mock_set.assert_not_called()
+
+    def test_two_scope_fields_returns_400(self, mocker):
+        mock_set = mocker.patch("function_app.set_pole_lights")
+
+        response = function_app.setPoleLights(
+            make_set_pole_lights_http_request(
+                {"poleNumber": "P1", "gatewayCode": "GT", "brightness": 50, "time": 30}
+            )
+        )
+
+        assert response.status_code == 400
+        mock_set.assert_not_called()
+
+    def test_all_three_scope_fields_returns_400(self, mocker):
+        mock_set = mocker.patch("function_app.set_pole_lights")
+
+        response = function_app.setPoleLights(
+            make_set_pole_lights_http_request(
+                {
+                    "poleNumber": "P1",
+                    "gatewayCode": "GT",
+                    "projectId": "recProj1",
+                    "brightness": 50,
+                    "time": 30,
+                }
+            )
+        )
+
+        assert response.status_code == 400
+        mock_set.assert_not_called()
+
+    # -- Body validation shared across all scopes --
+
+    def test_invalid_json_body_returns_400(self, mocker):
+        mock_set = mocker.patch("function_app.set_pole_lights")
+
+        response = function_app.setPoleLights(
+            make_set_pole_lights_http_request(invalid_json=True)
+        )
+
+        assert response.status_code == 400
+        mock_set.assert_not_called()
+
+    def test_missing_brightness_returns_400(self, mocker):
+        mock_set = mocker.patch("function_app.set_pole_lights")
+
+        response = function_app.setPoleLights(
+            make_set_pole_lights_http_request({"poleNumber": "P1", "time": 30})
+        )
+
+        assert response.status_code == 400
+        mock_set.assert_not_called()
+
+    def test_brightness_out_of_range_returns_400(self, mocker):
+        mock_set = mocker.patch("function_app.set_pole_lights")
+
+        response = function_app.setPoleLights(
+            make_set_pole_lights_http_request({"poleNumber": "P1", "brightness": 150, "time": 30})
+        )
+
+        assert response.status_code == 400
+        mock_set.assert_not_called()
+
+    def test_negative_brightness_returns_400(self, mocker):
+        mock_set = mocker.patch("function_app.set_pole_lights")
+
+        response = function_app.setPoleLights(
+            make_set_pole_lights_http_request({"poleNumber": "P1", "brightness": -1, "time": 30})
+        )
+
+        assert response.status_code == 400
+        mock_set.assert_not_called()
+
+    def test_missing_time_returns_400(self, mocker):
+        mock_set = mocker.patch("function_app.set_pole_lights")
+
+        response = function_app.setPoleLights(
+            make_set_pole_lights_http_request({"poleNumber": "P1", "brightness": 50})
+        )
+
+        assert response.status_code == 400
+        mock_set.assert_not_called()
+
+    def test_negative_time_returns_400(self, mocker):
+        mock_set = mocker.patch("function_app.set_pole_lights")
+
+        response = function_app.setPoleLights(
+            make_set_pole_lights_http_request({"poleNumber": "P1", "brightness": 50, "time": -5})
+        )
+
+        assert response.status_code == 400
+        mock_set.assert_not_called()
+
+    def test_brightness_zero_is_valid(self, mocker):
+        """0 is a legitimate brightness (e.g. \"off\") -- must not be
+        rejected by a falsy check."""
+        mock_set = mocker.patch(
+            "function_app.set_pole_lights", return_value={"success": True, "data": None}
+        )
+
+        response = function_app.setPoleLights(
+            make_set_pole_lights_http_request({"poleNumber": "P1", "brightness": 0, "time": 0})
+        )
+
+        assert response.status_code == 200
+        mock_set.assert_called_once_with(
+            pole_number="P1", gateway_code=None, project_id=None, brightness=0, time_minutes=0
+        )
+
+    def test_boolean_brightness_is_rejected(self, mocker):
+        """bool is a subclass of int in Python -- True/False must not
+        silently pass an int-type check."""
+        mock_set = mocker.patch("function_app.set_pole_lights")
+
+        response = function_app.setPoleLights(
+            make_set_pole_lights_http_request({"poleNumber": "P1", "brightness": True, "time": 30})
+        )
+
+        assert response.status_code == 400
+        mock_set.assert_not_called()
+
+    # -- Downstream error mapping (shared across scopes) --
+
+    def test_leadsun_edge_account_not_found_returns_500(self, mocker):
+        mocker.patch(
+            "function_app.set_pole_lights",
+            side_effect=function_app.LeadsunEdgeAccountNotFoundError("no account"),
+        )
+
+        response = function_app.setPoleLights(
+            make_set_pole_lights_http_request({"poleNumber": "X", "brightness": 50, "time": 30})
+        )
+
+        assert response.status_code == 500
+
+    def test_leadsun_edge_api_error_returns_502(self, mocker):
+        mocker.patch(
+            "function_app.set_pole_lights",
+            side_effect=function_app.LeadsunEdgeApiError("Leadsun rejected the request"),
+        )
+
+        response = function_app.setPoleLights(
+            make_set_pole_lights_http_request({"poleNumber": "X", "brightness": 50, "time": 30})
+        )
+
+        assert response.status_code == 502
+
+    def test_unexpected_error_returns_500(self, mocker):
+        mocker.patch("function_app.set_pole_lights", side_effect=RuntimeError("boom"))
+
+        response = function_app.setPoleLights(
+            make_set_pole_lights_http_request({"poleNumber": "X", "brightness": 50, "time": 30})
+        )
+
+        assert response.status_code == 500

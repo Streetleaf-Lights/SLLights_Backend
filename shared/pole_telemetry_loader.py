@@ -726,12 +726,12 @@ def _aggregate_telemetry_by_leadsun_project(telemetry_rows) -> dict:
     Groups PoleTelemetry rows into the nested structure explicitly
     requested for Projects.LeadsunProject's own "groups"/"products"
     shape -- one entry per distinct LeadsunProjectId, each holding that
-    project's own ProjectName/UserName (both confirmed constant within a
-    project -- validated directly against a real 11,837-record Leadsun
-    /lamps response: 176 distinct projects, 0 with more than one distinct
-    ProjectName or UserName across their own records) plus a list of
-    distinct GroupId groups, each holding a list of that group's own
-    distinct products.
+    project's own ProjectName (confirmed constant within a project --
+    validated directly against a real 11,837-record Leadsun /lamps
+    response: 176 distinct projects, 0 with more than one distinct
+    ProjectName across their own records) plus a list of distinct
+    GroupId groups, each holding a list of that group's own distinct
+    products.
 
     Field mapping, deliberately NOT a 1:1 rename of PoleTelemetry's own
     column names -- this disambiguates two genuinely different Leadsun
@@ -747,6 +747,17 @@ def _aggregate_telemetry_by_leadsun_project(telemetry_rows) -> dict:
                            a real /lamps response -- genuinely NOT the
                            same identifier as ProductId/LeadsunId above,
                            despite the similar name)
+      PoleNumber       <- Poles.PoleNumber, via a LEFT JOIN in
+                           _FETCH_TELEMETRY_FOR_PROJECT_AGGREGATION_SQL
+                           on Poles.LocationId = PoleTelemetry.LocationId
+                           -- NOT a PoleTelemetry column at all, so this
+                           is the one product field that can legitimately
+                           come back None: a Leadsun device reporting
+                           telemetry with a LocationId that doesn't (yet)
+                           match any row in Poles (e.g. not yet entered
+                           in Airtable) still gets a product entry here,
+                           just with PoleNumber left as None rather than
+                           being dropped from the aggregation entirely.
 
     Keyed by LeadsunProjectId CAST TO STRING (via str()) -- matching how
     Projects.LeadsunProject's own "ProjectId" is stored (a JSON STRING,
@@ -794,7 +805,6 @@ def _aggregate_telemetry_by_leadsun_project(telemetry_rows) -> dict:
         (
             leadsun_project_id,
             leadsun_project_name,
-            user_name,
             group_id,
             group_name,
             gateway_code,
@@ -802,6 +812,7 @@ def _aggregate_telemetry_by_leadsun_project(telemetry_rows) -> dict:
             location_id,
             controller_code,
             product_id,
+            pole_number,
         ) = row
 
         if leadsun_project_id is None or group_id is None:
@@ -815,7 +826,7 @@ def _aggregate_telemetry_by_leadsun_project(telemetry_rows) -> dict:
         project_key = str(leadsun_project_id)
         project_entry = projects.setdefault(
             project_key,
-            {"ProjectName": leadsun_project_name, "UserName": user_name, "groups": {}},
+            {"ProjectName": leadsun_project_name, "groups": {}},
         )
 
         group_entry = project_entry["groups"].setdefault(
@@ -833,6 +844,7 @@ def _aggregate_telemetry_by_leadsun_project(telemetry_rows) -> dict:
             "ProductName": location_id,
             "ControllerCode": controller_code,
             "ProvidedProductId": product_id,
+            "PoleNumber": pole_number,
         }
 
     # Flatten the internal, dedup-friendly dicts (keyed by GroupId/
@@ -859,7 +871,6 @@ def _aggregate_telemetry_by_leadsun_project(telemetry_rows) -> dict:
         ]
         result[project_key] = {
             "ProjectName": project_entry["ProjectName"],
-            "UserName": project_entry["UserName"],
             "totalGateways": len(groups),
             "totalPoles": sum(group["totalPoles"] for group in groups),
             "groups": groups,
@@ -876,17 +887,19 @@ WHERE JSON_VALUE(LeadsunProject, '$.ProjectId') IS NOT NULL
 _FETCH_TELEMETRY_FOR_PROJECT_AGGREGATION_SQL = """
 ;WITH RecentTelemetry AS (
     SELECT
-        LeadsunProjectId, LeadsunProjectName, UserName, GroupId, GroupName,
+        LeadsunProjectId, LeadsunProjectName, GroupId, GroupName,
         GatewayCode, LeadsunId, LocationId, ControllerCode, ProductId,
         ROW_NUMBER() OVER (PARTITION BY LocationId ORDER BY LastUpload DESC) AS rn
     FROM PoleTelemetry
     WHERE LeadsunProjectId IS NOT NULL
       AND LastUpload >= ?
 )
-SELECT LeadsunProjectId, LeadsunProjectName, UserName, GroupId, GroupName,
-       GatewayCode, LeadsunId, LocationId, ControllerCode, ProductId
-FROM RecentTelemetry
-WHERE rn = 1
+SELECT rt.LeadsunProjectId, rt.LeadsunProjectName, rt.GroupId, rt.GroupName,
+       rt.GatewayCode, rt.LeadsunId, rt.LocationId, rt.ControllerCode, rt.ProductId,
+       p.PoleNumber
+FROM RecentTelemetry rt
+LEFT JOIN Poles p ON p.LocationId = rt.LocationId
+WHERE rt.rn = 1
 """
 
 # How far back to look for "currently reporting" telemetry when building
@@ -1004,7 +1017,6 @@ def update_leadsun_project_details() -> None:
                 {
                     "ProjectId": leadsun_project_id_str,
                     "ProjectName": aggregated["ProjectName"],
-                    "UserName": aggregated["UserName"],
                     "totalGateways": aggregated["totalGateways"],
                     "totalPoles": aggregated["totalPoles"],
                     "groups": aggregated["groups"],

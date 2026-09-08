@@ -647,7 +647,6 @@ class TestBackfillIsOpenIssueFaultFailureRecordingUsesAFreshConnection:
 def _telemetry_row(
     leadsun_project_id=482,
     leadsun_project_name="Chaparral",
-    user_name="12009-brevard",
     group_id=1149,
     group_name="Chaparral Ph3",
     gateway_code="GT18L94A25082883",
@@ -655,13 +654,14 @@ def _telemetry_row(
     location_id="12009-1000",
     controller_code="A3P70LA323110598",
     product_id="AE3SAP7323113143",
+    pole_number="12009-1000-A",
 ):
     """Matches _FETCH_TELEMETRY_FOR_PROJECT_AGGREGATION_SQL's own column
-    order exactly."""
+    order exactly (including the trailing PoleNumber, from its LEFT JOIN
+    to Poles)."""
     return (
         leadsun_project_id,
         leadsun_project_name,
-        user_name,
         group_id,
         group_name,
         gateway_code,
@@ -669,6 +669,7 @@ def _telemetry_row(
         location_id,
         controller_code,
         product_id,
+        pole_number,
     )
 
 
@@ -681,7 +682,7 @@ class TestAggregateTelemetryByLeadsunProject:
         assert list(result.keys()) == ["482"]
         project = result["482"]
         assert project["ProjectName"] == "Chaparral"
-        assert project["UserName"] == "12009-brevard"
+        assert "UserName" not in project
         assert len(project["groups"]) == 1
 
         group = project["groups"][0]
@@ -696,6 +697,7 @@ class TestAggregateTelemetryByLeadsunProject:
             "ProductName": "12009-1000",
             "ControllerCode": "A3P70LA323110598",
             "ProvidedProductId": "AE3SAP7323113143",
+            "PoleNumber": "12009-1000-A",
         }
 
     def test_field_mapping_disambiguates_id_from_provided_product_id(self):
@@ -766,6 +768,22 @@ class TestAggregateTelemetryByLeadsunProject:
 
     def test_empty_input_produces_empty_result(self):
         assert pole_telemetry_loader._aggregate_telemetry_by_leadsun_project([]) == {}
+
+    def test_pole_number_is_included_on_each_product(self):
+        row = _telemetry_row(pole_number="12009-1000-A")
+        result = pole_telemetry_loader._aggregate_telemetry_by_leadsun_project([row])
+        product = result["482"]["groups"][0]["products"][0]
+        assert product["PoleNumber"] == "12009-1000-A"
+
+    def test_pole_number_none_when_no_matching_pole(self):
+        """The LEFT JOIN to Poles in
+        _FETCH_TELEMETRY_FOR_PROJECT_AGGREGATION_SQL means a telemetry
+        reading with no matching Poles row still produces a product
+        entry -- just with PoleNumber left as None, not dropped."""
+        row = _telemetry_row(pole_number=None)
+        result = pole_telemetry_loader._aggregate_telemetry_by_leadsun_project([row])
+        product = result["482"]["groups"][0]["products"][0]
+        assert product["PoleNumber"] is None
 
     def test_total_gateways_counts_distinct_groups(self):
         rows = [
@@ -841,10 +859,10 @@ class TestAggregateTelemetryByLeadsunProject:
 
         rows = [
             (
-                r.get("projectId"), r.get("projectName"), r.get("userName"),
+                r.get("projectId"), r.get("projectName"),
                 r.get("groupId"), r.get("groupName"), r.get("gatewayCode"),
                 r.get("id"), r.get("productName"), r.get("controllerCode"),
-                r.get("productId"),
+                r.get("productId"), None,  # PoleNumber -- not part of the raw Leadsun fixture
             )
             for r in records
         ]
@@ -878,10 +896,10 @@ class TestAggregateTelemetryByLeadsunProject:
 
         rows = [
             (
-                r.get("projectId"), r.get("projectName"), r.get("userName"),
+                r.get("projectId"), r.get("projectName"),
                 r.get("groupId"), r.get("groupName"), r.get("gatewayCode"),
                 r.get("id"), r.get("productName"), r.get("controllerCode"),
-                r.get("productId"),
+                r.get("productId"), None,  # PoleNumber -- not part of the raw Leadsun fixture
             )
             for r in records
         ]
@@ -921,7 +939,7 @@ class TestUpdateLeadsunProjectDetailsSuccessFlow:
         parsed = json.loads(leadsun_project_json)
         assert parsed["ProjectId"] == "482"
         assert parsed["ProjectName"] == "Chaparral"
-        assert parsed["UserName"] == "12009-brevard"
+        assert "UserName" not in parsed
         assert len(parsed["groups"]) == 1
 
     def test_written_json_includes_total_gateways_and_poles(
@@ -1033,7 +1051,7 @@ class TestFetchTelemetryForProjectAggregationSqlIsBounded:
         multiple readings within the lookback window."""
         sql = pole_telemetry_loader._FETCH_TELEMETRY_FOR_PROJECT_AGGREGATION_SQL
         assert "ROW_NUMBER() OVER (PARTITION BY LocationId ORDER BY LastUpload DESC)" in sql
-        assert "WHERE rn = 1" in sql
+        assert "WHERE rt.rn = 1" in sql
 
     def test_lookback_constant_is_a_small_bounded_window_not_the_full_retention(self):
         """3 hours (or anything similarly small), never anywhere close

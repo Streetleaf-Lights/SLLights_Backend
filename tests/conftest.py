@@ -415,3 +415,11 @@ def make_project_record():
         }
 
     return _make
+
+
+@pytest.fixture
+def patch_get_connection_pole_remote_control(mocker, mock_conn):
+    """Patches shared.pole_remote_control.get_connection to return mock_conn."""
+    return mocker.patch(
+        "shared.pole_remote_control.get_connection", return_value=mock_conn
+    )

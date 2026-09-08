@@ -14,5 +14,5 @@ SELECT TOP (1000) [Id]
   WHERE 1 = 1
 --   AND [Id] = 'recEKgOsGbo5LtZpa'
 --   and name LIKE '%Swiss%'
-    AND Active = 1
+    AND Active = 0
   ORDER BY [Name]

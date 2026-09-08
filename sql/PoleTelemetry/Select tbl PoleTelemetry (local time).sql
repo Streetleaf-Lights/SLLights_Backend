@@ -69,7 +69,7 @@ LEFT JOIN Poles p ON t.LocationId = p.LocationId
 LEFT JOIN PoleTimeZones ptz ON t.LocationId = ptz.LocationId
 WHERE 1 = 1
 -- AND t.LocationId = 'DRH-Orl'
--- AND t.LocationId LIKE '%AEX-G%'
+AND t.LocationId LIKE '%DRH-Orl%'
 -- AND p.PoleNumber LIKE '%HIL-4509%'
 -- AND t.SP_ExecId = 442
 -- AND t.IsDaylight IS NULL
