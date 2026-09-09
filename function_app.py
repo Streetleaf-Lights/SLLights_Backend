@@ -24,6 +24,7 @@ from shared.pole_remote_control import (
     set_pole_lights,
     PoleNotFoundError,
     PoleTelemetryNotFoundError,
+    PoleNumbersNotResolvedError,
     GatewayNotFoundError,
     ProjectNotFoundError,
     ProjectHasNoLeadsunIdError,
@@ -1067,10 +1068,16 @@ def getPoleVitalsByPeriod(req: func.HttpRequest) -> func.HttpResponse:
 def setPoleLights(req: func.HttpRequest) -> func.HttpResponse:
     """
     Remotely turns light(s) on/off/dim. Body (JSON) needs EXACTLY ONE of
-    the three scope fields below, plus brightness/time:
+    the four scope fields below, plus brightness/time:
       {"poleNumber": "...", "brightness": 0-100, "time": <int>}
         -- one specific pole, looked up by its human-facing PoleNumber
            (NOT its Id), e.g. "12009-1000-A".
+      {"poleNumbers": ["...", "..."], "brightness": 0-100, "time": <int>}
+        -- a specific LIST of poles, possibly spanning different groups
+           and/or different Leadsun accounts (see
+           shared/pole_remote_control.py's set_pole_lights() docstring
+           for how multi-account lists are handled and how the response
+           shape differs in that case).
       {"gatewayCode": "...", "brightness": 0-100, "time": <int>}
         -- every currently-reporting pole under that Leadsun gateway.
       {"projectId": "...", "brightness": 0-100, "time": <int>}
@@ -1085,7 +1092,7 @@ def setPoleLights(req: func.HttpRequest) -> func.HttpResponse:
     and shared/leadsun_edge_client.py's own module docstrings for the
     full flow this wires together (telemetry lookup -> Leadsun EDGE
     login/token refresh -> the actual remote-command call, sent as ONE
-    request covering every matched pole even at gateway/project scope).
+    request per Leadsun account covering every matched pole under it).
     """
     try:
         body = req.get_json()
@@ -1097,19 +1104,40 @@ def setPoleLights(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     pole_number = body.get("poleNumber")
+    pole_numbers = body.get("poleNumbers")
     gateway_code = body.get("gatewayCode")
     project_id = body.get("projectId")
     brightness = body.get("brightness")
     time_minutes = body.get("time")
 
     scope_fields_given = [
-        name for name, value in (("poleNumber", pole_number), ("gatewayCode", gateway_code), ("projectId", project_id)) if value
+        name
+        for name, value in (
+            ("poleNumber", pole_number),
+            ("poleNumbers", pole_numbers),
+            ("gatewayCode", gateway_code),
+            ("projectId", project_id),
+        )
+        if value
     ]
     if len(scope_fields_given) != 1:
         return func.HttpResponse(
             json.dumps(
-                {"error": "exactly one of poleNumber, gatewayCode, or projectId is required"}
+                {
+                    "error": "exactly one of poleNumber, poleNumbers, gatewayCode, "
+                    "or projectId is required"
+                }
             ),
+            status_code=400,
+            mimetype="application/json",
+        )
+    if pole_numbers is not None and (
+        not isinstance(pole_numbers, list)
+        or not pole_numbers
+        or not all(isinstance(pn, str) and pn for pn in pole_numbers)
+    ):
+        return func.HttpResponse(
+            json.dumps({"error": "poleNumbers must be a non-empty array of non-empty strings"}),
             status_code=400,
             mimetype="application/json",
         )
@@ -1129,6 +1157,7 @@ def setPoleLights(req: func.HttpRequest) -> func.HttpResponse:
     try:
         result = set_pole_lights(
             pole_number=pole_number,
+            pole_numbers=pole_numbers,
             gateway_code=gateway_code,
             project_id=project_id,
             brightness=brightness,
@@ -1137,6 +1166,7 @@ def setPoleLights(req: func.HttpRequest) -> func.HttpResponse:
     except (
         PoleNotFoundError,
         PoleTelemetryNotFoundError,
+        PoleNumbersNotResolvedError,
         GatewayNotFoundError,
         ProjectNotFoundError,
         ProjectTelemetryNotFoundError,

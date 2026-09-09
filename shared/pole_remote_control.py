@@ -92,6 +92,17 @@ class ProjectTelemetryNotFoundError(Exception):
     project genuinely has zero poles reporting yet)."""
 
 
+class PoleNumbersNotResolvedError(Exception):
+    """One or more entries in a pole_numbers list couldn't be resolved --
+    either the PoleNumber doesn't exist in Poles at all, or it exists but
+    has no PoleTelemetry row yet. Both problems are reported together
+    (see set_pole_lights()'s own batch-lookup code) since a caller acting
+    on a whole list needs to know everything wrong with it at once, not
+    just the first issue encountered -- fixing one typo only to
+    immediately hit a second, unreported one on the next attempt would
+    be a frustrating way to debug a list of a dozen pole numbers."""
+
+
 class LeadsunEdgeAccountNotFoundError(Exception):
     """The matched telemetry has a UserName, but LeadsunEdgeAccounts has
     no matching row -- there's no password to log in with."""
@@ -207,6 +218,74 @@ def _fetch_latest_telemetry_for_pole(pole_number: str):
     finally:
         cursor.close()
         conn.close()
+
+
+def _fetch_latest_telemetry_for_poles(pole_numbers: list):
+    """
+    Batch version of _fetch_latest_telemetry_for_pole() for a LIST of
+    PoleNumbers -- returns {pole_number: (user_name, group_id,
+    gateway_code, controller_code)}, one entry per pole_numbers input,
+    each pole's own most recent PoleTelemetry reading (same "regardless
+    of age" behavior as the single-pole lookup -- see this module's own
+    docstring for why: a caller naming specific poles is choosing them
+    deliberately, not asking "whichever happen to be currently online").
+
+    All-or-nothing: if ANY given PoleNumber can't be resolved (doesn't
+    exist in Poles at all, or exists but has no telemetry yet), raises
+    ONE PoleNumbersNotResolvedError listing every problem pole together,
+    rather than silently proceeding with just the resolvable subset --
+    a caller controlling real hardware from a list should know exactly
+    what didn't work, not have some unknown subset silently skipped.
+    """
+    placeholders = ",".join("?" for _ in pole_numbers)
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            f"SELECT PoleNumber FROM Poles WHERE PoleNumber IN ({placeholders})",
+            *pole_numbers,
+        )
+        existing_pole_numbers = {row[0] for row in cursor.fetchall()}
+
+        cursor.execute(
+            f"""
+            ;WITH RecentTelemetry AS (
+                SELECT
+                    p.PoleNumber, pt.UserName, pt.GroupId, pt.GatewayCode, pt.ControllerCode,
+                    ROW_NUMBER() OVER (PARTITION BY p.PoleNumber ORDER BY pt.LastUpload DESC) AS rn
+                FROM Poles p
+                JOIN PoleTelemetry pt ON pt.LocationId = p.LocationId
+                WHERE p.PoleNumber IN ({placeholders})
+            )
+            SELECT PoleNumber, UserName, GroupId, GatewayCode, ControllerCode
+            FROM RecentTelemetry
+            WHERE rn = 1
+            """,
+            *pole_numbers,
+        )
+        telemetry_by_pole_number = {row[0]: row[1:] for row in cursor.fetchall()}
+    finally:
+        cursor.close()
+        conn.close()
+
+    not_found = [pn for pn in pole_numbers if pn not in existing_pole_numbers]
+    no_telemetry = [
+        pn
+        for pn in pole_numbers
+        if pn in existing_pole_numbers and pn not in telemetry_by_pole_number
+    ]
+    if not_found or no_telemetry:
+        problems = []
+        if not_found:
+            problems.append(f"not found: {not_found}")
+        if no_telemetry:
+            problems.append(f"no telemetry yet: {no_telemetry}")
+        raise PoleNumbersNotResolvedError(
+            f"Could not resolve all pole numbers ({'; '.join(problems)})."
+        )
+
+    return {pn: telemetry_by_pole_number[pn] for pn in pole_numbers}
 
 
 def _fetch_telemetry_for_gateway(gateway_code: str):
@@ -345,6 +424,33 @@ def _decode_expiry(token: str) -> float:
     return jwt.decode(token, options={"verify_signature": False})["exp"]
 
 
+def _force_fresh_access_token(username: str, password: str) -> str:
+    """
+    Unconditionally calls get_token() (bypassing any cached entry
+    entirely) and updates the cache with the result. Used as a
+    self-healing retry step: if a cached token gets rejected by Leadsun
+    EDGE, the most likely explanation isn't that the token merely
+    expired early (_get_access_token already accounts for that) -- it's
+    that ANOTHER Azure Functions instance (a cold start, a concurrent
+    request, a scale-out event) independently called get_token() for
+    this same username in the meantime, and Leadsun EDGE enforces a
+    single active session per account, silently invalidating this
+    instance's still-cached-and-still-"unexpired" token. Since the token
+    cache is per-process (see _token_cache's own comment), no amount of
+    local expiry bookkeeping can detect that from here -- only an actual
+    failed request against the real API reveals it. Forcing a fresh
+    login recovers immediately either way.
+    """
+    body = get_token(username, password)
+    _token_cache[username] = {
+        "access_token": body["access_token"],
+        "refresh_token": body["refresh_token"],
+        "access_exp": _decode_expiry(body["access_token"]),
+        "refresh_exp": _decode_expiry(body["refresh_token"]),
+    }
+    return body["access_token"]
+
+
 def _get_access_token(username: str, password: str) -> str:
     """
     Returns a valid access token for username, reusing a cached one if
@@ -388,25 +494,90 @@ def _get_access_token(username: str, password: str) -> str:
     return body["access_token"]
 
 
+def _execute_remote_command(
+    user_name: str, groups: list, brightness: int, time_minutes: int, scope_description: str
+) -> dict:
+    """
+    Shared by every scope in set_pole_lights(): fetches the password for
+    user_name, gets/reuses an access token, sends the remote-command, and
+    self-heals with one retry (a truly fresh login) if the first attempt
+    is rejected -- see _force_fresh_access_token()'s own docstring for
+    why that specific failure mode happens and why retrying once (not
+    looping) is the right response to it.
+    """
+    password = _fetch_leadsun_edge_password(user_name)
+    access_token = _get_access_token(user_name, password)
+
+    logging.info(
+        "pole_remote_control: sending remote command for %s (userName=%s, "
+        "%d group(s), brightness=%s, time=%s).",
+        scope_description, user_name, len(groups), brightness, time_minutes,
+    )
+    try:
+        return send_remote_command(
+            access_token=access_token,
+            brightness=brightness,
+            time_minutes=time_minutes,
+            groups=groups,
+        )
+    except LeadsunEdgeApiError as ex:
+        logging.warning(
+            "pole_remote_control: remote-command failed with cached token for %s "
+            "(userName=%s), retrying once with a fresh login: %s",
+            scope_description, user_name, ex,
+        )
+        access_token = _force_fresh_access_token(user_name, password)
+        return send_remote_command(
+            access_token=access_token,
+            brightness=brightness,
+            time_minutes=time_minutes,
+            groups=groups,
+        )
+
+
 def set_pole_lights(
     brightness: int,
     time_minutes: int,
     pole_number: str = None,
+    pole_numbers: list = None,
     gateway_code: str = None,
     project_id: str = None,
 ) -> dict:
     """
-    Turns light(s) on/off/dim at exactly ONE of three scopes -- pass
-    exactly one of pole_number/gateway_code/project_id, not zero, not
-    more than one. brightness and time_minutes are passed straight
-    through to Leadsun for every matched pole -- see this module's own
-    docstring for why no on/off-specific interpretation happens here.
+    Turns light(s) on/off/dim at exactly ONE of four scopes -- pass
+    exactly one of pole_number/pole_numbers/gateway_code/project_id, not
+    zero, not more than one. brightness and time_minutes are passed
+    straight through to Leadsun for every matched pole -- see this
+    module's own docstring for why no on/off-specific interpretation
+    happens here.
+
+    pole_numbers (a LIST of PoleNumbers, possibly spanning different
+    groups AND different Leadsun accounts) is the odd one out among the
+    four scopes: pole_number/gateway_code/project_id each resolve to
+    telemetry that's guaranteed (or, for gateway/project, has been
+    validated elsewhere -- see pole_telemetry_loader.py's own
+    _aggregate_telemetry_by_leadsun_project() docstring) to share ONE
+    UserName, so they only ever need ONE Leadsun EDGE login and ONE
+    remote-command call. An arbitrary pole_numbers list has no such
+    guarantee -- the poles named could belong to entirely different
+    projects with entirely different Leadsun accounts. So this scope
+    partitions the resolved telemetry by UserName FIRST, then issues one
+    independent login + remote-command call PER distinct UserName found
+    (still just one call per account, not one per pole -- poles sharing
+    an account but spanning multiple groups still land in one call's
+    `groups` list, same as gateway/project scope). In the overwhelmingly
+    common case (a caller's pole_numbers all belong to one project), this
+    still ends up being exactly one call, same as any other scope.
 
     Raises:
       ValueError                      -- zero or more than one scope
                                           argument given
       PoleNotFoundError               -- pole_number doesn't exist
       PoleTelemetryNotFoundError      -- pole exists, no telemetry yet
+      PoleNumbersNotResolvedError     -- one or more pole_numbers entries
+                                          couldn't be resolved (see
+                                          _fetch_latest_telemetry_for_poles()
+                                          for the all-or-nothing reasoning)
       GatewayNotFoundError            -- gateway_code matches nothing
                                           currently reporting
       ProjectNotFoundError            -- project_id doesn't exist
@@ -421,13 +592,21 @@ def set_pole_lights(
 
     Returns the parsed remote-command response body on success (see
     shared/leadsun_edge_client.py's send_remote_command() for its shape)
-    -- ONE response for the whole call, even at gateway/project scope,
-    since it's still just one underlying API request.
+    for pole_number/gateway_code/project_id scope, OR for pole_numbers
+    scope specifically:
+      - if every matched pole shares one UserName (the common case):
+        that SAME single response body, unchanged -- so a caller who
+        only ever uses single-account pole lists sees an identical
+        response shape regardless of which scope they used.
+      - if the list spans multiple UserNames: {"results": [{"userName":
+        ..., "poleCount": <int>, "response": {...}}, ...]}, one entry
+        per account actually contacted.
     """
     scope_args_given = [
         name
         for name, value in (
             ("pole_number", pole_number),
+            ("pole_numbers", pole_numbers),
             ("gateway_code", gateway_code),
             ("project_id", project_id),
         )
@@ -435,8 +614,8 @@ def set_pole_lights(
     ]
     if len(scope_args_given) != 1:
         raise ValueError(
-            "Exactly one of pole_number, gateway_code, or project_id is required "
-            f"(got: {scope_args_given or 'none'})."
+            "Exactly one of pole_number, pole_numbers, gateway_code, or project_id is "
+            f"required (got: {scope_args_given or 'none'})."
         )
 
     if pole_number:
@@ -451,26 +630,38 @@ def set_pole_lights(
             }
         ]
         scope_description = f"pole '{pole_number}'"
-    elif gateway_code:
+        return _execute_remote_command(user_name, groups, brightness, time_minutes, scope_description)
+
+    if pole_numbers:
+        telemetry_by_pole_number = _fetch_latest_telemetry_for_poles(pole_numbers)
+        by_username: dict = {}
+        for pole_number_key, (user_name, group_id, gateway_code_value, controller_code) in (
+            telemetry_by_pole_number.items()
+        ):
+            by_username.setdefault(user_name, []).append(
+                (user_name, group_id, gateway_code_value, controller_code)
+            )
+
+        results = []
+        for user_name, rows in by_username.items():
+            _, groups = _rows_to_groups_and_username(rows)
+            scope_description = f"{len(rows)} pole(s) from pole_numbers list (userName={user_name})"
+            response = _execute_remote_command(
+                user_name, groups, brightness, time_minutes, scope_description
+            )
+            results.append({"userName": user_name, "poleCount": len(rows), "response": response})
+
+        if len(results) == 1:
+            return results[0]["response"]
+        return {"results": results}
+
+    if gateway_code:
         rows = _fetch_telemetry_for_gateway(gateway_code)
         user_name, groups = _rows_to_groups_and_username(rows)
         scope_description = f"gateway '{gateway_code}' ({len(rows)} pole(s))"
-    else:
-        rows = _fetch_telemetry_for_project(project_id)
-        user_name, groups = _rows_to_groups_and_username(rows)
-        scope_description = f"project '{project_id}' ({len(rows)} pole(s))"
+        return _execute_remote_command(user_name, groups, brightness, time_minutes, scope_description)
 
-    password = _fetch_leadsun_edge_password(user_name)
-    access_token = _get_access_token(user_name, password)
-
-    logging.info(
-        "pole_remote_control: sending remote command for %s (userName=%s, "
-        "%d group(s), brightness=%s, time=%s).",
-        scope_description, user_name, len(groups), brightness, time_minutes,
-    )
-    return send_remote_command(
-        access_token=access_token,
-        brightness=brightness,
-        time_minutes=time_minutes,
-        groups=groups,
-    )
+    rows = _fetch_telemetry_for_project(project_id)
+    user_name, groups = _rows_to_groups_and_username(rows)
+    scope_description = f"project '{project_id}' ({len(rows)} pole(s))"
+    return _execute_remote_command(user_name, groups, brightness, time_minutes, scope_description)

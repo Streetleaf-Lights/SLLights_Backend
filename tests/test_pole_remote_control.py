@@ -57,6 +57,79 @@ class TestFetchLatestTelemetryForPole:
         mock_conn.close.assert_called_once()
 
 
+class TestFetchLatestTelemetryForPoles:
+    def test_all_resolve_returns_dict_keyed_by_pole_number(
+        self, patch_get_connection_pole_remote_control, mock_cursor
+    ):
+        mock_cursor.fetchall.side_effect = [
+            [("P1",), ("P2",)],  # existing pole numbers
+            [
+                ("P1", "SLDEMOS", 1458, "GT", "CC-1"),
+                ("P2", "SLDEMOS", 1458, "GT", "CC-2"),
+            ],  # telemetry rows
+        ]
+
+        result = m._fetch_latest_telemetry_for_poles(["P1", "P2"])
+
+        assert result == {
+            "P1": ("SLDEMOS", 1458, "GT", "CC-1"),
+            "P2": ("SLDEMOS", 1458, "GT", "CC-2"),
+        }
+
+    def test_nonexistent_pole_number_raises_with_details(
+        self, patch_get_connection_pole_remote_control, mock_cursor
+    ):
+        mock_cursor.fetchall.side_effect = [
+            [("P1",)],  # only P1 exists, P2 doesn't
+            [("P1", "SLDEMOS", 1458, "GT", "CC-1")],
+        ]
+
+        with pytest.raises(m.PoleNumbersNotResolvedError, match="not found.*P2"):
+            m._fetch_latest_telemetry_for_poles(["P1", "P2"])
+
+    def test_pole_with_no_telemetry_raises_with_details(
+        self, patch_get_connection_pole_remote_control, mock_cursor
+    ):
+        mock_cursor.fetchall.side_effect = [
+            [("P1",), ("P2",)],  # both exist
+            [("P1", "SLDEMOS", 1458, "GT", "CC-1")],  # but P2 has no telemetry
+        ]
+
+        with pytest.raises(m.PoleNumbersNotResolvedError, match="no telemetry yet.*P2"):
+            m._fetch_latest_telemetry_for_poles(["P1", "P2"])
+
+    def test_both_problems_reported_together(
+        self, patch_get_connection_pole_remote_control, mock_cursor
+    ):
+        mock_cursor.fetchall.side_effect = [
+            [("P1",)],  # P2, P3 don't exist at all
+            [],  # P1 exists but has no telemetry either
+        ]
+
+        with pytest.raises(m.PoleNumbersNotResolvedError) as exc_info:
+            m._fetch_latest_telemetry_for_poles(["P1", "P2", "P3"])
+
+        message = str(exc_info.value)
+        assert "not found" in message
+        assert "no telemetry yet" in message
+
+    def test_spanning_multiple_usernames(
+        self, patch_get_connection_pole_remote_control, mock_cursor
+    ):
+        mock_cursor.fetchall.side_effect = [
+            [("P1",), ("P2",)],
+            [
+                ("P1", "SLDEMOS", 100, "GT-A", "CC-1"),
+                ("P2", "OTHER_ACCOUNT", 200, "GT-B", "CC-2"),
+            ],
+        ]
+
+        result = m._fetch_latest_telemetry_for_poles(["P1", "P2"])
+
+        assert result["P1"][0] == "SLDEMOS"
+        assert result["P2"][0] == "OTHER_ACCOUNT"
+
+
 class TestFetchLeadsunEdgePassword:
     def test_no_matching_account_raises(
         self, patch_get_connection_pole_remote_control, mock_cursor
@@ -464,3 +537,188 @@ class TestSetPoleLights:
         m.set_pole_lights(project_id="recProj1", brightness=50, time_minutes=30)
 
         mock_send.assert_called_once()
+
+    def test_failure_with_cached_token_retries_with_fresh_login(
+        self, patch_get_connection_pole_remote_control, mock_cursor, mocker
+    ):
+        """The self-healing retry: if the first send_remote_command call
+        fails (e.g. another instance invalidated our cached token via
+        Leadsun EDGE's single-active-session model), a fresh login is
+        forced and the command is retried once, succeeding."""
+        mock_cursor.fetchone.side_effect = [
+            (1,),
+            ("SLDEMOS", 1458, "GT", "CC"),
+            ("encrypted-blob",),
+        ]
+        mocker.patch("shared.pole_remote_control.decrypt_secret", return_value="hunter2")
+        mock_get_token = mocker.patch(
+            "shared.pole_remote_control.get_token",
+            return_value={"access_token": _make_jwt(3600), "refresh_token": _make_jwt(604800)},
+        )
+        from shared.leadsun_edge_client import LeadsunEdgeApiError
+
+        mock_send = mocker.patch(
+            "shared.pole_remote_control.send_remote_command",
+            side_effect=[
+                LeadsunEdgeApiError("401: invalid token"),
+                {"success": True, "data": None},
+            ],
+        )
+
+        result = m.set_pole_lights(pole_number="P1", brightness=50, time_minutes=30)
+
+        assert result == {"success": True, "data": None}
+        assert mock_send.call_count == 2
+        # get_token called twice: once for the initial (cache-miss) login,
+        # once again for the forced-fresh retry login.
+        assert mock_get_token.call_count == 2
+
+    def test_failure_persists_after_retry_propagates(
+        self, patch_get_connection_pole_remote_control, mock_cursor, mocker
+    ):
+        """If a truly fresh login ALSO gets rejected, that's a real
+        failure (bad credentials, Leadsun EDGE outage) -- it must
+        propagate, not retry forever."""
+        mock_cursor.fetchone.side_effect = [
+            (1,),
+            ("SLDEMOS", 1458, "GT", "CC"),
+            ("encrypted-blob",),
+        ]
+        mocker.patch("shared.pole_remote_control.decrypt_secret", return_value="hunter2")
+        mocker.patch(
+            "shared.pole_remote_control.get_token",
+            return_value={"access_token": _make_jwt(3600), "refresh_token": _make_jwt(604800)},
+        )
+        from shared.leadsun_edge_client import LeadsunEdgeApiError
+
+        mock_send = mocker.patch(
+            "shared.pole_remote_control.send_remote_command",
+            side_effect=LeadsunEdgeApiError("401: invalid token"),
+        )
+
+        with pytest.raises(LeadsunEdgeApiError):
+            m.set_pole_lights(pole_number="P1", brightness=50, time_minutes=30)
+
+        assert mock_send.call_count == 2  # tried once, retried once, then gave up
+
+    def test_retry_uses_forced_fresh_token_not_stale_cache(
+        self, patch_get_connection_pole_remote_control, mock_cursor, mocker
+    ):
+        """The retry must use a genuinely NEW token, not just re-read the
+        same (already-rejected) cached one."""
+        mock_cursor.fetchone.side_effect = [
+            (1,),
+            ("SLDEMOS", 1458, "GT", "CC"),
+            ("encrypted-blob",),
+        ]
+        mocker.patch("shared.pole_remote_control.decrypt_secret", return_value="hunter2")
+        stale_token = _make_jwt(3600)
+        fresh_token = _make_jwt(3600)
+        mocker.patch(
+            "shared.pole_remote_control.get_token",
+            side_effect=[
+                {"access_token": stale_token, "refresh_token": _make_jwt(604800)},
+                {"access_token": fresh_token, "refresh_token": _make_jwt(604800)},
+            ],
+        )
+        from shared.leadsun_edge_client import LeadsunEdgeApiError
+
+        mock_send = mocker.patch(
+            "shared.pole_remote_control.send_remote_command",
+            side_effect=[
+                LeadsunEdgeApiError("401: invalid token"),
+                {"success": True, "data": None},
+            ],
+        )
+
+        m.set_pole_lights(pole_number="P1", brightness=50, time_minutes=30)
+
+        first_call_token = mock_send.call_args_list[0].kwargs["access_token"]
+        second_call_token = mock_send.call_args_list[1].kwargs["access_token"]
+        assert first_call_token == stale_token
+        assert second_call_token == fresh_token
+        assert first_call_token != second_call_token
+
+    def test_pole_numbers_scope_single_username_returns_bare_response(
+        self, patch_get_connection_pole_remote_control, mock_cursor, mocker
+    ):
+        """When every matched pole shares one UserName -- the overwhelmingly
+        common case -- the response shape must be identical to any other
+        scope (the bare Leadsun response body), not wrapped."""
+        mock_cursor.fetchall.side_effect = [
+            [("P1",), ("P2",)],
+            [
+                ("P1", "SLDEMOS", 1458, "GT", "CC-1"),
+                ("P2", "SLDEMOS", 1458, "GT", "CC-2"),
+            ],
+        ]
+        mock_cursor.fetchone.return_value = ("encrypted-blob",)
+        mock_send = self._mock_common(mocker)
+
+        result = m.set_pole_lights(pole_numbers=["P1", "P2"], brightness=50, time_minutes=30)
+
+        assert result == {"success": True, "data": None}
+        mock_send.assert_called_once()
+        call_kwargs = mock_send.call_args.kwargs
+        assert call_kwargs["groups"] == [
+            {"gateway_code": "GT", "group_id": 1458, "controller_codes": ["CC-1", "CC-2"]}
+        ]
+
+    def test_pole_numbers_scope_multiple_usernames_wraps_results(
+        self, patch_get_connection_pole_remote_control, mock_cursor, mocker
+    ):
+        mock_cursor.fetchall.side_effect = [
+            [("P1",), ("P2",)],
+            [
+                ("P1", "SLDEMOS", 100, "GT-A", "CC-1"),
+                ("P2", "OTHER_ACCOUNT", 200, "GT-B", "CC-2"),
+            ],
+        ]
+        mock_cursor.fetchone.return_value = ("encrypted-blob",)
+        mock_send = self._mock_common(mocker)
+
+        result = m.set_pole_lights(pole_numbers=["P1", "P2"], brightness=50, time_minutes=30)
+
+        assert mock_send.call_count == 2  # one login+call per distinct account
+        assert "results" in result
+        assert len(result["results"]) == 2
+        usernames = {entry["userName"] for entry in result["results"]}
+        assert usernames == {"SLDEMOS", "OTHER_ACCOUNT"}
+        for entry in result["results"]:
+            assert entry["poleCount"] == 1
+            assert entry["response"] == {"success": True, "data": None}
+
+    def test_pole_numbers_unresolved_propagates(
+        self, patch_get_connection_pole_remote_control, mock_cursor
+    ):
+        mock_cursor.fetchall.side_effect = [[], []]
+
+        with pytest.raises(m.PoleNumbersNotResolvedError):
+            m.set_pole_lights(pole_numbers=["P-BAD"], brightness=50, time_minutes=30)
+
+    def test_pole_numbers_scope_mutually_exclusive_with_others(self):
+        with pytest.raises(ValueError, match="Exactly one"):
+            m.set_pole_lights(
+                brightness=50, time_minutes=30, pole_numbers=["P1"], pole_number="P2"
+            )
+
+    def test_pole_numbers_same_username_different_groups_one_call(
+        self, patch_get_connection_pole_remote_control, mock_cursor, mocker
+    ):
+        """Same account, different groups -- still ONE remote-command call
+        (multiple entries in `groups`), not one per group."""
+        mock_cursor.fetchall.side_effect = [
+            [("P1",), ("P2",)],
+            [
+                ("P1", "SLDEMOS", 100, "GT-A", "CC-1"),
+                ("P2", "SLDEMOS", 200, "GT-B", "CC-2"),
+            ],
+        ]
+        mock_cursor.fetchone.return_value = ("encrypted-blob",)
+        mock_send = self._mock_common(mocker)
+
+        result = m.set_pole_lights(pole_numbers=["P1", "P2"], brightness=50, time_minutes=30)
+
+        mock_send.assert_called_once()
+        assert len(mock_send.call_args.kwargs["groups"]) == 2
+        assert result == {"success": True, "data": None}

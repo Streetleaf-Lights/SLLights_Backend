@@ -1536,6 +1536,7 @@ class TestSetPoleLights:
         assert json.loads(response.get_body()) == {"success": True, "data": None}
         mock_set.assert_called_once_with(
             pole_number="12009-1000-A",
+            pole_numbers=None,
             gateway_code=None,
             project_id=None,
             brightness=50,
@@ -1582,6 +1583,7 @@ class TestSetPoleLights:
         assert response.status_code == 200
         mock_set.assert_called_once_with(
             pole_number=None,
+            pole_numbers=None,
             gateway_code="GT18L94A25082883",
             project_id=None,
             brightness=100,
@@ -1616,6 +1618,7 @@ class TestSetPoleLights:
         assert response.status_code == 200
         mock_set.assert_called_once_with(
             pole_number=None,
+            pole_numbers=None,
             gateway_code=None,
             project_id="recProj1",
             brightness=0,
@@ -1775,7 +1778,7 @@ class TestSetPoleLights:
 
         assert response.status_code == 200
         mock_set.assert_called_once_with(
-            pole_number="P1", gateway_code=None, project_id=None, brightness=0, time_minutes=0
+            pole_number="P1", pole_numbers=None, gateway_code=None, project_id=None, brightness=0, time_minutes=0
         )
 
     def test_boolean_brightness_is_rejected(self, mocker):
@@ -1824,3 +1827,117 @@ class TestSetPoleLights:
         )
 
         assert response.status_code == 500
+
+    # -- poleNumbers array scope --
+
+    def test_pole_numbers_scope_happy_path(self, mocker):
+        mock_set = mocker.patch(
+            "function_app.set_pole_lights", return_value={"success": True, "data": None}
+        )
+
+        response = function_app.setPoleLights(
+            make_set_pole_lights_http_request(
+                {"poleNumbers": ["P1", "P2"], "brightness": 50, "time": 30}
+            )
+        )
+
+        assert response.status_code == 200
+        mock_set.assert_called_once_with(
+            pole_number=None,
+            pole_numbers=["P1", "P2"],
+            gateway_code=None,
+            project_id=None,
+            brightness=50,
+            time_minutes=30,
+        )
+
+    def test_pole_numbers_multi_account_result_passed_through(self, mocker):
+        mocker.patch(
+            "function_app.set_pole_lights",
+            return_value={
+                "results": [
+                    {"userName": "A", "poleCount": 1, "response": {"success": True, "data": None}},
+                    {"userName": "B", "poleCount": 1, "response": {"success": True, "data": None}},
+                ]
+            },
+        )
+
+        response = function_app.setPoleLights(
+            make_set_pole_lights_http_request(
+                {"poleNumbers": ["P1", "P2"], "brightness": 50, "time": 30}
+            )
+        )
+
+        assert response.status_code == 200
+        body = json.loads(response.get_body())
+        assert len(body["results"]) == 2
+
+    def test_pole_numbers_not_a_list_returns_400(self, mocker):
+        mock_set = mocker.patch("function_app.set_pole_lights")
+
+        response = function_app.setPoleLights(
+            make_set_pole_lights_http_request({"poleNumbers": "P1", "brightness": 50, "time": 30})
+        )
+
+        assert response.status_code == 400
+        mock_set.assert_not_called()
+
+    def test_pole_numbers_empty_list_returns_400(self, mocker):
+        mock_set = mocker.patch("function_app.set_pole_lights")
+
+        response = function_app.setPoleLights(
+            make_set_pole_lights_http_request({"poleNumbers": [], "brightness": 50, "time": 30})
+        )
+
+        assert response.status_code == 400
+        mock_set.assert_not_called()
+
+    def test_pole_numbers_with_non_string_entry_returns_400(self, mocker):
+        mock_set = mocker.patch("function_app.set_pole_lights")
+
+        response = function_app.setPoleLights(
+            make_set_pole_lights_http_request(
+                {"poleNumbers": ["P1", 123], "brightness": 50, "time": 30}
+            )
+        )
+
+        assert response.status_code == 400
+        mock_set.assert_not_called()
+
+    def test_pole_numbers_with_empty_string_entry_returns_400(self, mocker):
+        mock_set = mocker.patch("function_app.set_pole_lights")
+
+        response = function_app.setPoleLights(
+            make_set_pole_lights_http_request(
+                {"poleNumbers": ["P1", ""], "brightness": 50, "time": 30}
+            )
+        )
+
+        assert response.status_code == 400
+        mock_set.assert_not_called()
+
+    def test_pole_numbers_combined_with_pole_number_returns_400(self, mocker):
+        mock_set = mocker.patch("function_app.set_pole_lights")
+
+        response = function_app.setPoleLights(
+            make_set_pole_lights_http_request(
+                {"poleNumber": "P1", "poleNumbers": ["P2"], "brightness": 50, "time": 30}
+            )
+        )
+
+        assert response.status_code == 400
+        mock_set.assert_not_called()
+
+    def test_pole_numbers_not_resolved_returns_404(self, mocker):
+        mocker.patch(
+            "function_app.set_pole_lights",
+            side_effect=function_app.PoleNumbersNotResolvedError("not found: ['P-BAD']"),
+        )
+
+        response = function_app.setPoleLights(
+            make_set_pole_lights_http_request(
+                {"poleNumbers": ["P-BAD"], "brightness": 50, "time": 30}
+            )
+        )
+
+        assert response.status_code == 404
