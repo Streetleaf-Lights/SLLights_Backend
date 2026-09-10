@@ -13,6 +13,6 @@ SELECT TOP (1000) [Id]
   FROM [dbo].[Customers]
   WHERE 1 = 1
 --   AND [Id] = 'recEKgOsGbo5LtZpa'
---   and name LIKE '%Swiss%'
-    AND Active = 0
+  and name LIKE '%Streetleaf%'
+    -- AND Active = 0
   ORDER BY [Name]

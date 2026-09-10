@@ -20,11 +20,16 @@ underscore-prefixed names" for code this tightly coupled and this
 unlikely to be used by anything outside this codebase.
 """
 
-from shared.api_utils import clamp_limit, compute_pole_local_sunset, compute_pole_status_labels, json_safe
+from shared.api_utils import (
+    clamp_limit,
+    compute_pole_local_sunset,
+    compute_reporting_staleness_label,
+    json_safe,
+)
 from shared.pole_vitals_api import (
-    _POLE_DETAIL_PERIOD_TYPE,
     _POLE_DETAILS_SQL_TEMPLATE,
     _ROLLUP_PERIOD_TYPE,
+    _compute_pole_vitals_status_fields,
     _pole_row_to_dict,
 )
 from shared.sql_client import get_connection
@@ -107,11 +112,18 @@ SELECT
     ptz.Latitude AS TimeZoneLatitude,
     ptz.Longitude AS TimeZoneLongitude,
     ptz.IanaTimeZone AS IanaTimeZone,
-    rps_online.IsOnline AS IsOnline,
+    rps.IsOnline AS IsOnline,
     rps.IsLedFault AS IsLedFault,
     rps.IsBatteryFault AS IsBatteryFault,
     rps.IsPanelFault AS IsPanelFault,
-    rps.IsOpenIssueFault AS IsOpenIssueFault,
+    -- Same as pole_vitals_api.py's own _POLE_DETAILS_SQL_TEMPLATE:
+    -- reads directly from PoleOpenIssues, decoupled from the Last48Hours
+    -- join and therefore from telemetry recency entirely -- always TRUE
+    -- or FALSE, never NULL, regardless of whether rps itself has a
+    -- matching row.
+    CASE WHEN EXISTS (
+        SELECT 1 FROM PoleOpenIssues poi WHERE poi.PoleId = p.Id
+    ) THEN CAST(1 AS BIT) ELSE CAST(0 AS BIT) END AS IsOpenIssueFault,
     rps.IsPoleFault AS IsPoleFault,
     rps.AvgBatteryPercentage AS BatteryPercentage,
     rps.AvgPanelPercentage AS PanelPercentage,
@@ -121,13 +133,6 @@ FROM Poles p
 JOIN Projects proj ON p.ProjectId = proj.Id
 JOIN Customers c ON proj.CustomerId = c.Id
 LEFT JOIN PoleVitals rps ON p.LocationId = rps.LocationId AND rps.PeriodType = ?
--- Second join, same reasoning as pole_vitals_api.py's own
--- _POLE_DETAILS_SQL_TEMPLATE: IsOnline specifically reverts to
--- Last48Hours (_ROLLUP_PERIOD_TYPE) while every other field above stays
--- on LastKnown48Hours (_POLE_DETAIL_PERIOD_TYPE) -- a silent pole's
--- LastKnown48Hours.IsOnline would misleadingly reflect its own LAST
--- KNOWN state, not whether it's online RIGHT NOW.
-LEFT JOIN PoleVitals rps_online ON p.LocationId = rps_online.LocationId AND rps_online.PeriodType = ?
 LEFT JOIN PoleTimeZones ptz ON p.LocationId = ptz.LocationId
 OUTER APPLY (
     -- TOP 1 ... ORDER BY LastUpload DESC. OUTER (not CROSS): a pole with
@@ -182,17 +187,31 @@ def _summary_row_to_dict(row) -> dict:
     genuinely different (missing batteryVoltage1/2), not just a subset
     of the exact same shape.
 
-    lightStatusLabel/panelStatusLabel/panelIdleReason/batteryStatusLabel:
-    computed via the exact same shared api_utils.compute_pole_status_
-    labels() pole_vitals_api.py's own _pole_row_to_dict() uses -- see
-    that function's own docstring for the full logic/reasoning. Four of
-    its five keys are included here, per explicit request;
+    lightStatusLabel/panelStatusLabel/panelIdleReason/batteryStatusLabel/
+    connectedLabel/overallStatusLabel: computed via the exact same
+    shared pole_vitals_api._compute_pole_vitals_status_fields() helper
+    pole_vitals_api.py's own _pole_row_to_dict() uses -- reused directly
+    here (rather than reimplementing the same staleness-override logic a
+    second time) for the same "one shared implementation, no silent
+    drift" reasoning this whole module's own header comment already
+    applies to the SQL templates. This means a silent pole (lastUpdate
+    null or >48h old) gets the exact same treatment here as it does in
+    getPoleVitals: isLedFault/isBatteryFault/isPanelFault/isPoleFault/
+    lampPower1/2/batteryElecCurrent1/2/solarBoardVoltage/
+    solarBoardElecCurrent all null, lightStatusLabel/panelStatusLabel/
+    batteryStatusLabel/overallStatusLabel showing "Not Reporting"/"Not
+    Reporting 48H" as appropriate, and connectedLabel reflecting
+    isOnline/lastUpdate per its own independent rules.
+
     electricCurrentAverage is popped back out before merging into this
-    dict below, rather than this shared function ever being asked to
-    return only four keys for this one caller -- keeping
-    compute_pole_status_labels()'s own contract simple and total, with
-    "which of the five to actually expose" left entirely up to each
-    caller.
+    dict below, rather than that shared helper ever being asked to
+    return fewer keys for this one caller -- keeping its own contract
+    simple and total, with "which fields to actually expose" left
+    entirely up to each caller. (isOpenIssueFault is untouched by any of
+    this -- see _POLE_SUMMARY_SQL_TEMPLATE's own comment: it's read
+    directly from PoleOpenIssues, independent of lastUpdate/telemetry
+    staleness entirely, same as pole_vitals_api.py's own per-pole detail
+    query.)
     """
     (
         project_id,
@@ -226,8 +245,36 @@ def _summary_row_to_dict(row) -> dict:
         customer_id,
     ) = row
 
-    status_labels = compute_pole_status_labels(
-        has_telemetry=last_update is not None,
+    # Same staleness override as pole_vitals_api._pole_row_to_dict()
+    # applies to its own four fault fields and raw sensor fields --
+    # replicated here (rather than assuming _compute_pole_vitals_
+    # status_fields() below does it) since that helper only computes
+    # the LABEL fields (lightStatusLabel/panelStatusLabel/
+    # batteryStatusLabel/connectedLabel/overallStatusLabel/
+    # electricCurrentAverage/panelIdleReason) -- isLedFault/
+    # isBatteryFault/isPanelFault/isPoleFault and the raw
+    # lampPower/batteryElecCurrent/solarBoard readings are this
+    # function's own separate local variables, nulled directly here.
+    # isOpenIssueFault is untouched, same reasoning as
+    # pole_vitals_api.py's own version: sourced independently from
+    # PoleOpenIssues (see _POLE_SUMMARY_SQL_TEMPLATE's own comment), not
+    # from PoleTelemetry, so telemetry staleness says nothing about it.
+    if compute_reporting_staleness_label(last_update) is not None:
+        is_led_fault = None
+        is_battery_fault = None
+        is_panel_fault = None
+        is_pole_fault = None
+        lamp_power_1 = None
+        lamp_power_2 = None
+        battery_elec_current_1 = None
+        battery_elec_current_2 = None
+        solar_board_voltage = None
+        solar_board_elec_current = None
+
+    status_fields = _compute_pole_vitals_status_fields(
+        last_update=last_update,
+        is_online=is_online,
+        is_pole_fault=is_pole_fault,
         lamp_power_1=lamp_power_1,
         lamp_power_2=lamp_power_2,
         battery_elec_current_1=battery_elec_current_1,
@@ -236,7 +283,8 @@ def _summary_row_to_dict(row) -> dict:
         solar_board_elec_current=solar_board_elec_current,
         is_daylight_for_panel_fault=is_daylight_for_panel_fault,
     )
-    status_labels.pop("electricCurrentAverage", None)
+    status_fields.pop("electricCurrentAverage", None)
+
     sunset_time = json_safe(
         compute_pole_local_sunset(timezone_latitude, timezone_longitude, iana_timezone)
     )
@@ -262,7 +310,7 @@ def _summary_row_to_dict(row) -> dict:
         "sunsetTime": sunset_time,
         "projectId": json_safe(project_id),
         "customerId": json_safe(customer_id),
-        **status_labels,
+        **status_fields,
     }
 
 
@@ -348,15 +396,16 @@ def get_poles(
         # means "this pole, AND verify it belongs to this project",
         # not "poleId wins, projectId is silently ignored".
         conditions = []
-        # Both templates below now have TWO period-type placeholders,
-        # not one -- rps (LastKnown48Hours, first) for most fields,
-        # rps_online (Last48Hours, second) for IsOnline specifically --
-        # see _POLE_DETAILS_SQL_TEMPLATE's own comment on rps_online (and
-        # _POLE_SUMMARY_SQL_TEMPLATE's matching one) for why that one
-        # field reverts to the rollup's own period type. Both templates
-        # share this exact same two-parameter prefix, so this single
-        # params list serves either one.
-        params = [_POLE_DETAIL_PERIOD_TYPE, _ROLLUP_PERIOD_TYPE]
+        # Both templates now have a SINGLE period-type placeholder --
+        # rps, bound to _ROLLUP_PERIOD_TYPE, used for isOnline AND every
+        # other detail field alike (a separate LastKnown48Hours-driven
+        # rps_online join used to exist here; removed entirely by
+        # explicit request/correction -- a silent pole now gets null for
+        # every one of these fields uniformly, not a last-known
+        # fallback). Both templates share this exact same
+        # one-parameter prefix, so this single params list serves either
+        # one.
+        params = [_ROLLUP_PERIOD_TYPE]
         if pole_id:
             conditions.append("p.Id = ?")
             params.append(pole_id)
@@ -385,7 +434,7 @@ def get_poles(
         # shape ever changes to produce more than one row per pole again.
         where_clause = "WHERE p.Id IN (SELECT TOP (?) Id FROM Poles ORDER BY PoleNumber)"
         row_limit = _clamp_summary_limit(limit) if summary else clamp_limit(limit)
-        params = [_POLE_DETAIL_PERIOD_TYPE, _ROLLUP_PERIOD_TYPE, row_limit]
+        params = [_ROLLUP_PERIOD_TYPE, row_limit]
         if active is not None:
             where_clause += " AND p.Active = ?"
             params.append(1 if active else 0)

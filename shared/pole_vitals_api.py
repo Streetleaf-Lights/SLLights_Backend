@@ -1,48 +1,35 @@
-from shared.api_utils import clamp_limit, compute_pole_local_sunset, compute_pole_status_labels, json_safe
+from shared.api_utils import (
+    clamp_limit,
+    compute_pole_local_sunset,
+    compute_pole_status_labels,
+    compute_pole_connectivity_labels,
+    compute_reporting_staleness_label,
+    json_safe,
+)
 from shared.sql_client import get_connection
 
-# Which PoleVitals period type drives the ROLLUP classification
-# (totalLights/connectedLights/totalFaults/percentWorking) -- Last48Hours
-# specifically, not Hour: it's a single, continuously updated row per
-# pole (see pole_vitals_loader.py's own module docstring for why that
-# period type is structured that way), so reading it directly IS "what's
-# each pole's status right now" -- no window aggregation needed here at
-# all, unlike the Hour-based rolling-window design this replaced.
+# Which PoleVitals period type drives BOTH the rollup classification
+# (totalLights/connectedLights/totalFaults/percentWorking) AND every
+# per-pole detail field (isOnline/isPoleFault/isPanelFault/isLedFault/
+# isBatteryFault/isOpenIssueFault/avgBatteryPercentage/avgPanelPercentage/
+# avgLightPercentage) -- Last48Hours specifically, not Hour: it's a
+# single, continuously updated row per pole (see pole_vitals_loader.py's
+# own module docstring for why that period type is structured that way),
+# so reading it directly IS "what's each pole's status right now" -- no
+# window aggregation needed here at all, unlike the Hour-based
+# rolling-window design this replaced.
 #
-# Deliberately NOT LastKnown48Hours, unlike _POLE_DETAIL_PERIOD_TYPE
-# below -- a silent pole's LastKnown48Hours.IsOnline reflects whether it
-# was online during its own LAST KNOWN window, not whether it's online
-# RIGHT NOW, so counting that toward connectedLights/totalFaults would
-# silently resurrect a long-silent pole into the "currently connected"/
-# "currently faulty" status it's specifically meant to exclude from
-# (totalLights itself no longer depends on this at all -- see
-# _FETCH_SQL_TEMPLATE's own comment -- but connectedLights/totalFaults
-# both still do). This is a deliberate choice, made explicitly for this
-# rollup -- see _POLE_DETAIL_PERIOD_TYPE's own comment for why the
-# per-pole detail fields make the opposite choice.
+# A pole with no CURRENT Last48Hours row (gone silent -- no telemetry at
+# all within the rolling 48-hour window) gets NULL for every one of the
+# per-pole detail fields above, via the LEFT JOIN below -- genuinely
+# null, not a fallback to whatever that pole's own last-known values used
+# to be. A separate period type (LastKnown48Hours) used to persist a
+# silent pole's last-known state specifically to avoid that null; it was
+# removed entirely by explicit request/correction -- null is now the
+# correct, intended signal for "this pole isn't currently reporting",
+# for every per-pole field, including the ones that previously fell back
+# to stale last-known values.
 _ROLLUP_PERIOD_TYPE = "Last48Hours"
-
-# Which PoleVitals period type drives the PER-POLE detail fields
-# (isPoleFault/isPanelFault/isLedFault/isBatteryFault/isOpenIssueFault/
-# avgBatteryPercentage/avgPanelPercentage/avgLightPercentage) -- NOT the
-# same as _ROLLUP_PERIOD_TYPE above, and deliberately so: Last48Hours has
-# no row at all for a pole that's gone silent (see
-# _LAST_48_HOURS_STALE_ROW_PRUNE_SQL in pole_vitals_loader.py), which
-# would otherwise leave every one of these fields NULL for that pole --
-# not "unknown", just silently missing, with no way for a caller to tell
-# the difference between "we don't know" and "everything's fine".
-# LastKnown48Hours persists for exactly this case (identical to
-# Last48Hours for a currently-active pole, but a fresh rollup of that
-# pole's own last-known 48 hours of activity once it goes silent -- see
-# pole_vitals_loader.py's own comments on
-# _LAST_KNOWN_48_HOURS_COPY_FROM_LAST_48_HOURS_SQL and
-# _LAST_KNOWN_48_HOURS_FRESH_COMPUTE_FOR_OFFLINE_POLES_SQL), so a silent
-# pole's detail fields still show its actual last-known state instead of
-# NULL. For a currently-active pole this produces the exact same values
-# as _ROLLUP_PERIOD_TYPE would, since LastKnown48Hours is a direct copy
-# of that same pole's own Last48Hours row in that case -- the difference
-# only shows up for a silent pole.
-_POLE_DETAIL_PERIOD_TYPE = "LastKnown48Hours"
 
 # One row per Project (with its Customer attached), aggregating over
 # every Pole belonging to that project and each pole's own Last48Hours
@@ -159,17 +146,12 @@ ORDER BY c.Name, proj.Name
 # aggregate query, so both queries stay scoped identically.
 #
 # RecentPoleStats here is now a plain, unaggregated SELECT (no GROUP BY
-# at all) -- both Last48Hours and LastKnown48Hours are structurally
-# always 0-or-1 rows per LocationId (see pole_vitals_loader.py's
-# _LAST_48_HOURS_MERGE_SQL and _LAST_KNOWN_48_HOURS_COPY_FROM_LAST_48_
-# HOURS_SQL/_LAST_KNOWN_48_HOURS_FRESH_COMPUTE_FOR_OFFLINE_POLES_SQL --
-# each matches PoleVitals on LocationId+PeriodType alone, no PeriodStart,
-# so there's exactly one row per pole for either period type), so
+# at all) -- Last48Hours is structurally always 0-or-1 rows per
+# LocationId (see pole_vitals_loader.py's own _LAST_48_HOURS_MERGE_SQL --
+# it matches PoleVitals on LocationId+PeriodType alone, no PeriodStart,
+# so there's exactly one row per pole, or none for a silent one), so
 # there's nothing to aggregate across the way the old Hour-window design
-# needed to. This query specifically reads _POLE_DETAIL_PERIOD_TYPE
-# (LastKnown48Hours), NOT _ROLLUP_PERIOD_TYPE (Last48Hours) -- see both
-# constants' own comments for why the two queries in this file
-# deliberately read different period types.
+# needed to.
 #
 # CAST(...AS BIT) on every fault/IsOnline column matters, not decorative:
 # PoleVitals.IsOnline/IsLedFault/etc. are already BIT columns, so
@@ -247,11 +229,21 @@ SELECT
     ptz.Latitude AS TimeZoneLatitude,
     ptz.Longitude AS TimeZoneLongitude,
     ptz.IanaTimeZone AS IanaTimeZone,
-    rps_online.IsOnline AS IsOnline,
+    rps.IsOnline AS IsOnline,
     rps.IsLedFault AS IsLedFault,
     rps.IsBatteryFault AS IsBatteryFault,
     rps.IsPanelFault AS IsPanelFault,
-    rps.IsOpenIssueFault AS IsOpenIssueFault,
+    -- Reads directly from PoleOpenIssues, NOT rps -- deliberately
+    -- decoupled from the Last48Hours join (and therefore from telemetry
+    -- recency entirely), per explicit request: whether a pole has an
+    -- open issue is a current fact about the POLE, unrelated to whether
+    -- it's reported telemetry in the last 48 hours. Always TRUE or
+    -- FALSE, never NULL, regardless of whether rps itself has a
+    -- matching row -- unlike every other field on this line, which
+    -- comes back NULL for a pole with no current Last48Hours row.
+    CASE WHEN EXISTS (
+        SELECT 1 FROM PoleOpenIssues poi WHERE poi.PoleId = p.Id
+    ) THEN CAST(1 AS BIT) ELSE CAST(0 AS BIT) END AS IsOpenIssueFault,
     rps.IsPoleFault AS IsPoleFault,
     rps.AvgBatteryPercentage AS BatteryPercentage,
     rps.AvgPanelPercentage AS PanelPercentage,
@@ -261,19 +253,6 @@ FROM Poles p
 JOIN Projects proj ON p.ProjectId = proj.Id
 JOIN Customers c ON proj.CustomerId = c.Id
 LEFT JOIN PoleVitals rps ON p.LocationId = rps.LocationId AND rps.PeriodType = ?
--- Deliberately a SECOND join, not reusing rps above -- IsOnline
--- specifically reverts to _ROLLUP_PERIOD_TYPE (Last48Hours), while
--- every other field above stays on _POLE_DETAIL_PERIOD_TYPE
--- (LastKnown48Hours). A silent pole's LastKnown48Hours.IsOnline would
--- reflect whether it was online during its own LAST KNOWN window, not
--- whether it's online RIGHT NOW -- actively misleading for this one
--- field specifically (a UI showing "isOnline: true" for a pole that
--- hasn't reported in two weeks), unlike the fault flags/percentages
--- above, where showing last-known state instead of NULL is still
--- useful context, not misleading. Same underlying reasoning as
--- _ROLLUP_PERIOD_TYPE's own choice for the rollup query -- just applied
--- to this one specific per-pole field instead of the whole rollup.
-LEFT JOIN PoleVitals rps_online ON p.LocationId = rps_online.LocationId AND rps_online.PeriodType = ?
 LEFT JOIN PoleTimeZones ptz ON p.LocationId = ptz.LocationId
 OUTER APPLY (
     SELECT TOP 1
@@ -326,29 +305,21 @@ def _pole_row_to_dict(row) -> dict:
     """Converts one row from _POLE_DETAILS_SQL_TEMPLATE into its own
     dict for a project's "poles" list.
 
-    isLedFault/isBatteryFault/isPanelFault/isOpenIssueFault/isPoleFault,
-    and the three avg*Percentage fields, all come directly from that
-    pole's own PoleVitals row for _POLE_DETAIL_PERIOD_TYPE
-    (LastKnown48Hours, NOT _ROLLUP_PERIOD_TYPE/Last48Hours -- see both
-    constants' own comments for why these two intentionally differ).
-    For a currently-active pole this is identical to its Last48Hours row
-    (LastKnown48Hours is a direct copy in that case); for a pole that's
-    gone silent, it's that SAME pole's own last-known 48 hours of
-    activity instead of NULL -- None (JSON null) only for a pole with NO
-    PoleVitals row of either period type at all yet (installed, but no
-    telemetry ever processed for it), not merely for one that's
-    currently offline.
-
-    isOnline is the ONE EXCEPTION to the above -- it comes from a
-    SEPARATE PoleVitals join (rps_online in _POLE_DETAILS_SQL_TEMPLATE),
-    still reading _ROLLUP_PERIOD_TYPE (Last48Hours), same as the rollup
-    query. A silent pole's LastKnown48Hours.IsOnline would reflect
-    whether it was online during its own last-known window, not whether
-    it's online RIGHT NOW -- actively misleading for this one field
-    specifically, unlike the fault flags/percentages above where
-    last-known state is still useful context. So isOnline is None for a
-    silent pole (no current Last48Hours row), even though every other
-    field on that same pole still shows its last-known value.
+    isOnline/isLedFault/isBatteryFault/isPanelFault/isOpenIssueFault/
+    isPoleFault, and the three avg*Percentage fields, all come from that
+    pole's own CURRENT Last48Hours PoleVitals row (_ROLLUP_PERIOD_TYPE)
+    via a single LEFT JOIN -- None (JSON null) for EVERY one of these
+    fields when a pole has no current Last48Hours row, whether that's
+    because it's genuinely gone silent (no telemetry within the rolling
+    48-hour window) or because it's never reported at all. A separate
+    period type (LastKnown48Hours) used to persist a silent pole's
+    last-known values here instead of null; it was removed entirely by
+    explicit request/correction -- null is now the correct, intended
+    signal for "not currently reporting", uniformly across every one of
+    these fields (isOnline included -- it was already null-for-silent
+    even before that removal, since it always read this same
+    _ROLLUP_PERIOD_TYPE join; the other fields now match that same
+    behavior instead of falling back to stale data).
 
     installDate/lat/long come straight from Poles -- static install-time
     facts, not derived from any telemetry or vitals aggregation.
@@ -417,6 +388,62 @@ def _pole_row_to_dict(row) -> dict:
         light_percentage,
         _,  # CustomerId -- see docstring above for why this is discarded here
     ) = row
+
+    # Per explicit request: these four fault-related fields go null
+    # whenever lastUpdate is null OR more than 48 hours old -- a fault
+    # reading tied to telemetry that old (or nonexistent) isn't
+    # trustworthy as a CURRENT fault state, same reasoning as
+    # overallStatusLabel/lightStatusLabel/etc.'s own staleness override
+    # below. Two fields are deliberately EXCLUDED from this override:
+    #   isOnline      -- wasn't named in the request, and connectedLabel's
+    #                    own logic already reads is_online directly
+    #                    regardless of staleness (see
+    #                    api_utils.compute_pole_connectivity_labels()).
+    #   isOpenIssueFault -- sourced directly from PoleOpenIssues via its
+    #                    own independent EXISTS check in the SQL query
+    #                    itself (see _POLE_DETAILS_SQL_TEMPLATE's own
+    #                    comment), not from the rps/Last48Hours join at
+    #                    all -- always True or False, NEVER null,
+    #                    regardless of whether this pole even has a
+    #                    current Last48Hours row. Per a later, separate
+    #                    explicit request: whether a pole has an open
+    #                    issue is a current fact about the POLE, entirely
+    #                    unrelated to whether it's reported telemetry in
+    #                    the last 48 hours -- so this field doesn't
+    #                    merely skip the staleness override below, it's
+    #                    structurally incapable of being affected by it.
+    #
+    # Per a SEPARATE, later explicit request: the raw PoleTelemetry
+    # "single most recent reading" fields (batteryVoltage1/2, lampPower1/2,
+    # batteryElecCurrent1/2, solarBoardVoltage/solarBoardElecCurrent) ALSO
+    # go null under this same condition now -- these come from a
+    # genuinely different source than the four fault fields above (the
+    # OUTER APPLY's own TOP 1 PoleTelemetry row, not a PoleVitals rollup
+    # row), and or a long-silent pole that reading can be weeks old,
+    # making its own literal sensor values (e.g. a real "0.0" lamp power
+    # reading from three weeks ago) look deceptively like a CURRENT
+    # status rather than ancient history -- exactly the kind of
+    # misleading signal the staleness overrides elsewhere in this
+    # function exist to prevent. lastUpdate itself is deliberately NOT
+    # nulled -- it's the one field a caller actually needs in order to
+    # know how stale (or utterly absent) this pole's last reading was;
+    # nulling it too would remove the only piece of information that
+    # explains why everything else came back null.
+    is_stale = compute_reporting_staleness_label(last_update) is not None
+    if is_stale:
+        is_led_fault = None
+        is_battery_fault = None
+        is_panel_fault = None
+        is_pole_fault = None
+        battery_voltage_1 = None
+        battery_voltage_2 = None
+        lamp_power_1 = None
+        lamp_power_2 = None
+        battery_elec_current_1 = None
+        battery_elec_current_2 = None
+        solar_board_voltage = None
+        solar_board_elec_current = None
+
     return {
         "id": json_safe(pole_id),
         "poleNumber": json_safe(pole_number),
@@ -450,8 +477,10 @@ def _pole_row_to_dict(row) -> dict:
         "sunsetTime": json_safe(
             compute_pole_local_sunset(timezone_latitude, timezone_longitude, iana_timezone)
         ),
-        **compute_pole_status_labels(
-            has_telemetry=last_update is not None,
+        **_compute_pole_vitals_status_fields(
+            last_update=last_update,
+            is_online=is_online,
+            is_pole_fault=is_pole_fault,
             lamp_power_1=lamp_power_1,
             lamp_power_2=lamp_power_2,
             battery_elec_current_1=battery_elec_current_1,
@@ -459,6 +488,75 @@ def _pole_row_to_dict(row) -> dict:
             solar_board_voltage=solar_board_voltage,
             solar_board_elec_current=solar_board_elec_current,
             is_daylight_for_panel_fault=is_daylight_for_panel_fault,
+        ),
+    }
+
+
+def _compute_pole_vitals_status_fields(
+    last_update,
+    is_online,
+    is_pole_fault,
+    lamp_power_1,
+    lamp_power_2,
+    battery_elec_current_1,
+    battery_elec_current_2,
+    solar_board_voltage,
+    solar_board_elec_current,
+    is_daylight_for_panel_fault,
+) -> dict:
+    """
+    getPoleVitals-specific layer on top of api_utils.compute_pole_status_
+    labels()'s own five fields, per explicit request -- adds
+    connectedLabel/overallStatusLabel (see
+    api_utils.compute_pole_connectivity_labels()), and overrides
+    lightStatusLabel/panelStatusLabel/batteryStatusLabel specifically to
+    api_utils.compute_reporting_staleness_label()'s own "Not
+    Reporting"/"Not Reporting 48H" whenever that applies -- taking
+    priority over whatever compute_pole_status_labels() itself computed
+    from this pole's own (possibly stale) telemetry values.
+
+    panelIdleReason is NOT part of this override -- left exactly as
+    compute_pole_status_labels() itself returns it (still None when
+    there's no telemetry at all; still computed from the actual stale
+    reading's own values when telemetry exists but is >48h old), since
+    it wasn't named in either the request that introduced this staleness
+    override or the later one that added electricCurrentAverage/the raw
+    sensor fields to it.
+
+    electricCurrentAverage IS now part of this override (added per a
+    later, separate explicit request) -- forced to None whenever
+    staleness_label applies, rather than trusting whatever
+    compute_pole_status_labels() itself computed. This can't be left to
+    that function alone: by the time this is called, _pole_row_to_dict()
+    has already nulled the raw battery_elec_current_1/2 inputs for a
+    stale pole (see that function's own comment), and
+    compute_pole_status_labels() treats a null INDIVIDUAL reading as
+    zero for this average (not as "skip it") -- so passing (None, None)
+    would silently produce 0.0, not None, without this explicit
+    override.
+    """
+    status_labels = compute_pole_status_labels(
+        has_telemetry=last_update is not None,
+        lamp_power_1=lamp_power_1,
+        lamp_power_2=lamp_power_2,
+        battery_elec_current_1=battery_elec_current_1,
+        battery_elec_current_2=battery_elec_current_2,
+        solar_board_voltage=solar_board_voltage,
+        solar_board_elec_current=solar_board_elec_current,
+        is_daylight_for_panel_fault=is_daylight_for_panel_fault,
+    )
+
+    staleness_label = compute_reporting_staleness_label(last_update)
+    if staleness_label:
+        status_labels["lightStatusLabel"] = staleness_label
+        status_labels["panelStatusLabel"] = staleness_label
+        status_labels["batteryStatusLabel"] = staleness_label
+        status_labels["electricCurrentAverage"] = None
+
+    return {
+        **status_labels,
+        **compute_pole_connectivity_labels(
+            is_online=is_online, is_pole_fault=is_pole_fault, last_update=last_update
         ),
     }
 
@@ -554,21 +652,21 @@ def get_pole_vitals(customer_id: str = None, project_id: str = None, limit: int 
     e.g. polar day/night at extreme Alaska latitudes -- see that
     function's and shared/daylight_utils.get_sunset()'s own docstrings)
     --
-    isLedFault/isBatteryFault/isPanelFault/isOpenIssueFault/isPoleFault
-    and the three avg*Percentage fields, unlike the rollup stats above,
-    come from each pole's own LastKnown48Hours PoleVitals row,
-    _POLE_DETAIL_PERIOD_TYPE, so a silent pole still shows its actual
-    last-known state here instead of NULL, even though it's excluded
-    from totalLights/connectedLights above -- see
-    _POLE_DETAIL_PERIOD_TYPE's own comment for the full reasoning.
-    isOnline is the one exception among the per-pole fields -- it reads
-    Last48Hours (_ROLLUP_PERIOD_TYPE), same as the rollup stats, since a
-    silent pole's LastKnown48Hours.IsOnline would misleadingly reflect
-    its LAST KNOWN state, not whether it's online RIGHT NOW. A single,
-    continuously-updated row per pole either way -- see
-    pole_vitals_loader.py's own module docstring for why these period
-    types are structured that way; no window-aggregation happens at
-    this API layer at all anymore).
+    isLedFault/isBatteryFault/isPanelFault/isOpenIssueFault/isPoleFault,
+    isOnline, and the three avg*Percentage fields all come from that
+    pole's own CURRENT Last48Hours PoleVitals row (_ROLLUP_PERIOD_TYPE)
+    -- the SAME period type driving the rollup stats above. A silent
+    pole (no current Last48Hours row) gets NULL for every one of these
+    fields, uniformly -- a separate period type (LastKnown48Hours) used
+    to persist a silent pole's last-known values instead of null; it was
+    removed entirely by explicit request/correction, so null is now the
+    correct, intended signal here, consistent with that same pole
+    already being excluded from totalLights/connectedLights above for
+    the same underlying reason (see _ROLLUP_PERIOD_TYPE's own comment).
+    A single, continuously-updated row per pole -- see
+    pole_vitals_loader.py's own module docstring for why this period
+    type is structured that way; no window-aggregation happens at this
+    API layer at all anymore.
 
     Rollup design: totalLights counts EVERY pole belonging to the
     project, full stop -- no IsOnline/IsOpenIssueFault filtering.
@@ -644,20 +742,6 @@ def get_pole_vitals(customer_id: str = None, project_id: str = None, limit: int 
         where_clause = "WHERE c.Id IN (SELECT TOP (?) Id FROM Customers ORDER BY Name)"
         params = (_ROLLUP_PERIOD_TYPE, clamp_limit(limit))
 
-    # Same shape as params above, EXCEPT the period type(s) -- the rollup
-    # query (immediately below) and the per-pole detail query (further
-    # below) deliberately read DIFFERENT PoleVitals period types now;
-    # see _ROLLUP_PERIOD_TYPE/_POLE_DETAIL_PERIOD_TYPE's own comments for
-    # why. The detail query's own SQL now has TWO period-type
-    # placeholders, not one -- rps (LastKnown48Hours, first) for most
-    # fields, rps_online (Last48Hours, second) for IsOnline specifically
-    # -- see _POLE_DETAILS_SQL_TEMPLATE's own comment on rps_online for
-    # why that one field reverts to the rollup's own period type.
-    # project_id/customer_id/limit's own position and value are
-    # identical to params either way -- only these first two elements
-    # differ (one element in params, two here).
-    pole_detail_params = (_POLE_DETAIL_PERIOD_TYPE, _ROLLUP_PERIOD_TYPE) + params[1:]
-
     conn = get_connection()
     cursor = conn.cursor()
     try:
@@ -667,15 +751,15 @@ def get_pole_vitals(customer_id: str = None, project_id: str = None, limit: int 
         )
         rows = cursor.fetchall()
 
-        # Same where_clause as above, but pole_detail_params (not
-        # params) -- see this function's own comment on that variable,
-        # and _POLE_DETAIL_PERIOD_TYPE's own comment, for why these two
-        # queries deliberately read different PoleVitals period types
-        # now (see _POLE_DETAILS_SQL_TEMPLATE's own comment for why this
-        # is a separate query rather than merged into the one above).
+        # Same where_clause AND same params as the rollup query above --
+        # both queries now read the SAME single PoleVitals period type
+        # (_ROLLUP_PERIOD_TYPE), so there's no longer a separate
+        # pole_detail_params to bind here. See _POLE_DETAILS_SQL_TEMPLATE's
+        # own comment for why this remains a separate query rather than
+        # merged into the one above.
         cursor.execute(
             _POLE_DETAILS_SQL_TEMPLATE.format(where_clause=where_clause),
-            *pole_detail_params,
+            *params,
         )
         pole_rows = cursor.fetchall()
     finally:
@@ -750,23 +834,22 @@ def get_pole_vitals(customer_id: str = None, project_id: str = None, limit: int 
 # --------------------------------------------------------------------------
 # get_pole_vitals_by_period() -- a genuinely different kind of query from
 # get_pole_vitals() above: that one reads each pole's own current-state
-# PoleVitals row(s) directly (Last48Hours for the rollup stats,
-# LastKnown48Hours for the per-pole detail fields -- see
-# _ROLLUP_PERIOD_TYPE/_POLE_DETAIL_PERIOD_TYPE's own comments for why --
-# no window/aggregation at all either way, since both are already a
-# single row per pole). This one returns a pole's FULL HISTORY of
-# PoleVitals rows for a CALLER-CHOSEN period type -- Hour is the ONLY
-# one this endpoint still supports (Day was removed from PoleVitals
-# entirely by explicit request; Last48Hours/LastKnown48Hours were never
-# valid here to begin with -- see below), each read directly, exactly
-# as stored.
+# Last48Hours PoleVitals row directly (_ROLLUP_PERIOD_TYPE, used for
+# both the rollup stats and every per-pole detail field alike -- see
+# that constant's own comment for why -- no window/aggregation at all,
+# since it's already a single row per pole, or none for a silent one).
+# This one returns a pole's FULL HISTORY of PoleVitals rows for a
+# CALLER-CHOSEN period type -- Hour is the ONLY one this endpoint still
+# supports (Day was removed from PoleVitals entirely by explicit
+# request; Last48Hours was never valid here to begin with -- see below),
+# each read directly, exactly as stored.
 
 # Valid PoleVitals period types for THIS function specifically --
-# 'Hour' is genuinely the only one now: Last48Hours and LastKnown48Hours
-# are both deliberately excluded (each is a single current-state row,
-# not a history to page through, so "give me its history" doesn't apply
-# to either), and 'Day' was removed from PoleVitals altogether. This
-# tuple is still checked explicitly, rather than assuming period_type is
+# 'Hour' is genuinely the only one now: Last48Hours is deliberately
+# excluded (a single current-state row, not a history to page through,
+# so "give me its history" doesn't apply to it), and 'Day' was removed
+# from PoleVitals altogether. This tuple is still checked explicitly,
+# rather than assuming period_type is
 # always 'Hour', so a caller passing anything else (a typo, or a
 # removed/never-valid value like 'Day' or 'Week') still gets a clear
 # ValueError instead of silently querying the wrong thing.
@@ -819,92 +902,106 @@ OUTER APPLY (
 WHERE p.Id = ?
 """
 
-# The Hour-specific variant of the query below -- ALSO bounds the
-# result to a genuine window ending at this pole's own latest reading,
-# not just the newest N rows regardless of how far back they actually
-# reach. Confirmed as a real, practical difference: Hour buckets aren't
-# guaranteed contiguous -- a pole that went offline for a stretch has
-# GAPS in its own PeriodStart sequence, so "TOP N rows" alone could
-# silently reach back well past N real hours to fill in for the missing
-# ones. This template accepts that tradeoff deliberately: fewer than N
-# entries when there are real gaps within the window, rather than
-# papering over those gaps by reaching further into history than the
-# caller actually asked for.
+# The Hour-specific variant of the query below -- generates a FULL,
+# CONTIGUOUS sequence of `limit` hourly buckets ending at the CURRENT
+# hour (SYSDATETIMEOFFSET(), truncated down to its own top-of-hour, in
+# THIS POLE'S OWN local timezone -- matching exactly how
+# pole_vitals_loader.py's own Hour rollup truncates BucketStart), and
+# LEFT JOINs PoleVitals onto that generated sequence rather than
+# selecting PoleVitals rows directly. Per explicit request/correction:
+# an earlier version of this anchored the window to THIS POLE'S OWN most
+# recent PoleTelemetry reading instead of "now", specifically so a pole
+# that had gone silent would still show its own last known activity
+# rather than an empty list. That reasoning is now explicitly reversed:
+# a pole that's gone silent should show REAL gaps -- an actual missing
+# hour, with PeriodStart/PeriodEnd populated and every average/fault
+# field null -- not a window quietly anchored to whenever it last
+# happened to report. "Truly from now" per that request.
 #
-# The window width is DERIVED FROM limit itself, not a fixed constant --
-# confirmed in practice as a real bug in an earlier version of this
-# query, which hard-coded "-48" regardless of what limit the caller
-# passed, so a caller asking for limit=168 (or any value past 48) would
-# silently still only ever get up to 48 hours' worth back, no matter how
-# much more was actually available. limit hourly buckets, with no gaps,
-# span exactly limit hours -- so bounding the window to limit hours back
-# is the natural generalization: it can only additionally narrow the
-# result on top of TOP (?) when there ARE gaps, never silently widen it
-# past what the caller asked for. This does mean limit is bound TWICE in
-# this one query (once for TOP (?), once for this DATEADD) -- the same
-# value, not two different ones.
+# Numbers is a classic recursive tally-number generator (0, 1, 2, ...,
+# limit-1) -- OPTION (MAXRECURSION 0) is required since limit can reach
+# MAX_LIMIT (1000), well past SQL Server's default 100-level recursion
+# cap.
 #
-# The window is anchored to THIS POLE'S OWN most recent PoleTelemetry
-# reading (PoleContext's own MaxLastUpload subquery) -- deliberately NOT
-# to SYSDATETIMEOFFSET()/"now". A pole that's gone completely offline
-# would otherwise return an empty "vitals" list forever once its last
-# real reading falls more than limit hours behind the actual current
-# time -- exactly the case this anchor exists to handle: still show that
-# pole's own last known activity, ending at the last moment it was
-# actually working, rather than nothing at all just because time has
-# moved on since then. For a pole that's actively reporting, this
-# produces the same practical result as anchoring to "now" would -- its
-# own latest reading and the current moment are closely tracking each
-# other -- so this isn't a behavior change for the common case, only for
-# the "gone silent" one.
+# Buckets cross-joins those offsets onto PoleContext's own
+# CurrentBucketStart to produce exactly `limit` distinct BucketStart
+# values, each `limit` counted backward from the current hour -- one row
+# per hour, guaranteed contiguous by construction (not dependent on
+# PoleVitals actually having a row there).
 #
-# The sentinel exclusion ('9999-12-31 23:59:59.999 +00:00') is a
-# hardcoded literal, not a bound parameter -- matches the same
-# established precedent in pole_daylight_flags_loader.py's own
-# _FIND_UNFLAGGED_SQL, rather than importing
-# pole_telemetry_loader._MISSING_LAST_UPLOAD_SENTINEL here (which would
-# transitively pull leadsun_client, and its own LEADSUN_CLIENT_CERT_PEM
-# requirement, into this otherwise Leadsun-independent, read-only API
-# module for a single string literal).
+# The final SELECT LEFT JOINs PoleVitals onto those generated buckets
+# (matched on LocationId + PeriodType='Hour' + PeriodStart) instead of
+# the reverse (selecting PoleVitals and filtering) -- this is what makes
+# a genuinely missing hour still produce its own row, with every
+# PoleVitals-sourced column coming back NULL via the LEFT JOIN's own
+# standard NULL-for-no-match behavior, rather than being silently
+# absent from the result set entirely.
 #
-# A pole with NO PoleTelemetry rows at all (MaxLastUpload NULL) simply
-# matches nothing below (PeriodStart >= NULL is UNKNOWN, never TRUE) --
-# correctly empty, and consistent with that same pole having no
-# PoleVitals rows to derive from in the first place.
+# PeriodStart/PeriodEnd on the OUTPUT side are computed from the
+# generated BucketStart (via the same "AT TIME ZONE TimeZoneName"
+# conversion the loader itself uses), NOT read from pv.PeriodStart/
+# pv.PeriodEnd -- necessary specifically for the gap case, where
+# pv.PeriodStart/pv.PeriodEnd would otherwise come back NULL (no
+# PoleVitals row to read them from) even though the bucket's own
+# start/end time is perfectly well known from the generated sequence
+# itself.
 #
-# 'Hour' is a hardcoded literal, not a bound parameter, here -- this
-# template is only ever selected in Python when period_type == "Hour",
-# so there's nothing to parameterize.
+# 'Hour' is a hardcoded literal, not a bound parameter, in both the
+# BucketStart-truncation logic (matching the loader's own convention)
+# and the LEFT JOIN condition -- this template is only ever selected in
+# Python when period_type == "Hour", so there's nothing to parameterize.
 #
-# Day intentionally does NOT get an equivalent bounded window here (see
-# get_pole_vitals_by_period()'s own docstring) -- it keeps using
-# _POLE_VITALS_HISTORY_SQL_TEMPLATE below, a pure row-count limit with
-# no time bound at all.
+# Day intentionally does NOT get an equivalent generated/gap-filled
+# window here (see get_pole_vitals_by_period()'s own docstring) -- it
+# keeps using _POLE_VITALS_HISTORY_SQL_TEMPLATE below, a pure row-count
+# limit with no time bound or gap-filling at all.
 #
-# Parameter order (forced by the CTE coming first, textually, in T-SQL):
-# pole_id (for PoleContext's own WHERE p.Id = ?), THEN limit TWICE (once
-# for the main query's TOP (?), once for the DATEADD window bound) --
-# the opposite order, and now one extra parameter, from
-# _POLE_VITALS_HISTORY_SQL_TEMPLATE's own call site below, which binds
-# limit once, after pole_id. Easy to get backwards;
-# get_pole_vitals_by_period()'s own call site binds these in this exact
-# order deliberately.
+# Parameter order (forced by the CTEs coming first, textually, in
+# T-SQL): pole_id (for PoleContext's own WHERE p.Id = ?), THEN limit
+# ONCE (for the Numbers CTE's own upper bound -- this template no longer
+# double-binds limit the way its predecessor did, since there's no
+# separate TOP (?) anymore: the Numbers CTE itself is now the only thing
+# controlling row count, generating exactly `limit` rows by
+# construction).
 _POLE_VITALS_HOUR_HISTORY_SQL_TEMPLATE = """
 ;WITH PoleContext AS (
     SELECT
         p.LocationId,
-        (
-            SELECT MAX(pt.LastUpload)
-            FROM PoleTelemetry pt
-            WHERE pt.LocationId = p.LocationId
-              AND pt.LastUpload <> '9999-12-31 23:59:59.999 +00:00'
-        ) AS MaxLastUpload
+        ISNULL(ptz.WindowsTimeZone, 'Eastern Standard Time') AS TimeZoneName
     FROM Poles p
+    LEFT JOIN PoleTimeZones ptz ON p.LocationId = ptz.LocationId
     WHERE p.Id = ?
+),
+CurrentBucket AS (
+    SELECT
+        LocationId,
+        TimeZoneName,
+        DATEADD(
+            HOUR,
+            DATEDIFF(
+                HOUR, '19000101',
+                CAST(SYSDATETIMEOFFSET() AT TIME ZONE TimeZoneName AS DATETIME2(3))
+            ),
+            '19000101'
+        ) AS CurrentBucketStart
+    FROM PoleContext
+),
+Numbers AS (
+    SELECT 0 AS n
+    UNION ALL
+    SELECT n + 1 FROM Numbers WHERE n < ? - 1
+),
+Buckets AS (
+    SELECT
+        cb.LocationId,
+        cb.TimeZoneName,
+        DATEADD(HOUR, -n.n, cb.CurrentBucketStart) AS BucketStart
+    FROM CurrentBucket cb
+    CROSS JOIN Numbers n
 )
-SELECT TOP (?)
-    pv.PeriodStart AS PeriodStart,
-    pv.PeriodEnd AS PeriodEnd,
+SELECT
+    b.BucketStart AT TIME ZONE b.TimeZoneName AS PeriodStart,
+    DATEADD(HOUR, 1, b.BucketStart) AT TIME ZONE b.TimeZoneName AS PeriodEnd,
     pv.IsOnline AS IsOnline,
     pv.IsLedFault AS IsLedFault,
     pv.IsBatteryFault AS IsBatteryFault,
@@ -914,11 +1011,13 @@ SELECT TOP (?)
     pv.AvgBatteryPercentage AS AvgBatteryPercentage,
     pv.AvgPanelPercentage AS AvgPanelPercentage,
     pv.AvgLightPercentage AS AvgLightPercentage
-FROM PoleVitals pv
-JOIN PoleContext pc ON pv.LocationId = pc.LocationId
-WHERE pv.PeriodType = 'Hour'
-  AND pv.PeriodStart >= DATEADD(HOUR, -1 * ?, pc.MaxLastUpload)
-ORDER BY pv.PeriodStart DESC
+FROM Buckets b
+LEFT JOIN PoleVitals pv
+    ON pv.LocationId = b.LocationId
+   AND pv.PeriodType = 'Hour'
+   AND pv.PeriodStart = (b.BucketStart AT TIME ZONE b.TimeZoneName)
+ORDER BY b.BucketStart DESC
+OPTION (MAXRECURSION 0)
 """
 
 
@@ -973,42 +1072,42 @@ def get_pole_vitals_by_period(pole_id: str, period_type: str, limit: int = None)
     period_type: must be 'Hour' -- the only period type this endpoint
     still supports (see _VALID_PERIOD_TYPES' own comment: 'Day' was
     removed from PoleVitals entirely by explicit request, and
-    Last48Hours/LastKnown48Hours were never valid here to begin with,
-    since each is a single current-state row, not a history to page
-    through). Raises ValueError for anything else; the HTTP layer maps
-    that to a 400.
+    Last48Hours was never valid here to begin with, since it's a single
+    current-state row, not a history to page through). Raises
+    ValueError for anything else; the HTTP layer maps that to a 400.
 
-    limit: max number of history entries returned, most-recent-first.
-    Defaults to DEFAULT_LIMIT, capped at MAX_LIMIT (see
-    shared/api_utils.py). This SAME value is ALSO used as a bound on top
-    of the row-count limit itself -- not a substitute for it -- so
-    PeriodStart must be within `limit` hours of this pole's own latest
-    PoleTelemetry reading. Hour buckets aren't guaranteed contiguous (a
-    pole that went offline for a stretch has gaps in its own PeriodStart
-    sequence), so without that bound, a plain "most recent N rows" limit
-    could silently reach back well past `limit` real hours to fill in
-    for the missing ones. Fewer than `limit` entries is expected and
-    correct when there are real gaps within that window, not a bug --
-    this deliberately doesn't paper over missing data by reaching
-    further into history than the caller actually asked for.
+    limit: max number of hourly buckets returned, most-recent-first,
+    always exactly `limit` entries -- one per hour, contiguous, counting
+    back from the CURRENT hour (see _POLE_VITALS_HOUR_HISTORY_SQL_TEMPLATE's
+    own comment for the truncation details). Defaults to DEFAULT_LIMIT,
+    capped at MAX_LIMIT (see shared/api_utils.py).
 
-    That window is anchored to the POLE'S OWN latest telemetry, not to
-    the current moment -- a pole that's gone completely offline still
-    returns its own last known activity (ending at the last moment it
-    was actually working) rather than an empty "vitals" list just
-    because real time has since moved past that pole's own last
-    reading. For an actively-reporting pole this produces the same
-    result either way, since its latest reading and "now" are closely
-    tracking each other -- the difference only shows up for a pole
-    that's stopped reporting.
+    That window is anchored to the CURRENT MOMENT (SYSDATETIMEOFFSET()),
+    NOT to this pole's own latest telemetry -- per explicit request/
+    correction, reversing an earlier version of this endpoint that
+    anchored to the pole's own last reading specifically so a silent
+    pole would still show its last known activity. Now, a genuinely
+    missing hour -- no PoleVitals row at all for that bucket, whether
+    because the pole went offline, was installed partway through that
+    hour, or simply hasn't been processed yet -- still gets its OWN
+    entry in "vitals", with periodStart/periodEnd populated (computed
+    from the generated bucket sequence itself, not read from a
+    nonexistent PoleVitals row) and every other field (isOnline,
+    isLedFault, isBatteryFault, isPanelFault, isOpenIssueFault,
+    isPoleFault, avgBatteryPercentage, avgPanelPercentage,
+    avgLightPercentage) null. "vitals" is therefore always exactly
+    `limit` entries long -- never fewer, unlike this endpoint's earlier
+    behavior of silently omitting gap hours entirely.
 
     Returns None if no Pole exists with that id. If the pole exists but
     has no PoleTelemetry row yet, lastUpdate and the other
     latest-telemetry fields (lampPower1/2, batteryElecCurrent1/2,
-    solarBoardVoltage, solarBoardElecCurrent) come back null. If it has
-    no PoleVitals rows of the requested
-    period_type yet, "vitals" comes back as an empty list -- not an
-    error, and not a 404.
+    solarBoardVoltage, solarBoardElecCurrent) come back null -- but
+    "vitals" still comes back as a full `limit`-length list of
+    all-null-except-periodStart/periodEnd entries (this endpoint no
+    longer depends on PoleTelemetry existing at all to produce its hour
+    sequence, since that sequence is generated from the current moment,
+    not from the pole's own telemetry history).
     """
     if period_type not in _VALID_PERIOD_TYPES:
         raise ValueError(f"periodType must be one of: {', '.join(_VALID_PERIOD_TYPES)}")
@@ -1022,17 +1121,21 @@ def get_pole_vitals_by_period(pole_id: str, period_type: str, limit: int = None)
             return None
 
         # 'Hour' is the only period type left -- see _VALID_PERIOD_TYPES'
-        # own comment. This template adds an ADDITIONAL bound, anchored
-        # to this pole's own latest telemetry rather than "now" (see
-        # _POLE_VITALS_HOUR_HISTORY_SQL_TEMPLATE's own comment for why),
-        # sized to limit itself rather than a fixed 48 hours (a real bug
-        # this once had -- see that same comment).
+        # own comment. This template generates a full, contiguous,
+        # gap-filled sequence of `limit` hourly buckets anchored to the
+        # CURRENT moment -- see _POLE_VITALS_HOUR_HISTORY_SQL_TEMPLATE's
+        # own comment for why (a request/correction reversing this
+        # endpoint's earlier "anchor to the pole's own last reading"
+        # behavior). Only ONE limit parameter now (the Numbers CTE's own
+        # upper bound) -- no more double-binding the same value for both
+        # a TOP (?) and a separate DATEADD window bound, since the
+        # generated bucket sequence itself is what controls row count
+        # now, not a filter on top of PoleVitals' own rows.
         hour_limit = clamp_limit(limit)
         cursor.execute(
             _POLE_VITALS_HOUR_HISTORY_SQL_TEMPLATE,
             pole_id,
-            hour_limit,  # TOP (?)
-            hour_limit,  # DATEADD(HOUR, -1 * ?, ...) -- the SAME value, not a second one
+            hour_limit,
         )
         vitals_rows = cursor.fetchall()
     finally:

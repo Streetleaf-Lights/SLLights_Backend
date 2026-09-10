@@ -58,6 +58,16 @@ class TestPoleSummarySqlStructure:
         assert sql.count("OUTER APPLY") == 1
         assert sql.count("FROM PoleTelemetry") == 1
 
+    def test_is_open_issue_fault_reads_from_pole_open_issues_not_rps(self):
+        """Same fix as pole_vitals_api.py's own _POLE_DETAILS_SQL_TEMPLATE:
+        isOpenIssueFault must reflect whether a pole CURRENTLY has an
+        open issue, independent of the Last48Hours join/telemetry
+        recency -- never null, unlike every other fault field."""
+        sql = m._POLE_SUMMARY_SQL_TEMPLATE
+        assert "rps.IsOpenIssueFault" not in sql
+        assert "SELECT 1 FROM PoleOpenIssues poi WHERE poi.PoleId = p.Id" in sql
+        assert "THEN CAST(1 AS BIT) ELSE CAST(0 AS BIT) END AS IsOpenIssueFault" in sql
+
 
 def _summary_row(
     project_id="proj1",
@@ -142,7 +152,8 @@ class TestSummaryRowToDict:
             solar_board_voltage=18.0, solar_board_elec_current=2.0,
             is_daylight_for_panel_fault=1,
         )
-        result = m._summary_row_to_dict(row)
+        with freeze_time("2026-08-27 12:00:00"):
+            result = m._summary_row_to_dict(row)
         assert result["lightStatusLabel"] == "OFF"
         assert result["panelStatusLabel"] == "Charging"
         assert result["panelIdleReason"] is None
@@ -155,16 +166,92 @@ class TestSummaryRowToDict:
         result = m._summary_row_to_dict(_summary_row())
         assert "electricCurrentAverage" not in result
 
+    def test_connected_label_and_overall_status_label_present(self):
+        """Per explicit request: summary mode gets the same
+        connectedLabel/overallStatusLabel fields getPoleVitals already
+        has."""
+        row = _summary_row()
+        with freeze_time("2026-08-27 12:00:00"):
+            result = m._summary_row_to_dict(row)
+        assert result["connectedLabel"] == "Online"
+        assert result["overallStatusLabel"] == "OK"
+
+    def test_overall_status_label_not_reporting_when_no_telemetry(self):
+        row = _summary_row(last_update=None)
+        result = m._summary_row_to_dict(row)
+        assert result["overallStatusLabel"] == "Not Reporting"
+        assert result["connectedLabel"] == "Online"  # is_online=True default, independent of lastUpdate
+
+    def test_stale_last_update_nulls_fault_fields_but_not_open_issue_fault(self):
+        """Same staleness override as pole_vitals_api.py's own
+        _pole_row_to_dict() -- applied here too, per explicit request,
+        so summary mode doesn't silently drift from getPoleVitals'
+        behavior."""
+        row = _summary_row(
+            last_update="2026-08-01 08:00:00 -04:00",  # >48h before frozen time below
+            is_led_fault=True, is_battery_fault=True, is_panel_fault=True,
+            is_open_issue_fault=True, is_pole_fault=True,
+        )
+        with freeze_time("2026-08-28 12:00:00"):
+            result = m._summary_row_to_dict(row)
+        assert result["isLedFault"] is None
+        assert result["isBatteryFault"] is None
+        assert result["isPanelFault"] is None
+        assert result["isPoleFault"] is None
+        assert result["isOpenIssueFault"] is True
+        assert result["lightStatusLabel"] == "Not Reporting 48H"
+        assert result["panelStatusLabel"] == "Not Reporting 48H"
+        assert result["batteryStatusLabel"] == "Not Reporting 48H"
+        assert result["overallStatusLabel"] == "Not Reporting 48H"
+
+    def test_stale_last_update_leaves_avg_percentages_untouched(self):
+        """avgBatteryPercentage/avgPanelPercentage/avgLightPercentage
+        come from the PoleVitals rollup row directly (rps), not from
+        raw PoleTelemetry -- they're NOT part of this staleness
+        override (same scope as pole_vitals_api.py's own version)."""
+        row = _summary_row(
+            last_update="2026-08-01 08:00:00 -04:00",
+            battery_percentage=42.0, panel_percentage=33.0, light_percentage=0.0,
+        )
+        with freeze_time("2026-08-28 12:00:00"):
+            result = m._summary_row_to_dict(row)
+        assert result["avgBatteryPercentage"] == 42.0
+        assert result["avgPanelPercentage"] == 33.0
+        assert result["avgLightPercentage"] == 0.0
+        # is_daylight_for_panel_fault is NOT nulled by this override
+        # (same scope as pole_vitals_api.py's own version), so with
+        # solar_board_voltage/elec_current now nulled but that flag
+        # still present, compute_pole_status_labels() legitimately
+        # returns "N/A" here rather than None -- not a bug.
+        assert result["panelIdleReason"] == "N/A"
+
+    def test_fresh_last_update_leaves_fault_fields_untouched(self):
+        row = _summary_row(
+            last_update="2026-08-27 10:00:00 -04:00",
+            is_led_fault=True, is_battery_fault=False, is_panel_fault=True,
+            is_open_issue_fault=False, is_pole_fault=True,
+        )
+        with freeze_time("2026-08-28 12:00:00"):
+            result = m._summary_row_to_dict(row)
+        assert result["isLedFault"] is True
+        assert result["isBatteryFault"] is False
+        assert result["isPanelFault"] is True
+        assert result["isPoleFault"] is True
+
     def test_status_labels_computed_even_though_battery_voltage_is_absent(self):
         """Confirms the four status labels don't accidentally depend on
         batteryVoltage1/2 (which this row shape never has) -- they're
         computed purely from lampPower/batteryElecCurrent/solarBoard
         inputs, all of which ARE present here."""
         row = _summary_row(lamp_power_1=5.0, lamp_power_2=0)
-        result = m._summary_row_to_dict(row)
+        with freeze_time("2026-08-27 12:00:00"):
+            result = m._summary_row_to_dict(row)
         assert result["lightStatusLabel"] == "ON"
 
-    def test_no_telemetry_gives_all_four_status_labels_none(self):
+    def test_no_telemetry_gives_not_reporting_status_labels(self):
+        """Updated per the same staleness-override behavior now applied
+        here as in pole_vitals_api.py's own _pole_row_to_dict(): no
+        telemetry at all means "Not Reporting", not None."""
         row = _summary_row(
             last_update=None,
             lamp_power_1=None, lamp_power_2=None,
@@ -174,10 +261,10 @@ class TestSummaryRowToDict:
         )
         result = m._summary_row_to_dict(row)
         assert result["lastUpdate"] is None
-        assert result["lightStatusLabel"] is None
-        assert result["panelStatusLabel"] is None
+        assert result["lightStatusLabel"] == "Not Reporting"
+        assert result["panelStatusLabel"] == "Not Reporting"
         assert result["panelIdleReason"] is None
-        assert result["batteryStatusLabel"] is None
+        assert result["batteryStatusLabel"] == "Not Reporting"
         assert "electricCurrentAverage" not in result
 
     def test_panel_idle_reason_only_populated_when_status_is_idle(self):
@@ -185,7 +272,8 @@ class TestSummaryRowToDict:
             solar_board_voltage=0, solar_board_elec_current=0,  # Idle
             is_daylight_for_panel_fault=0,
         )
-        result = m._summary_row_to_dict(row)
+        with freeze_time("2026-08-27 12:00:00"):
+            result = m._summary_row_to_dict(row)
         assert result["panelStatusLabel"] == "Idle"
         assert result["panelIdleReason"] == "Sundown"
 
@@ -206,7 +294,7 @@ class TestSummaryRowToDict:
         with freeze_time("2026-08-28 12:00:00"):
             result = m._summary_row_to_dict(row)
         assert result["lastUpdate"] is None
-        assert result["lightStatusLabel"] is None  # confirms telemetry-gated fields still behave as before
+        assert result["lightStatusLabel"] == "Not Reporting"  # telemetry-gated field, per the new behavior
         assert result["sunsetTime"] == "2026-08-28 19:47:58.596527-04:00"
 
     def test_sunset_time_none_when_pole_time_zone_coordinates_missing(self):
@@ -233,7 +321,8 @@ class TestGetPolesSummaryMode:
     ):
         mock_cursor.fetchall.return_value = [_summary_row()]
 
-        result = m.get_poles(summary=True)
+        with freeze_time("2026-08-27 12:00:00"):
+            result = m.get_poles(summary=True)
 
         assert len(result) == 1
         assert result[0]["lightStatusLabel"] == "OFF"

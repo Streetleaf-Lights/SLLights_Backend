@@ -202,6 +202,126 @@ class TestComputePoleStatusLabels:
         assert result["electricCurrentAverage"] == 1.5
 
 
+class TestComputeReportingStalenessLabel:
+    """Direct unit tests, per explicit request: this drives
+    overallStatusLabel and the lightStatusLabel/panelStatusLabel/
+    batteryStatusLabel override, both in pole_vitals_api.py's own
+    getPoleVitals -- see that module's _compute_pole_vitals_status_fields()."""
+
+    def test_none_last_update_is_not_reporting(self):
+        assert api_utils.compute_reporting_staleness_label(None) == "Not Reporting"
+
+    def test_recent_last_update_is_none(self):
+        with freeze_time("2026-08-28 12:00:00"):
+            result = api_utils.compute_reporting_staleness_label("2026-08-28 10:00:00 -04:00")
+        assert result is None
+
+    def test_exactly_at_threshold_is_not_stale(self):
+        """> 48h, not >=, per the request's own "older than 48 hours" wording."""
+        with freeze_time("2026-08-28 12:00:00"):
+            result = api_utils.compute_reporting_staleness_label("2026-08-26 08:00:00 -04:00")
+        assert result is None
+
+    def test_older_than_48_hours_is_stale(self):
+        with freeze_time("2026-08-28 12:00:00"):
+            result = api_utils.compute_reporting_staleness_label("2026-08-26 07:00:00 -04:00")
+        assert result == "Not Reporting 48H"
+
+    def test_accepts_native_datetime_not_just_string(self):
+        from datetime import datetime, timezone
+
+        recent = datetime.now(timezone.utc)
+        assert api_utils.compute_reporting_staleness_label(recent) is None
+
+        stale = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        assert api_utils.compute_reporting_staleness_label(stale) == "Not Reporting 48H"
+
+    def test_handles_the_exact_three_digit_millisecond_wire_format(self):
+        """Regression guard: to_dto_string() produces exactly this shape
+        (3-digit ms + space + offset), which datetime.fromisoformat()
+        alone can't parse -- see datetime_utils.parse_dto_string()'s own
+        docstring."""
+        with freeze_time("2026-08-28 12:00:00"):
+            result = api_utils.compute_reporting_staleness_label("2026-08-28 10:00:00.123 -04:00")
+        assert result is None
+
+
+class TestComputePoleConnectivityLabels:
+    """Direct unit tests for connectedLabel/overallStatusLabel, per
+    explicit request."""
+
+    # -- connectedLabel --
+
+    def test_online_true_is_online(self):
+        result = api_utils.compute_pole_connectivity_labels(
+            is_online=True, is_pole_fault=False, last_update="2026-08-28 10:00:00 -04:00"
+        )
+        assert result["connectedLabel"] == "Online"
+
+    def test_online_false_is_offline(self):
+        result = api_utils.compute_pole_connectivity_labels(
+            is_online=False, is_pole_fault=False, last_update="2026-08-28 10:00:00 -04:00"
+        )
+        assert result["connectedLabel"] == "Offline"
+
+    def test_online_none_with_last_update_is_disconnected(self):
+        result = api_utils.compute_pole_connectivity_labels(
+            is_online=None, is_pole_fault=False, last_update="2026-08-28 10:00:00 -04:00"
+        )
+        assert result["connectedLabel"] == "Disconnected"
+
+    def test_online_none_without_last_update_is_unknown(self):
+        result = api_utils.compute_pole_connectivity_labels(
+            is_online=None, is_pole_fault=False, last_update=None
+        )
+        assert result["connectedLabel"] == "Unknown"
+
+    def test_online_true_takes_priority_even_without_last_update(self):
+        """Per spec: isOnline=true -> Online, unconditionally -- not
+        gated by lastUpdate being present."""
+        result = api_utils.compute_pole_connectivity_labels(
+            is_online=True, is_pole_fault=False, last_update=None
+        )
+        assert result["connectedLabel"] == "Online"
+
+    # -- overallStatusLabel --
+
+    def test_null_last_update_is_not_reporting(self):
+        result = api_utils.compute_pole_connectivity_labels(
+            is_online=True, is_pole_fault=True, last_update=None
+        )
+        assert result["overallStatusLabel"] == "Not Reporting"
+
+    def test_stale_last_update_is_not_reporting_48h(self):
+        with freeze_time("2026-08-28 12:00:00"):
+            result = api_utils.compute_pole_connectivity_labels(
+                is_online=True, is_pole_fault=True, last_update="2026-08-20 08:00:00 -04:00"
+            )
+        assert result["overallStatusLabel"] == "Not Reporting 48H"
+
+    def test_staleness_takes_priority_over_fault(self):
+        """Not Reporting (48H) wins even when isPoleFault=True -- a
+        silent pole is reported as silent, not as faulty."""
+        result = api_utils.compute_pole_connectivity_labels(
+            is_online=None, is_pole_fault=True, last_update=None
+        )
+        assert result["overallStatusLabel"] == "Not Reporting"
+
+    def test_pole_fault_true_is_fault(self):
+        with freeze_time("2026-08-28 12:00:00"):
+            result = api_utils.compute_pole_connectivity_labels(
+                is_online=True, is_pole_fault=True, last_update="2026-08-28 10:00:00 -04:00"
+            )
+        assert result["overallStatusLabel"] == "Fault"
+
+    def test_pole_fault_false_is_ok(self):
+        with freeze_time("2026-08-28 12:00:00"):
+            result = api_utils.compute_pole_connectivity_labels(
+                is_online=True, is_pole_fault=False, last_update="2026-08-28 10:00:00 -04:00"
+            )
+        assert result["overallStatusLabel"] == "OK"
+
+
 class TestComputePoleLocalSunset:
     """
     Direct unit tests for compute_pole_local_sunset(), per explicit

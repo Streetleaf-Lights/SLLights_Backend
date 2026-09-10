@@ -178,8 +178,11 @@ class TestPoleDetailsSqlStructure:
 
     def test_all_five_fault_flags_present(self):
         sql = m._POLE_DETAILS_SQL_TEMPLATE
-        for col in ("IsLedFault", "IsBatteryFault", "IsPanelFault", "IsOpenIssueFault", "IsPoleFault"):
+        for col in ("IsLedFault", "IsBatteryFault", "IsPanelFault", "IsPoleFault"):
             assert f"rps.{col} AS {col}" in sql
+        # IsOpenIssueFault deliberately does NOT come from rps -- see the
+        # dedicated TestPoleDetailsIsOpenIssueFaultIndependence class below.
+        assert "AS IsOpenIssueFault" in sql
 
     def test_no_light_status_anywhere(self):
         sql = m._POLE_DETAILS_SQL_TEMPLATE
@@ -255,6 +258,68 @@ class TestPoleDetailsSqlStructure:
         assert "latest_pt.IsDaylightForPanelFault AS IsDaylightForPanelFault" in sql
         apply_block = sql.split("OUTER APPLY (")[1].split(") AS latest_pt")[0]
         assert "pt.IsDaylightForPanelFault" in apply_block
+
+
+class TestPoleDetailsIsOpenIssueFaultIndependence:
+    """Per explicit request: isOpenIssueFault must reflect whether a
+    pole CURRENTLY has an open issue, entirely independent of the
+    Last48Hours join/telemetry recency -- never null, unlike every other
+    fault field on this same row."""
+
+    def test_reads_from_pole_open_issues_not_rps(self):
+        sql = m._POLE_DETAILS_SQL_TEMPLATE
+        assert "rps.IsOpenIssueFault" not in sql
+        assert "PoleOpenIssues" in sql
+
+    def test_uses_exists_check_against_poles_own_id(self):
+        """PoleOpenIssues.PoleId matches Poles.Id, not LocationId --
+        same join key pole_telemetry_loader.py's own
+        _fetch_location_ids_with_open_issues() uses."""
+        sql = m._POLE_DETAILS_SQL_TEMPLATE
+        assert "EXISTS (" in sql
+        assert "SELECT 1 FROM PoleOpenIssues poi WHERE poi.PoleId = p.Id" in sql
+
+    def test_always_a_definite_bit_never_left_as_a_bare_join_column(self):
+        """CAST(...AS BIT) on both branches -- this must always resolve
+        to a concrete 1 or 0, never inherit NULL the way a plain LEFT
+        JOIN column would for a pole with no matching rps row."""
+        sql = m._POLE_DETAILS_SQL_TEMPLATE
+        assert "THEN CAST(1 AS BIT) ELSE CAST(0 AS BIT) END AS IsOpenIssueFault" in sql
+
+    def test_no_new_bound_parameter_introduced(self):
+        """The EXISTS subquery references p.Id directly -- no additional
+        '?' placeholder, so existing callers' param-binding order is
+        unaffected by this change."""
+        sql = m._POLE_DETAILS_SQL_TEMPLATE
+        assert sql.count("?") == 1  # only rps.PeriodType = ?, same as before
+
+    def test_pole_with_open_issue_and_no_current_telemetry_still_shows_true(
+        self, patch_get_connection_pole_vitals_api, mock_cursor
+    ):
+        """The actual scenario this whole change exists for: a silent
+        pole (no Last48Hours row, so isOnline/isPoleFault/etc. all come
+        back null) that DOES have a real open issue must still show
+        isOpenIssueFault=True, not null."""
+        agg_rows = [("cust1", "Acme", "proj1", "Downtown", 8, 6, 3, None)]
+        mock_cursor.fetchall.side_effect = [
+            agg_rows,
+            [self._detail_row(is_open_issue_fault=True, is_online=None, is_pole_fault=None)],
+        ]
+        result = m.get_pole_vitals()
+        pole = result[0]["projects"][0]["poles"][0]
+        assert pole["isOnline"] is None
+        assert pole["isPoleFault"] is None
+        assert pole["isOpenIssueFault"] is True
+
+    def _detail_row(self, is_open_issue_fault, is_online, is_pole_fault):
+        return (
+            "proj1", "pole1", "PN-1", "LOC-1", "2025-01-01", 28.0, -82.0, True,
+            None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None,
+            28.2, -80.7, "America/New_York",
+            is_online, None, None, None, is_open_issue_fault, is_pole_fault,
+            None, None, None, "cust1",
+        )
 
     def test_pole_time_zone_columns_added_for_sunset_time(self):
         """Needed for sunsetTime's own calculation -- sourced from the
@@ -337,7 +402,7 @@ class TestPoleRowToDict:
 
     def test_maps_every_field_correctly(self):
         with freeze_time("2026-08-28 12:00:00"):
-            result = m._pole_row_to_dict(self._row())
+            result = m._pole_row_to_dict(self._row(last_update="2026-08-28 10:00:00 -04:00"))
         assert result == {
             "id": "pole1",
             "poleNumber": "PN-001",
@@ -346,7 +411,7 @@ class TestPoleRowToDict:
             "lat": 28.0,
             "long": -82.0,
             "active": True,
-            "lastUpdate": "2026-07-31 08:00:00 -04:00",
+            "lastUpdate": "2026-08-28 10:00:00 -04:00",
             "controllerCode": "CC-100",
             "groupId": 7,
             "productId": "PROD-42",
@@ -374,6 +439,8 @@ class TestPoleRowToDict:
             "batteryStatusLabel": "Discharging",
             "electricCurrentAverage": 15.1,
             "sunsetTime": "2026-08-28 19:47:58.596527-04:00",
+            "connectedLabel": "Online",
+            "overallStatusLabel": "OK",
         }
 
     def test_discards_project_id_and_customer_id(self):
@@ -425,11 +492,151 @@ class TestPoleRowToDict:
         assert result["batteryElecCurrent2"] is None
         assert result["solarBoardVoltage"] is None
         assert result["solarBoardElecCurrent"] is None
-        assert result["lightStatusLabel"] is None
-        assert result["panelStatusLabel"] is None
+        assert result["lightStatusLabel"] == "Not Reporting"
+        assert result["panelStatusLabel"] == "Not Reporting"
         assert result["panelIdleReason"] is None
-        assert result["batteryStatusLabel"] is None
+        assert result["batteryStatusLabel"] == "Not Reporting"
         assert result["electricCurrentAverage"] is None
+        assert result["connectedLabel"] == "Online"  # is_online=True (default, from a separate join than lastUpdate)
+        assert result["overallStatusLabel"] == "Not Reporting"
+
+    def test_no_telemetry_nulls_four_fault_fields_but_not_open_issue_fault(self):
+        """Per explicit request (and a later correction):
+        isLedFault/isBatteryFault/isPanelFault/isPoleFault all go null
+        when lastUpdate is null, EVEN THOUGH these particular values
+        come from a different join (PoleVitals rollup) than lastUpdate
+        itself (PoleTelemetry) and are non-null/truthy in the underlying
+        row. isOpenIssueFault is explicitly EXCLUDED from this override
+        -- it's sourced from open-issue tracking, not telemetry, so
+        telemetry going stale/missing says nothing about it."""
+        row = self._row(
+            last_update=None,
+            is_led_fault=True, is_battery_fault=True, is_panel_fault=True,
+            is_open_issue_fault=True, is_pole_fault=True,
+        )
+        result = m._pole_row_to_dict(row)
+        assert result["isLedFault"] is None
+        assert result["isBatteryFault"] is None
+        assert result["isPanelFault"] is None
+        assert result["isPoleFault"] is None
+        assert result["isOpenIssueFault"] is True
+
+    def test_stale_last_update_nulls_four_fault_fields_but_not_open_issue_fault(self):
+        with freeze_time("2026-08-28 12:00:00"):
+            row = self._row(
+                last_update="2026-08-20 08:00:00 -04:00",  # >48h before frozen time
+                is_led_fault=True, is_battery_fault=True, is_panel_fault=True,
+                is_open_issue_fault=True, is_pole_fault=True,
+            )
+            result = m._pole_row_to_dict(row)
+        assert result["isLedFault"] is None
+        assert result["isBatteryFault"] is None
+        assert result["isPanelFault"] is None
+        assert result["isPoleFault"] is None
+        assert result["isOpenIssueFault"] is True
+
+    def test_stale_last_update_nulls_raw_sensor_fields_too(self):
+        """Per a later, separate explicit follow-up request: the raw
+        PoleTelemetry 'single most recent reading' fields also go null
+        for a stale pole -- not just the four PoleVitals-rollup-sourced
+        fault fields above. lastUpdate itself is NOT nulled -- it's the
+        one field that tells a caller HOW stale everything else is."""
+        with freeze_time("2026-08-28 12:00:00"):
+            row = self._row(
+                last_update="2026-08-20 08:00:00 -04:00",  # >48h before frozen time
+                battery_voltage_1=12.6, battery_voltage_2=12.4,
+                lamp_power_1=8.7, lamp_power_2=8.6,
+                battery_elec_current_1=15.0, battery_elec_current_2=15.2,
+                solar_board_voltage=18.0, solar_board_elec_current=2.0,
+            )
+            result = m._pole_row_to_dict(row)
+        assert result["lastUpdate"] == "2026-08-20 08:00:00 -04:00"
+        assert result["batteryVoltage1"] is None
+        assert result["batteryVoltage2"] is None
+        assert result["lampPower1"] is None
+        assert result["lampPower2"] is None
+        assert result["batteryElecCurrent1"] is None
+        assert result["batteryElecCurrent2"] is None
+        assert result["solarBoardVoltage"] is None
+        assert result["solarBoardElecCurrent"] is None
+
+    def test_stale_last_update_nulls_electric_current_average_not_zero(self):
+        """Regression guard: compute_pole_status_labels() treats a null
+        INDIVIDUAL battery current reading as zero when averaging, not
+        as 'skip it' -- so nulling battery_elec_current_1/2 upstream
+        would silently produce 0.0 here, not None, without the explicit
+        override in _compute_pole_vitals_status_fields()."""
+        with freeze_time("2026-08-28 12:00:00"):
+            row = self._row(
+                last_update="2026-08-20 08:00:00 -04:00",
+                battery_elec_current_1=15.0, battery_elec_current_2=15.2,
+            )
+            result = m._pole_row_to_dict(row)
+        assert result["electricCurrentAverage"] is None
+
+    def test_fresh_last_update_leaves_raw_sensor_fields_untouched(self):
+        with freeze_time("2026-08-28 12:00:00"):
+            row = self._row(
+                last_update="2026-08-28 10:00:00 -04:00",  # recent
+                battery_voltage_1=12.6, battery_voltage_2=12.4,
+                lamp_power_1=8.7, lamp_power_2=8.6,
+                battery_elec_current_1=15.0, battery_elec_current_2=15.2,
+                solar_board_voltage=18.0, solar_board_elec_current=2.0,
+            )
+            result = m._pole_row_to_dict(row)
+        assert result["batteryVoltage1"] == 12.6
+        assert result["batteryVoltage2"] == 12.4
+        assert result["lampPower1"] == 8.7
+        assert result["lampPower2"] == 8.6
+        assert result["batteryElecCurrent1"] == 15.0
+        assert result["batteryElecCurrent2"] == 15.2
+        assert result["solarBoardVoltage"] == 18.0
+        assert result["solarBoardElecCurrent"] == 2.0
+        assert result["electricCurrentAverage"] == 15.1
+
+    def test_null_last_update_nulls_raw_sensor_fields_too(self):
+        """No telemetry at all -- these were already null via the
+        OUTER APPLY's own NULL-for-no-match behavior before this
+        request, so this just confirms that continues to hold now that
+        it's an explicit override rather than an incidental default."""
+        row = self._row(
+            last_update=None,
+            battery_voltage_1=None, battery_voltage_2=None,
+            lamp_power_1=None, lamp_power_2=None,
+            battery_elec_current_1=None, battery_elec_current_2=None,
+            solar_board_voltage=None, solar_board_elec_current=None,
+        )
+        result = m._pole_row_to_dict(row)
+        assert result["batteryVoltage1"] is None
+        assert result["batteryVoltage2"] is None
+        assert result["lampPower1"] is None
+        assert result["lampPower2"] is None
+        assert result["batteryElecCurrent1"] is None
+        assert result["batteryElecCurrent2"] is None
+        assert result["solarBoardVoltage"] is None
+        assert result["solarBoardElecCurrent"] is None
+        assert result["electricCurrentAverage"] is None
+
+    def test_is_online_is_not_nulled_by_the_staleness_override(self):
+        """isOnline was NOT named in the request -- it must pass through
+        as-is even when lastUpdate is null/stale."""
+        row = self._row(last_update=None, is_online=True)
+        result = m._pole_row_to_dict(row)
+        assert result["isOnline"] is True
+
+    def test_fresh_last_update_leaves_fault_fields_untouched(self):
+        with freeze_time("2026-08-28 12:00:00"):
+            row = self._row(
+                last_update="2026-08-28 10:00:00 -04:00",  # recent
+                is_led_fault=True, is_battery_fault=False, is_panel_fault=True,
+                is_open_issue_fault=False, is_pole_fault=True,
+            )
+            result = m._pole_row_to_dict(row)
+        assert result["isLedFault"] is True
+        assert result["isBatteryFault"] is False
+        assert result["isPanelFault"] is True
+        assert result["isOpenIssueFault"] is False
+        assert result["isPoleFault"] is True
 
 
 class TestRowToProjectDict:
@@ -482,44 +689,45 @@ class TestGetPoleVitalsUnfiltered:
         agg_call = mock_cursor.execute.call_args_list[0]
         assert agg_call.args[1] == "Last48Hours"
 
-    def test_pole_detail_query_uses_last_known_48_hours_not_last_48_hours(
+    def test_pole_detail_query_uses_same_period_type_as_rollup(
         self, patch_get_connection_pole_vitals_api, mock_cursor
     ):
-        """The actual behavior change this pair of tests exists to pin
-        down: the ROLLUP query (totalLights/connectedLights/
-        percentWorking, checked above) keeps reading Last48Hours -- a
-        silent pole is deliberately NOT counted as currently connected.
-        But the per-pole DETAIL query (isPoleFault/isPanelFault/
-        avgBatteryPercentage/etc., checked here) reads LastKnown48Hours
-        instead, so those same silent poles still show their last-known
-        state in the "poles" list rather than NULL."""
+        """Per explicit request/correction: a separate LastKnown48Hours
+        period type used to persist a silent pole's last-known detail
+        fields instead of null; it was removed entirely, so the per-pole
+        DETAIL query (isPoleFault/isPanelFault/avgBatteryPercentage/etc.)
+        now reads the exact SAME period type as the rollup query
+        (Last48Hours) -- a silent pole gets null for every detail field,
+        uniformly, same as it's already excluded from
+        connectedLights/totalLights above."""
         mock_cursor.fetchall.side_effect = [[], []]
 
         m.get_pole_vitals()
 
         detail_call = mock_cursor.execute.call_args_list[1]
-        assert detail_call.args[1] == "LastKnown48Hours"
+        assert detail_call.args[1] == "Last48Hours"
 
-    def test_pole_detail_query_isonline_specifically_reverts_to_last_48_hours(
+    def test_pole_detail_query_isonline_uses_the_same_single_join(
         self, patch_get_connection_pole_vitals_api, mock_cursor
     ):
-        """A carve-out from the test above: isOnline is the ONE field
-        that does NOT follow the rest of the per-pole detail fields onto
-        LastKnown48Hours -- it reads Last48Hours instead (via the
-        query's own second PoleVitals join, rps_online), same period
-        type as the rollup query, since a silent pole's
-        LastKnown48Hours.IsOnline would misleadingly reflect its own
-        last-known state rather than whether it's online RIGHT NOW."""
+        """isOnline no longer needs a separate second PoleVitals join
+        (rps_online) -- it now comes from the exact same single join
+        (rps) as every other detail field, since both read the same
+        period type now."""
         mock_cursor.fetchall.side_effect = [[], []]
 
         m.get_pole_vitals()
 
         detail_call = mock_cursor.execute.call_args_list[1]
-        # args[0]=sql, args[1]=LastKnown48Hours (rps), args[2]=Last48Hours
-        # (rps_online, for IsOnline specifically)
-        assert detail_call.args[2] == "Last48Hours"
-        assert "LEFT JOIN PoleVitals rps_online" in detail_call.args[0]
-        assert "rps_online.IsOnline AS IsOnline" in detail_call.args[0]
+        sql = detail_call.args[0]
+        assert "rps_online" not in sql
+        assert sql.count("LEFT JOIN PoleVitals") == 1
+        assert "rps.IsOnline AS IsOnline" in sql
+        # Only ONE period-type value bound now, not two -- but the
+        # unfiltered case's own limit is still a second bound param
+        # after it (sql, period_type, limit) = 3 total.
+        assert len(detail_call.args) == 3
+        assert detail_call.args[1] == "Last48Hours"
 
     def test_unfiltered_uses_subquery_limit_on_customers(
         self, patch_get_connection_pole_vitals_api, mock_cursor
@@ -545,7 +753,7 @@ class TestGetPoleVitalsUnfiltered:
         pole_rows = [
             (
                 "proj1", "pole1", "PN-1", "LOC-1", "2025-01-01", 28.0, -82.0, True,
-                "2026-07-31 08:00:00 -04:00", "CC-100", 7, "PROD-42", "jdoe",
+                "2026-08-28 10:00:00 -04:00", "CC-100", 7, "PROD-42", "jdoe",
                 12.6, 12.4,
                 8.7, 8.6, 15.0, 15.2, 18.0, 2.0, 1,
                 28.2, -80.7, "America/New_York",
@@ -581,6 +789,8 @@ class TestGetPoleVitalsUnfiltered:
         assert project["poles"][0]["lightStatusLabel"] == "ON"
         assert project["poles"][0]["panelStatusLabel"] == "Charging"
         assert project["poles"][0]["sunsetTime"] == "2026-08-28 19:47:58.596527-04:00"
+        assert project["poles"][0]["connectedLabel"] == "Online"
+        assert project["poles"][0]["overallStatusLabel"] == "Fault"  # isPoleFault=True, not stale
         assert project["leadsunProject"] == '{"ProjectId": "482"}'
 
     def test_customer_with_zero_projects_gets_empty_projects_and_zeroed_rollup(
@@ -767,50 +977,54 @@ class TestGetPoleVitalsByPeriod:
         assert "BatteryChargingMin" not in sql
         assert "PoleModels" not in sql
 
-    def test_hour_history_query_has_a_bound_anchored_to_latest_telemetry(self):
-        """The whole point of this specific change: anchored to this
-        pole's own latest PoleTelemetry reading (via PoleContext's own
-        MaxLastUpload), NOT to SYSDATETIMEOFFSET()/"now" -- so a pole
-        that's gone completely offline still returns its own last known
-        activity instead of an empty list. Bound to limit hours back
-        (via a bound parameter), not a fixed 48 -- a real bug an earlier
-        version of this query had (limit=168 would still only ever
-        return up to 48 hours' worth back, no matter how much more was
-        actually available)."""
+    def test_hour_history_query_anchors_to_current_moment_not_last_reading(self):
+        """The core reversal, per explicit request/correction: anchored
+        to SYSDATETIMEOFFSET()/"now", NOT to this pole's own latest
+        PoleTelemetry reading -- a pole that's gone completely offline
+        now shows REAL gaps (a missing hour, with periodStart/periodEnd
+        populated and everything else null) rather than a window quietly
+        anchored to whenever it last happened to report."""
         sql = m._POLE_VITALS_HOUR_HISTORY_SQL_TEMPLATE
-        assert "AND pv.PeriodStart >= DATEADD(HOUR, -1 * ?, pc.MaxLastUpload)" in sql
-        assert "SYSDATETIMEOFFSET" not in sql
-        assert "-48" not in sql
+        assert "SYSDATETIMEOFFSET()" in sql
+        assert "MAX(pt.LastUpload)" not in sql
+        assert "MaxLastUpload" not in sql
 
-    def test_hour_history_query_resolves_latest_telemetry_via_pole_context_cte(self):
+    def test_hour_history_query_resolves_timezone_via_pole_context_cte(self):
         sql = m._POLE_VITALS_HOUR_HISTORY_SQL_TEMPLATE
         assert "WITH PoleContext AS (" in sql
-        assert "SELECT MAX(pt.LastUpload)" in sql
-        assert "FROM PoleTelemetry pt" in sql
-        assert "JOIN PoleContext pc ON pv.LocationId = pc.LocationId" in sql
+        assert "LEFT JOIN PoleTimeZones ptz ON p.LocationId = ptz.LocationId" in sql
+        assert "ISNULL(ptz.WindowsTimeZone, 'Eastern Standard Time')" in sql
 
-    def test_hour_history_query_excludes_the_missing_last_upload_sentinel(self):
-        """Hardcoded literal, not a bound parameter -- matches the same
-        established precedent in pole_daylight_flags_loader.py's own
-        _FIND_UNFLAGGED_SQL."""
+    def test_hour_history_query_no_longer_needs_the_missing_last_upload_sentinel(self):
+        """That sentinel exclusion was specific to the old MaxLastUpload
+        subquery, which this template no longer has."""
         sql = m._POLE_VITALS_HOUR_HISTORY_SQL_TEMPLATE
-        assert "AND pt.LastUpload <> '9999-12-31 23:59:59.999 +00:00'" in sql
+        assert "9999-12-31 23:59:59.999" not in sql
 
     def test_hour_history_query_hardcodes_hour_not_a_bound_parameter(self):
         """This template is only ever selected when period_type == 'Hour'
         -- nothing to parameterize, so it's a literal, not a bound '?'."""
         sql = m._POLE_VITALS_HOUR_HISTORY_SQL_TEMPLATE
         assert "pv.PeriodType = 'Hour'" in sql
-        # p.Id = ?, TOP (?), and the DATEADD's own -1 * ? -- three, not two.
-        assert sql.count("?") == 3
 
-    def test_hour_history_query_window_bound_reuses_the_same_limit_as_top(
+    def test_hour_history_query_generates_buckets_instead_of_a_top_clause(self):
+        """Row count is controlled by the generated Numbers/Buckets
+        sequence, not a TOP (?) filter on top of PoleVitals' own rows --
+        this is what makes gap-filling possible: a bucket with no
+        matching PoleVitals row still survives via the LEFT JOIN."""
+        sql = m._POLE_VITALS_HOUR_HISTORY_SQL_TEMPLATE
+        assert "TOP (?)" not in sql
+        assert "Numbers" in sql
+        assert "LEFT JOIN PoleVitals" in sql
+        assert "OPTION (MAXRECURSION 0)" in sql
+
+    def test_hour_history_query_binds_limit_only_once(
         self, patch_get_connection_pole_vitals_api, mock_cursor
     ):
-        """Regression guard for the actual reported bug: limit must be
-        bound TWICE with the SAME value (once for TOP (?), once for the
-        DATEADD window) -- not a fixed 48 that ignores whatever limit
-        the caller actually passed."""
+        """Only TWO bound params now (pole_id, then limit ONCE) -- no
+        more double-binding limit for both a TOP (?) and a separate
+        DATEADD window bound, since the generated bucket sequence itself
+        controls row count."""
         mock_cursor.fetchone.return_value = (
             "pole1", "PN-1", "LOC-1", "2025-01-01", 28.0, -82.0, "2026-07-31 08:00:00 -04:00",
             8.7, 8.6, 15.0, 15.2, 18.0, 2.0,
@@ -820,16 +1034,7 @@ class TestGetPoleVitalsByPeriod:
         m.get_pole_vitals_by_period("pole1", "Hour", limit=168)
 
         history_call = mock_cursor.execute.call_args_list[-1]
-        # (sql, pole_id, top_limit, dateadd_limit) -- top_limit and
-        # dateadd_limit must be the SAME value (168), not 168 and 48.
-        assert history_call.args == (m._POLE_VITALS_HOUR_HISTORY_SQL_TEMPLATE, "pole1", 168, 168)
-
-    def test_hour_history_query_keeps_the_row_count_limit_too(self):
-        """TOP (?) is kept ALONGSIDE the new time bound, not replaced by
-        it -- a caller can still ask for fewer than whatever the 48-hour
-        window would otherwise return."""
-        sql = m._POLE_VITALS_HOUR_HISTORY_SQL_TEMPLATE
-        assert "SELECT TOP (?)" in sql
+        assert history_call.args == (m._POLE_VITALS_HOUR_HISTORY_SQL_TEMPLATE, "pole1", 168)
 
     def test_hour_period_type_uses_the_hour_specific_template(
         self, patch_get_connection_pole_vitals_api, mock_cursor
@@ -844,11 +1049,4 @@ class TestGetPoleVitalsByPeriod:
 
         history_call = mock_cursor.execute.call_args_list[-1]
         assert history_call.args[0] == m._POLE_VITALS_HOUR_HISTORY_SQL_TEMPLATE
-        # pole_id, THEN limit TWICE (once for TOP (?), once for the
-        # DATEADD window bound -- the SAME value, not two different
-        # ones) -- the opposite order, and one extra parameter, from the
-        # now-removed Day template this used to be contrasted against,
-        # forced by PoleContext's own CTE (which needs pole_id to
-        # resolve LocationId) coming textually before the main query's
-        # own TOP (?).
-        assert history_call.args == (m._POLE_VITALS_HOUR_HISTORY_SQL_TEMPLATE, "pole1", 10, 10)
+        assert history_call.args == (m._POLE_VITALS_HOUR_HISTORY_SQL_TEMPLATE, "pole1", 10)

@@ -6,10 +6,11 @@ rather than duplicated per-module with the risk of the copies drifting
 apart later.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from shared.daylight_utils import get_sunset
+from shared.datetime_utils import parse_dto_string
 
 MAX_LIMIT = 1000
 
@@ -177,6 +178,90 @@ def compute_pole_status_labels(
         "panelIdleReason": panel_idle_reason,
         "batteryStatusLabel": battery_status_label,
         "electricCurrentAverage": battery_current_sum / 2,
+    }
+
+
+# How far back "still reporting" reaches before lightStatusLabel/
+# panelStatusLabel/batteryStatusLabel/overallStatusLabel all switch to
+# their own "Not Reporting 48H" state, per explicit request -- a pole
+# whose last known reading is older than this is treated as silent
+# going forward, regardless of what that stale reading's own values
+# happened to say.
+_NOT_REPORTING_STALENESS_THRESHOLD = timedelta(hours=48)
+
+
+def compute_reporting_staleness_label(last_update) -> str:
+    """
+    "Not Reporting" if last_update is None (no telemetry at all), "Not
+    Reporting 48H" if last_update is older than
+    _NOT_REPORTING_STALENESS_THRESHOLD, else None (still reporting
+    recently enough that a caller's own normal status logic should
+    apply instead of this staleness override).
+
+    last_update is expected to be an aware datetime OR a
+    to_dto_string()-shaped string -- this project's DATETIMEOFFSET
+    columns usually come back from pyodbc already timezone-aware, but
+    the "AT TIME ZONE" computed expression this project's own
+    pole-vitals queries use to convert LastUpload into each pole's own
+    local offset has been observed coming back as TEXT instead (see
+    shared/datetime_utils.parse_dto_string()'s own docstring). Either
+    way, comparing the resulting aware datetime against
+    datetime.now(timezone.utc) works correctly regardless of what
+    OFFSET it carries (e.g. a pole-local offset), since Python compares
+    aware datetimes by their absolute instant, not their displayed
+    offset.
+    """
+    last_update = parse_dto_string(last_update)
+    if last_update is None:
+        return "Not Reporting"
+    if (datetime.now(timezone.utc) - last_update) > _NOT_REPORTING_STALENESS_THRESHOLD:
+        return "Not Reporting 48H"
+    return None
+
+
+def compute_pole_connectivity_labels(is_online, is_pole_fault, last_update) -> dict:
+    """
+    Two more presentation-oriented derived fields, layered ALONGSIDE (not
+    replacing) compute_pole_status_labels()'s own five -- built for
+    pole_vitals_api.py's getPoleVitals specifically, per explicit
+    request. NOT plumbed into poles_api.py's own callers of
+    compute_pole_status_labels() -- that function's five-field contract
+    is unchanged; these two are computed and added on separately, only
+    where requested.
+
+    connectedLabel:
+      "Online"       if is_online is True
+      "Offline"      if is_online is False
+      "Disconnected" if is_online is None AND last_update is not None
+                        (telemetry exists, but this specific reading's
+                        own IsOnline came back NULL)
+      "Unknown"      otherwise (is_online is None AND last_update is
+                        also None -- no telemetry at all to judge from)
+
+    overallStatusLabel: compute_reporting_staleness_label(last_update)'s
+      own "Not Reporting"/"Not Reporting 48H" takes priority when it
+      applies; otherwise "Fault" if is_pole_fault is truthy, else "OK".
+    """
+    if is_online is True:
+        connected_label = "Online"
+    elif is_online is False:
+        connected_label = "Offline"
+    elif last_update is not None:
+        connected_label = "Disconnected"
+    else:
+        connected_label = "Unknown"
+
+    staleness_label = compute_reporting_staleness_label(last_update)
+    if staleness_label:
+        overall_status_label = staleness_label
+    elif is_pole_fault:
+        overall_status_label = "Fault"
+    else:
+        overall_status_label = "OK"
+
+    return {
+        "connectedLabel": connected_label,
+        "overallStatusLabel": overall_status_label,
     }
 
 

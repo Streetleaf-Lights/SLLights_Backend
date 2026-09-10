@@ -24,7 +24,7 @@ WHERE 1 = 1
 -- AND IsOnline = 0
 -- AND PeriodStart >= '2026-08-17 19:00:00'
 -- AND IsPoleFault = 0
-AND PoleNumber = 'HIL-4509'
+AND PoleNumber = '48085-1056'
 -- AND IsOpenIssueFault = 1
 -- AND (PeriodType = 'Last48Hours')
 ORDER BY PoleNumber, LocationId, PeriodStart DESC;

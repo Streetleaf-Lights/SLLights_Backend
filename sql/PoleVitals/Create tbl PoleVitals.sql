@@ -11,32 +11,38 @@
 -- time; this single script reflects where they all ended up, for a
 -- brand NEW environment being set up from scratch). If you're instead
 -- bringing an EXISTING, already-migrated PoleVitals table up to date
--- with the latest change (removing 'Day'/'Week'/'Month' from the
--- allowed PeriodType set), see "Remove Day Week and Month PeriodTypes.sql"
--- in this same folder instead -- this CREATE script's own IF NOT EXISTS
--- guard means it silently does nothing at all against a table that
--- already exists, so it can't apply that change to a live database on
--- its own.
+-- with a more recent change, see "Remove Day Week and Month
+-- PeriodTypes.sql" (removing 'Day'/'Week'/'Month') or "Remove
+-- LastKnown48Hours PeriodType.sql" (removing 'LastKnown48Hours') in this
+-- same folder instead -- this CREATE script's own IF NOT EXISTS guard
+-- means it silently does nothing at all against a table that already
+-- exists, so it can't apply either change to a live database on its
+-- own.
 --
--- Four period types were ever computed at different points in this
+-- Five period types were ever computed at different points in this
 -- project's history: Hour, Day, Week, and Month, plus a later-added
 -- Last48Hours (a single, continuously-updated rolling window per pole,
--- not a discrete historical bucket) and LastKnown48Hours (identical to
--- Last48Hours, but persists for an offline pole rather than
--- disappearing). By explicit request, only Hour, Last48Hours, and
--- LastKnown48Hours are computed and permitted going forward -- Day,
--- Week, and Month have all been removed entirely (Week/Month due to a
--- real row-explosion bug in Week's own Workweek join, followed by
--- persistent database CPU contention that never resolved proportionally
--- to the tuning effort spent on it; Day for consolidation, once it was
--- the only one left of the three "historical discrete bucket" period
--- types). See shared/pole_vitals_loader.py's own module docstring for
--- the full history and design of what's actually computed today.
+-- not a discrete historical bucket) and, later still, LastKnown48Hours
+-- (identical to Last48Hours, but persisted for an offline pole rather
+-- than disappearing). By explicit request, only Hour and Last48Hours
+-- are computed and permitted going forward -- Day, Week, and Month have
+-- all been removed entirely (Week/Month due to a real row-explosion bug
+-- in Week's own Workweek join, followed by persistent database CPU
+-- contention that never resolved proportionally to the tuning effort
+-- spent on it; Day for consolidation, once it was the only one left of
+-- the three "historical discrete bucket" period types), and
+-- LastKnown48Hours was later ALSO removed entirely, by a separate
+-- explicit request/correction: a silent pole (no current Last48Hours
+-- row) is now supposed to genuinely return null for its per-pole detail
+-- fields, not fall back to a persisted last-known value. See
+-- shared/pole_vitals_loader.py's own module docstring for the full
+-- history and design of what's actually computed today.
 --
--- Existing historical rows with PeriodType IN ('Day', 'Week', 'Month')
--- are NOT deleted by removing them from the CHECK CONSTRAINT below --
--- only NEW rows with those values are prevented going forward. See
--- "Remove Day Week and Month PeriodTypes.sql" for how an existing,
+-- Existing historical rows with PeriodType IN ('Day', 'Week', 'Month',
+-- 'LastKnown48Hours') are NOT deleted by removing them from the CHECK
+-- CONSTRAINT below -- only NEW rows with those values are prevented
+-- going forward. See "Remove Day Week and Month PeriodTypes.sql" and
+-- "Remove LastKnown48Hours PeriodType.sql" for how an existing,
 -- already-populated table applies this same tightening via WITH NOCHECK
 -- specifically so it doesn't reject those already-present rows.
 --
@@ -58,11 +64,11 @@
 -- A reading whose model can't be found, or whose SunboardPower/LightPower
 -- is 0, contributes NULL for that specific percentage (NULLIF-guarded in
 -- the loader's SQL) rather than erroring or skewing the average -- AVG()
--- ignores NULLs. For Last48Hours/LastKnown48Hours specifically,
--- AvgPanelPercentage/AvgLightPercentage are further restricted to only
--- readings taken during daylight with the battery genuinely charging
--- (for Panel) or at night (for Light) -- see pole_vitals_loader.py's own
--- comments on those two constants for the exact conditions.
+-- ignores NULLs. For Last48Hours specifically, AvgPanelPercentage/
+-- AvgLightPercentage are further restricted to only readings taken
+-- during daylight with the battery genuinely charging (for Panel) or
+-- at night (for Light) -- see pole_vitals_loader.py's own comments on
+-- those two constants for the exact conditions.
 --
 -- Fault flags (IsLedFault/IsBatteryFault/IsPanelFault/IsOpenIssueFault/
 -- IsPoleFault) replace an earlier Daylight-based LightStatus
@@ -93,8 +99,7 @@ IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'PoleVitals')
 BEGIN
     CREATE TABLE PoleVitals (
         LocationId           NVARCHAR(100)     NOT NULL,
-        PeriodType           VARCHAR(20)       NOT NULL,  -- 'Hour', 'Last48Hours', or
-                                                            -- 'LastKnown48Hours' -- see the
+        PeriodType           VARCHAR(20)       NOT NULL,  -- 'Hour' or 'Last48Hours' -- see the
                                                             -- header comment above for the
                                                             -- full history of what this
                                                             -- column has allowed over time
@@ -113,7 +118,7 @@ BEGIN
         Source               VARCHAR(50)       NOT NULL,
         SP_ExecId            INT               NULL,
         CONSTRAINT PK_PoleVitals PRIMARY KEY (LocationId, PeriodType, PeriodStart),
-        CONSTRAINT CK_PoleVitals_PeriodType CHECK (PeriodType IN ('Hour', 'Last48Hours', 'LastKnown48Hours'))
+        CONSTRAINT CK_PoleVitals_PeriodType CHECK (PeriodType IN ('Hour', 'Last48Hours'))
     );
 
     CREATE NONCLUSTERED INDEX IX_PoleVitals_PeriodType_PeriodStart

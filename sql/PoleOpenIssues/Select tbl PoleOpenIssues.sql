@@ -8,7 +8,7 @@ SELECT TOP (1000) PoleOpenIssues.[Id]
   FROM [dbo].[PoleOpenIssues] 
   LEFT JOIN Poles p ON PoleOpenIssues.PoleId = p.Id
   WHERE 1 = 1
-  AND p.PoleNumber = 'OSC-1099'
+--   AND p.PoleNumber = 'OSC-1099'
     -- AND PoleOpenIssues.[Id] = 'recXUFnjXiVszvreV'
     -- AND PoleOpenIssues.[PoleId] = 'reccrYpcKacWPvsvL'
     -- AND PoleOpenIssues.[IssueId] LIKE '%BRE-1014%'
