@@ -28,7 +28,7 @@ BEGIN
 
     CREATE NONCLUSTERED INDEX IX_SP_Execution_Environment_StartDateTime
     ON SP_Execution (Environment, StartDateTime);
-END
+END;
 
 -- DROP INDEX IX_SP_Execution_Environment ON SP_Execution;
 -- DROP INDEX IX_SP_Execution_Environment_StartDateTime ON SP_Execution;

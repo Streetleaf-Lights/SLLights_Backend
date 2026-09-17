@@ -126,4 +126,4 @@ BEGIN
 
     CREATE NONCLUSTERED INDEX IX_PoleVitals_SP_ExecId
         ON PoleVitals (SP_ExecId);
-END
+END;

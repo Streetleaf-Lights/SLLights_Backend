@@ -132,7 +132,7 @@ ORDER BY pt.LastUpload DESC
 # pole can have multiple readings within the lookback window, and only
 # its single most recent one should count.
 _FETCH_TELEMETRY_FOR_SCOPE_SQL_TEMPLATE = """
-;WITH RecentTelemetry AS (
+WITH RecentTelemetry AS (
     SELECT
         UserName, GroupId, GatewayCode, ControllerCode, LocationId,
         ROW_NUMBER() OVER (PARTITION BY LocationId ORDER BY LastUpload DESC) AS rn
@@ -250,7 +250,7 @@ def _fetch_latest_telemetry_for_poles(pole_numbers: list):
 
         cursor.execute(
             f"""
-            ;WITH RecentTelemetry AS (
+WITH RecentTelemetry AS (
                 SELECT
                     p.PoleNumber, pt.UserName, pt.GroupId, pt.GatewayCode, pt.ControllerCode,
                     ROW_NUMBER() OVER (PARTITION BY p.PoleNumber ORDER BY pt.LastUpload DESC) AS rn

@@ -43,4 +43,4 @@ IF EXISTS (
 )
 BEGIN
     ALTER TABLE PoleModels DROP COLUMN BatteryChargingMin;
-END
+END;

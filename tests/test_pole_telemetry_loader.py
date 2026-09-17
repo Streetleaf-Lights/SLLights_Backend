@@ -231,7 +231,10 @@ class TestStagingMergeSqlStructure:
         sql = pole_telemetry_loader._STAGING_TABLE_SQL
         assert "IF OBJECT_ID('tempdb..#PoleTelemetryStaging')" in sql
         match = re.search(r"CREATE TABLE #PoleTelemetryStaging \((.+)\);", sql, re.DOTALL)
-        cols = [line.strip().split()[0] for line in match.group(1).strip().split(",")]
+        # Strip comment lines before parsing column names
+        col_lines = [line.strip() for line in match.group(1).strip().split(",")
+                     if line.strip() and not line.strip().startswith("--")]
+        cols = [line.split()[0] for line in col_lines]
         assert cols == pole_telemetry_loader._ALL_COLUMNS
 
     def test_staging_insert_placeholder_count_matches_all_columns(self):
@@ -290,7 +293,7 @@ class TestStagingMergeSqlStructure:
 
 
 # --------------------------------------------------------------------------
-# load_pole_telemetry() -- full flow
+# load_leadsun_pole_telemetry() -- full flow
 # --------------------------------------------------------------------------
 
 
@@ -308,7 +311,7 @@ class TestLoadPoleTelemetrySuccessFlow:
         record2 = make_lamp_record(product_name="POLE-2")
         patch_fetch_lamps.return_value = [record1, record2]
 
-        pole_telemetry_loader.load_pole_telemetry()
+        pole_telemetry_loader.load_leadsun_pole_telemetry()
 
         calls = mock_cursor.execute.call_args_list
         # insert SP_Execution, open-issues lookup, staging create,
@@ -348,7 +351,7 @@ class TestLoadPoleTelemetrySuccessFlow:
         patch_fetch_lamps.return_value = []
         mock_cursor.fetchall.return_value = []  # no LocationIds with open issues
 
-        pole_telemetry_loader.load_pole_telemetry()
+        pole_telemetry_loader.load_leadsun_pole_telemetry()
 
         calls = mock_cursor.execute.call_args_list
         # insert, open-issues lookup, retention purge, final update -- no
@@ -367,7 +370,7 @@ class TestLoadPoleTelemetrySuccessFlow:
         bad_record = {"lastUpload": "2026-01-01T00:00:00Z"}  # missing productName
         patch_fetch_lamps.return_value = [good_record, bad_record]
 
-        pole_telemetry_loader.load_pole_telemetry()
+        pole_telemetry_loader.load_leadsun_pole_telemetry()
 
         final_update_args = mock_cursor.execute.call_args_list[-1].args
         success, errors = final_update_args[2], final_update_args[3]
@@ -384,7 +387,7 @@ class TestLoadPoleTelemetrySuccessFlow:
         record_with_null_upload = make_lamp_record(product_name="POLE-NEVER-UPLOADED", last_upload=None)
         patch_fetch_lamps.return_value = [record_with_null_upload]
 
-        pole_telemetry_loader.load_pole_telemetry()
+        pole_telemetry_loader.load_leadsun_pole_telemetry()
 
         final_update_args = mock_cursor.execute.call_args_list[-1].args
         success, errors = final_update_args[2], final_update_args[3]
@@ -401,7 +404,7 @@ class TestLoadPoleTelemetrySuccessFlow:
         mock_cursor.rowcount = 42
 
         with caplog.at_level("INFO"):
-            pole_telemetry_loader.load_pole_telemetry()
+            pole_telemetry_loader.load_leadsun_pole_telemetry()
 
         messages = [rec.message for rec in caplog.records]
         assert any("purged 42 record(s)" in m for m in messages)
@@ -426,7 +429,7 @@ class TestLoadPoleTelemetryPartialFailure:
             None, None, None, None, None, RuntimeError("bad row"), None, None,
         ]
 
-        pole_telemetry_loader.load_pole_telemetry()  # must not raise
+        pole_telemetry_loader.load_leadsun_pole_telemetry()  # must not raise
 
         final_update_args = mock_cursor.execute.call_args_list[-1].args
         success, errors = final_update_args[2], final_update_args[3]
@@ -441,7 +444,7 @@ class TestLoadPoleTelemetryTopLevelFailure:
         patch_fetch_lamps.side_effect = RuntimeError("leadsun api is down")
 
         with pytest.raises(RuntimeError, match="leadsun api is down"):
-            pole_telemetry_loader.load_pole_telemetry()
+            pole_telemetry_loader.load_leadsun_pole_telemetry()
 
         error_update_calls = [
             call for call in mock_cursor.execute.call_args_list if "ErrorMessage" in call.args[0]
@@ -499,12 +502,14 @@ class TestBackfillIsOpenIssueFaultPerPoleSqlStructure:
         assert "JOIN PoleOpenIssues poi ON poi.PoleId = p.Id" in sql
 
     def test_only_updates_rows_where_the_value_would_actually_change(self):
-        """Avoids rewriting rows that already have the correct value --
-        same "don't touch what's already right" convention as this
-        project's own MERGE-based upserts elsewhere."""
+        """Avoids rewriting rows that already have the correct non-NULL value,
+        but always sets NULL rows explicitly (NULL is not a valid stored state --
+        it means the row was written before IsOpenIssueFault was computed,
+        e.g. by provisioned_telemetry_loader before this fix was applied)."""
         sql = pole_telemetry_loader._BACKFILL_IS_OPEN_ISSUE_FAULT_PER_POLE_SQL
+        assert "t.IsOpenIssueFault IS NULL" in sql
         assert (
-            "AND ISNULL(t.IsOpenIssueFault, 0) <> CASE WHEN loi.LocationId IS NOT NULL THEN 1 ELSE 0 END"
+            "OR t.IsOpenIssueFault <> CASE WHEN loi.LocationId IS NOT NULL THEN 1 ELSE 0 END"
             in sql
         )
 
@@ -1035,7 +1040,7 @@ class TestFetchTelemetryForProjectAggregationSqlIsBounded:
     matched EVERY historical row for EVERY pole PoleTelemetry has ever
     recorded (6 months of retention, potentially many readings per pole
     per day), not just each pole's own current state. update_leadsun_
-    project_details() ran immediately after load_pole_telemetry()
+    project_details() ran immediately after load_leadsun_pole_telemetry()
     finished successfully, then itself failed after an unexplained ~30
     second delay -- exactly the shape of a query trying to scan far more
     data than intended.
@@ -1057,7 +1062,7 @@ class TestFetchTelemetryForProjectAggregationSqlIsBounded:
         """3 hours (or anything similarly small), never anywhere close
         to PoleTelemetry's own 6-month retention window -- this
         function runs every 30 minutes, immediately after
-        load_pole_telemetry() has just refreshed every currently-
+        load_leadsun_pole_telemetry() has just refreshed every currently-
         reporting pole, so a wide lookback here was never actually
         needed to find "current" poles."""
         assert pole_telemetry_loader._PROJECT_DETAILS_LOOKBACK <= timedelta(hours=6)

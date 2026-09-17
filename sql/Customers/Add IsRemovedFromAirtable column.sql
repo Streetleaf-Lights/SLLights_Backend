@@ -36,4 +36,4 @@ IF NOT EXISTS (
 )
 BEGIN
     ALTER TABLE Customers ADD IsRemovedFromAirtable BIT NOT NULL DEFAULT 0;
-END
+END;

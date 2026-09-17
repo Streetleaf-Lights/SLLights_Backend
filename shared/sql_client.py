@@ -51,3 +51,25 @@ def get_connection() -> pyodbc.Connection:
     # returns, not just once somewhere at import time.
     conn.add_output_converter(-155, _decode_datetimeoffset)
     return conn
+
+
+def get_provisioned_connection() -> pyodbc.Connection:
+    """
+    Opens a connection to Streetleaf's own provisioned-poles database --
+    a genuinely SEPARATE Azure SQL server from the one SQL_CONNECTION_STRING
+    points at (same Azure subscription, different server/database), via its
+    own app setting: PROVISIONED_DB_CONNECTION_STRING. Same connection
+    string shape as get_connection() -- just a different server/database/
+    login.
+
+    Kept as its own function, not a parameterized version of
+    get_connection(), so each call site is unambiguous about which
+    database it's talking to just from the function name alone -- this
+    project's convention throughout is one get_*_connection() function per
+    distinct database/server, not one generic function taking a
+    connection-string argument.
+    """
+    conn_str = os.environ["PROVISIONED_DB_CONNECTION_STRING"]
+    conn = pyodbc.connect(conn_str)
+    conn.add_output_converter(-155, _decode_datetimeoffset)
+    return conn

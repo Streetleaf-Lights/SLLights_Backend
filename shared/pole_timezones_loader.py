@@ -7,17 +7,14 @@ from shared.datetime_utils import now_eastern as _now_eastern, to_dto_string as 
 ENVIRONMENT = os.environ.get("ENVIRONMENT", "Dev")
 
 # Two distinct meanings that used to share one SOURCE_NAME constant:
-# EXECUTION_SOURCE tracks which pipeline this loader's own run belongs to
-# (SP_Execution.Source) -- still "Leadsun", since this loader still runs
-# as part of that pipeline's Models -> Telemetry -> TimeZones ->
-# DaylightFlags -> Vitals load order, regardless of where the coordinates
-# it resolves come from. COORDINATE_SOURCE tracks where each row's own
+# EXECUTION_SOURCE tracks which pipeline each loader's run belongs to
+# (SP_Execution.Source). COORDINATE_SOURCE tracks where each row's own
 # Longitude/Latitude actually came from (PoleTimeZones.Source) -- now
 # "CountyTimeZones" (a representative coordinate for that pole's county,
 # via Poles.CountyFips), replacing "Airtable" (Poles.Lat/Poles.Long
-# directly) entirely -- see _RESOLVE_FROM_COUNTY_SQL's own comment for
-# why.
+# directly) entirely -- see _RESOLVE_FROM_COUNTY_SQL's own comment for why.
 EXECUTION_SOURCE = "Leadsun"
+PROVISIONED_EXECUTION_SOURCE = "Provisioned"
 COORDINATE_SOURCE = "CountyTimeZones"
 
 # Resolves and caches each not-yet-seen LocationId's timezone via its
@@ -231,7 +228,7 @@ FROM (
 """
 
 
-def load_pole_timezones(backfill: bool = False) -> None:
+def load_leadsun_pole_timezones(backfill: bool = False) -> None:
     """
     Resolves and caches each not-yet-seen LocationId's timezone (via its
     pole's own county -- see _RESOLVE_FROM_COUNTY_SQL's own comment for
@@ -258,7 +255,7 @@ def load_pole_timezones(backfill: bool = False) -> None:
     CountyFips values does nothing for any pole that already has a
     PoleTimeZones row -- which, in practice, is nearly all of them. This
     is a one-time (or run-again-if-CountyFips-values-get-corrected-later)
-    operation, not part of the normal scheduled loadLeadsunData cycle --
+    operation, not part of the normal scheduled loadDeviceData cycle --
     see scripts/run_pole_timezones_backfill.py for how to invoke it.
     """
     start_time = _to_dto_string(_now_eastern())
@@ -385,6 +382,206 @@ def load_pole_timezones(backfill: bool = False) -> None:
             except Exception as recording_error:
                 logging.error(
                     "loadPoleTimeZones: additionally failed to record this run's "
+                    "failure in SP_Execution (Id=%s): %s -- that row will be left "
+                    "with EndDateTime still NULL. The ORIGINAL failure (%s) is "
+                    "what's actually raised below, not this one.",
+                    sp_exec_id,
+                    recording_error,
+                    ex,
+                )
+        raise
+    finally:
+        cursor.close()
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Provisioned-pole timezone resolution
+# ---------------------------------------------------------------------------
+#
+# Mirrors _RESOLVE_FROM_COUNTY_SQL above but keyed on ProvisionedPoleId
+# instead of LocationId. Provisioned poles are never linked to a Leadsun
+# device (no LocationId), so they can never appear in the Leadsun-keyed
+# resolution path above. Their own identifier is Poles.ProvisionedPoleId
+# (populated by provisioned_data_loader.load_provisioned_pole_serials()),
+# which is what PoleTimeZones must key on for these rows.
+#
+# Same INNER JOIN CountyTimeZones / LEFT JOIN PoleTimeZones logic as the
+# Leadsun path: a provisioned pole whose CountyFips is NULL or doesn't
+# match any CountyTimeZones row is silently excluded from this MERGE
+# (counted separately by _COUNT_UNRESOLVABLE_PROVISIONED_SQL below).
+# Same ROW_NUMBER() deduplication guard: Poles is keyed by Id, not
+# ProvisionedPoleId, so two rows could theoretically share one -- the
+# guard makes the tiebreak deterministic (lowest Poles.Id wins) rather
+# than letting MERGE fail with error 8672.
+#
+# p.ProvisionedPoleId IS NOT NULL: a Poles row exists before serials are
+# loaded (and ProvisionedPoleId is populated), so we must skip poles
+# that haven't been matched to a provisioned serial yet.
+_RESOLVE_PROVISIONED_FROM_COUNTY_SQL = """
+MERGE PoleTimeZones AS target
+USING (
+    SELECT ProvisionedPoleId, Longitude, Latitude, IanaTimeZone, WindowsTimeZone
+    FROM (
+        SELECT
+            p.ProvisionedPoleId,
+            ctz.Longitude,
+            ctz.Latitude,
+            ctz.IanaTimeZone,
+            ctz.WindowsTimeZone,
+            ROW_NUMBER() OVER (PARTITION BY p.ProvisionedPoleId ORDER BY p.Id) AS rn
+        FROM Poles p
+        LEFT JOIN PoleTimeZones ptz ON p.ProvisionedPoleId = ptz.ProvisionedPoleId
+        JOIN CountyTimeZones ctz ON p.CountyFips = ctz.FIPS
+        WHERE ptz.ProvisionedPoleId IS NULL
+          AND p.ProvisionedPoleId IS NOT NULL
+    ) AS deduped
+    WHERE rn = 1
+) AS source
+ON target.ProvisionedPoleId = source.ProvisionedPoleId
+WHEN MATCHED THEN UPDATE SET
+    Longitude       = source.Longitude,
+    Latitude        = source.Latitude,
+    IanaTimeZone    = source.IanaTimeZone,
+    WindowsTimeZone = source.WindowsTimeZone,
+    Source          = ?,
+    SP_ExecId       = ?
+WHEN NOT MATCHED THEN
+    INSERT (ProvisionedPoleId, Longitude, Latitude, IanaTimeZone, WindowsTimeZone, Source, SP_ExecId)
+    VALUES (source.ProvisionedPoleId, source.Longitude, source.Latitude, source.IanaTimeZone,
+            source.WindowsTimeZone, ?, ?);
+"""
+
+# Diagnostic counterpart: counts provisioned poles that have a
+# ProvisionedPoleId but no resolvable CountyFips -- same "make the gap
+# visible rather than silent" purpose as _COUNT_UNRESOLVABLE_SQL above.
+_COUNT_UNRESOLVABLE_PROVISIONED_SQL = """
+SELECT COUNT(*)
+FROM Poles p
+LEFT JOIN PoleTimeZones ptz ON p.ProvisionedPoleId = ptz.ProvisionedPoleId
+LEFT JOIN CountyTimeZones ctz ON p.CountyFips = ctz.FIPS
+WHERE ptz.ProvisionedPoleId IS NULL
+  AND p.ProvisionedPoleId IS NOT NULL
+  AND ctz.FIPS IS NULL
+"""
+
+
+def load_provisioned_pole_timezones() -> None:
+    """
+    Resolves and caches each not-yet-seen ProvisionedPoleId's timezone
+    (via its pole's own county, same CountyFips -> CountyTimeZones path
+    as load_leadsun_pole_timezones()) into PoleTimeZones.
+
+    Keyed on ProvisionedPoleId rather than LocationId -- provisioned poles
+    have no LocationId (it is NULL), so they can never be resolved via the
+    Leadsun path above. Must run AFTER load_provisioned_pole_serials(),
+    which is what populates Poles.ProvisionedPoleId in the first place.
+
+    No backfill variant: provisioned poles are new enough that there are
+    no pre-existing PoleTimeZones rows keyed on ProvisionedPoleId to
+    re-resolve. If that changes, a backfill=True path can be added here
+    mirroring _RESOLVE_FROM_COUNTY_BACKFILL_SQL's own pattern.
+    """
+    start_time = _to_dto_string(_now_eastern())
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    sp_exec_id = None
+    total_success = 0
+    total_errors = 0
+
+    try:
+        # 1. Open an SP_Execution row for this run
+        cursor.execute(
+            """
+            INSERT INTO SP_Execution (Name, Environment, StartDateTime, Source, BatchCount, IsFinalBatch)
+            OUTPUT INSERTED.Id
+            VALUES (?, ?, ?, ?, 0, 0)
+            """,
+            "loadProvisionedPoleTimeZones",
+            ENVIRONMENT,
+            start_time,
+            PROVISIONED_EXECUTION_SOURCE,
+        )
+        sp_exec_id = cursor.fetchone()[0]
+        conn.commit()
+
+        # 2. Resolve every eligible ProvisionedPoleId whose pole's county
+        # is known, in one set-based MERGE.
+        cursor.execute(
+            _RESOLVE_PROVISIONED_FROM_COUNTY_SQL,
+            COORDINATE_SOURCE,
+            sp_exec_id,
+            COORDINATE_SOURCE,
+            sp_exec_id,
+        )
+        total_success = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+        logging.info(
+            "loadProvisionedPoleTimeZones: resolved %d ProvisionedPoleId(s) via CountyTimeZones.",
+            total_success,
+        )
+
+        # 3. Separately report anything the MERGE above could never have
+        # resolved (missing CountyFips or no match in CountyTimeZones) --
+        # diagnostic only, not an error.
+        cursor.execute(_COUNT_UNRESOLVABLE_PROVISIONED_SQL)
+        unresolvable_count = cursor.fetchone()[0]
+        if unresolvable_count > 0:
+            logging.warning(
+                "loadProvisionedPoleTimeZones: %d provisioned pole(s) have a "
+                "ProvisionedPoleId but no resolvable CountyFips (missing entirely, "
+                "or not found in CountyTimeZones) -- these will keep falling back "
+                "to the default timezone until Poles.CountyFips is corrected.",
+                unresolvable_count,
+            )
+
+        conn.commit()
+
+        # 4. Close out the SP_Execution row with final counts
+        cursor.execute(
+            """
+            UPDATE SP_Execution
+            SET EndDateTime = ?,
+                TotalSuccessfulRecords = ?,
+                TotalErrorRecords = ?,
+                BatchCount = ?,
+                IsFinalBatch = 1
+            WHERE Id = ?
+            """,
+            _to_dto_string(_now_eastern()),
+            total_success,
+            total_errors,
+            1,
+            sp_exec_id,
+        )
+        conn.commit()
+
+    except Exception as ex:
+        logging.error("loadProvisionedPoleTimeZones: run failed: %s", ex)
+        if sp_exec_id:
+            try:
+                recovery_conn = get_connection()
+                recovery_cursor = recovery_conn.cursor()
+                try:
+                    recovery_cursor.execute(
+                        """
+                        UPDATE SP_Execution
+                        SET EndDateTime = ?, ErrorMessage = ?, TotalSuccessfulRecords = ?, TotalErrorRecords = ?
+                        WHERE Id = ?
+                        """,
+                        _to_dto_string(_now_eastern()),
+                        str(ex),
+                        total_success,
+                        total_errors,
+                        sp_exec_id,
+                    )
+                    recovery_conn.commit()
+                finally:
+                    recovery_cursor.close()
+                    recovery_conn.close()
+            except Exception as recording_error:
+                logging.error(
+                    "loadProvisionedPoleTimeZones: additionally failed to record this run's "
                     "failure in SP_Execution (Id=%s): %s -- that row will be left "
                     "with EndDateTime still NULL. The ORIGINAL failure (%s) is "
                     "what's actually raised below, not this one.",

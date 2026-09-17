@@ -28,4 +28,4 @@ BEGIN
     -- pattern every other read endpoint in this project already follows.
     CREATE NONCLUSTERED INDEX IX_PoleOpenIssues_PoleId
         ON PoleOpenIssues (PoleId);
-END
+END;

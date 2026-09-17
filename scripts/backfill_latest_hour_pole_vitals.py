@@ -2,9 +2,9 @@
 One-off script to run pole_vitals_loader.backfill_latest_hour_for_all_poles()
 -- ensures EVERY pole has an up-to-date "Hour" PoleVitals row reflecting
 its own most recent known telemetry, no matter how old that telemetry
-is -- outside of the normal loadLeadsunData timer cycle, which only
+is -- outside of the normal loadDeviceData timer cycle, which only
 ever looks within a global time window relative to "now" (even
-load_pole_vitals(backfill=True) doesn't cover this case -- see
+load_leadsun_pole_vitals(backfill=True) doesn't cover this case -- see
 backfill_latest_hour_for_all_poles()'s own docstring for why).
 
 Usage (from the Backend/ project root):

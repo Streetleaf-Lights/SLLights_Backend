@@ -36,4 +36,4 @@ IF NOT EXISTS (
 BEGIN
     CREATE NONCLUSTERED INDEX IX_Projects_LeadsunProjectId
         ON Projects (LeadsunProjectId);
-END
+END;

@@ -41,6 +41,14 @@
 --     BIT NOT NULL DEFAULT 1: every row starts as "active", correct as
 --     a starting assumption since the very next loadPoles run
 --     re-evaluates every row anyway.
+--   * ProvisionedPoleId/PoleModelId/ProvisionedPoleCreatedDateTime --
+--     sourced from Streetleaf's OWN provisioned database's `serials`
+--     table (a separate Azure SQL server), matched onto this table via
+--     serials.serial_number = Poles.ControllerId -- see "Add
+--     ProvisionedPoleId PoleModelId ProvisionedPoleCreatedDateTime
+--     columns.sql" in this same folder for the full mapping/reasoning,
+--     including why ProvisionedPoleCreatedDateTime is a plain
+--     DATETIME2(7) rather than this project's usual DATETIMEOFFSET.
 
 -- DROP TABLE IF EXISTS Poles;
 
@@ -60,7 +68,10 @@ BEGIN
         ControllerId            NVARCHAR(50)         NULL,
         SP_ExecId               INT                  NULL,
         Active                  BIT                  NOT NULL DEFAULT 1,
-        AirTableCreatedDateTime DATETIMEOFFSET(3)    NULL
+        AirTableCreatedDateTime DATETIMEOFFSET(3)    NULL,
+        ProvisionedPoleId               NVARCHAR(64)  NULL,
+        PoleModelId                     INT           NULL,
+        ProvisionedPoleCreatedDateTime  DATETIME2(7)  NULL
     );
 
     CREATE NONCLUSTERED INDEX IX_Poles_SP_ExecId
@@ -77,4 +88,7 @@ BEGIN
 
     CREATE NONCLUSTERED INDEX IX_Poles_CountyFips
         ON Poles (CountyFips);
-END
+
+    CREATE NONCLUSTERED INDEX IX_Poles_PoleModelId
+        ON Poles (PoleModelId);
+END;

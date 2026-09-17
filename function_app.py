@@ -2,6 +2,7 @@ import json
 import logging
 import os
 from datetime import datetime
+from typing import List
 from zoneinfo import ZoneInfo
 
 import azure.functions as func
@@ -10,11 +11,13 @@ from shared.customers_loader import load_customers
 from shared.projects_loader import load_projects
 from shared.poles_loader import load_poles
 from shared.pole_open_issues_loader import load_pole_open_issues
-from shared.pole_models_loader import load_pole_models
-from shared.pole_telemetry_loader import load_pole_telemetry, update_leadsun_project_details
-from shared.pole_timezones_loader import load_pole_timezones
-from shared.pole_daylight_flags_loader import load_pole_daylight_flags
-from shared.pole_vitals_loader import load_pole_vitals
+from shared.pole_models_loader import load_leadsun_pole_models
+from shared.pole_telemetry_loader import load_leadsun_pole_telemetry, update_leadsun_project_details
+from shared.pole_timezones_loader import load_leadsun_pole_timezones, load_provisioned_pole_timezones
+from shared.pole_daylight_flags_loader import load_leadsun_pole_daylight_flags, load_provisioned_pole_daylight_flags
+from shared.pole_vitals_loader import load_leadsun_pole_vitals, load_provisioned_pole_vitals
+from shared.provisioned_data_loader import load_provisioned_pole_models, load_provisioned_pole_serials
+from shared.provisioned_telemetry_loader import process_provisioned_telemetry_events
 from shared.customers_api import get_customers
 from shared.projects_api import get_projects
 from shared.pole_vitals_api import get_pole_vitals, get_pole_vitals_by_period
@@ -150,7 +153,8 @@ def loadAirTableDataManual(req: func.HttpRequest) -> func.HttpResponse:
 # Renamed from loadPoleRawData now that it orchestrates two loaders, not
 # one -- mirrors loadAirTableData's naming (source name + "Data" as the
 # umbrella, individual load_<x>() functions underneath). Load order is
-# Models -> Telemetry -> TimeZones -> DaylightFlags -> Vitals: PoleModels
+# Models -> Telemetry -> TimeZones -> DaylightFlags -> Vitals -> Provisioned
+# PoleModels: PoleModels
 # is a device-model reference table needed by PoleVitals' Panel/Light
 # percentage formulas (SunboardPower/LightPower), PoleTelemetry is the raw
 # readings PoleVitals aggregates (now also computing IsOpenIssueFault per
@@ -167,6 +171,29 @@ def loadAirTableDataManual(req: func.HttpRequest) -> func.HttpResponse:
 # misclassify whichever bucket straddles the actual sunrise/sunset
 # moment), needed by PoleVitals' IsLedFault column, and PoleVitals
 # depends on all four already being current for this cycle.
+#
+# load_provisioned_pole_models() and load_provisioned_pole_serials() run
+# LAST, sequentially AFTER load_leadsun_pole_vitals() -- per explicit
+# request that "loadProvisionedData" run right after loadDeviceData's
+# own Leadsun-sourced steps. Serials runs AFTER models specifically (not
+# just after Vitals) since a serial's own PoleModelId is meant to line
+# up with a PoleModels row the models loader just wrote for that same
+# product_id -- no FK enforces this ordering (see sql/Poles/"Add
+# ProvisionedPoleId PoleModelId ProvisionedPoleCreatedDateTime
+# columns.sql" for why), but it's the logically sensible order
+# regardless. A genuinely SEPARATE timer trigger scheduled to fire
+# shortly after this one's own 30-minute schedule was considered and
+# rejected: this whole pipeline has taken as long as ~20-25 minutes in
+# the past (see the schedule history note below), so a second,
+# independently-scheduled timer can't actually GUARANTEE it runs after
+# this one finishes -- it could just as easily fire while this one is
+# still mid-run. Calling it sequentially, in the same function
+# invocation, is the only way to make "runs right after loadDeviceData"
+# a real guarantee rather than a usually-true assumption. It's a
+# genuinely separate, independent loader in every other sense (its own
+# SP_Execution Name, its own module, its own source database) -- this is
+# purely a scheduling/ordering decision, not a merging of the two into
+# one logical pipeline.
 #
 # schedule history, for anyone wondering why this keeps moving: 10
 # minutes originally -> widened to 30 when Week/Month (since removed
@@ -197,52 +224,115 @@ def loadAirTableDataManual(req: func.HttpRequest) -> func.HttpResponse:
     run_on_startup=False,
     use_monitor=False,
 )
-def loadLeadsunData(myTimer: func.TimerRequest) -> None:
+def loadDeviceData(myTimer: func.TimerRequest) -> None:
     if ENVIRONMENT == "Dev":
         logging.info(
-            "loadLeadsunData: skipping timer-triggered run in Dev -- use "
-            "loadLeadsunDataManual instead."
+            "loadDeviceData: skipping timer-triggered run in Dev -- use "
+            "loadDeviceDataManual instead."
         )
         return
 
     if myTimer.past_due:
-        logging.warning("loadLeadsunData: timer is past due!")
+        logging.warning("loadDeviceData: timer is past due!")
 
-    logging.info("loadLeadsunData: starting run.")
-    load_pole_models()
-    load_pole_telemetry()
+    logging.info("loadDeviceData: starting run.")
+    load_leadsun_pole_models()
+    load_leadsun_pole_telemetry()
     update_leadsun_project_details()
-    load_pole_timezones()
-    load_pole_daylight_flags()
-    load_pole_vitals()
-    logging.info("loadLeadsunData: run complete.")
+    load_leadsun_pole_timezones()
+    load_leadsun_pole_daylight_flags()
+    load_leadsun_pole_vitals()
+    load_provisioned_pole_models()
+    load_provisioned_pole_serials()
+    load_provisioned_pole_timezones()
+    load_provisioned_pole_daylight_flags()
+    load_provisioned_pole_vitals()
+    logging.info("loadDeviceData: run complete.")
 
 
 # Manual trigger for testing outside the 30-minute schedule -- same
 # Prod-blocking convention as loadAirTableDataManual, and unaffected by
-# loadLeadsunData's Dev-skip above -- in Dev, this is the only way to
+# loadDeviceData's Dev-skip above -- in Dev, this is the only way to
 # trigger a run at all.
 @app.route(
-    route="loadLeadsunDataManual", methods=["POST"], auth_level=func.AuthLevel.FUNCTION
+    route="loadDeviceDataManual", methods=["POST"], auth_level=func.AuthLevel.FUNCTION
 )
-def loadLeadsunDataManual(req: func.HttpRequest) -> func.HttpResponse:
+def loadDeviceDataManual(req: func.HttpRequest) -> func.HttpResponse:
     if ENVIRONMENT == "Prod":
         return func.HttpResponse("Manual trigger is disabled in Prod.", status_code=403)
 
-    logging.info("loadLeadsunDataManual: manual run triggered.")
-    load_pole_models()
-    load_pole_telemetry()
+    logging.info("loadDeviceDataManual: manual run triggered.")
+    load_leadsun_pole_models()
+    load_leadsun_pole_telemetry()
     update_leadsun_project_details()
-    load_pole_timezones()
-    load_pole_daylight_flags()
-    load_pole_vitals()
-    logging.info("loadLeadsunDataManual: run complete.")
+    load_leadsun_pole_timezones()
+    load_leadsun_pole_daylight_flags()
+    load_leadsun_pole_vitals()
+    load_provisioned_pole_models()
+    load_provisioned_pole_serials()
+    load_provisioned_pole_timezones()
+    load_provisioned_pole_daylight_flags()
+    load_provisioned_pole_vitals()
+    logging.info("loadDeviceDataManual: run complete.")
 
     return func.HttpResponse(
         "loadPoleModels + loadPoleTelemetry + updateLeadsunProjectDetails + "
-        "loadPoleTimeZones + loadPoleDaylightFlags + loadPoleVitals run complete.",
+        "loadPoleTimeZones + loadPoleDaylightFlags + loadPoleVitals + "
+        "loadProvisionedPoleModels + loadProvisionedPoleSerials + "
+        "loadProvisionedPoleTimeZones + loadProvisionedPoleDaylightFlags + "
+        "loadProvisionedPoleVitals run complete.",
         status_code=200,
     )
+
+
+# --------------------------------------------------------------------------
+# loadProvisionedPoleTelemetry -- EVENT-DRIVEN, not timer/HTTP-triggered
+# like everything else in this file. Streetleaf's own provisioned poles
+# push real-time telemetry to an Azure Event Hub (namespace
+# ProvisionTestEventHub, event hub provisiontesteventhub); this function
+# fires automatically whenever new messages arrive, rather than on a
+# schedule this project controls. See shared/provisioned_telemetry_loader.py's
+# own module docstring for the full message shape/field mapping.
+#
+# cardinality="many": receives a BATCH of messages per invocation (a
+# Python list, even when Azure only had one message ready), not one
+# message per invocation -- lets process_provisioned_telemetry_events()
+# reuse the same chunked staging/MERGE upsert pattern every other loader
+# here already uses, instead of a much less efficient single-row upsert
+# per function invocation.
+#
+# connection="PROVISIONED_EVENT_HUB_CONNECTION_STRING": an app setting
+# holding that Event Hub instance's own connection string (Azure's own
+# per-Event-Hub connection string already includes
+# "EntityPath=provisiontesteventhub", so event_hub_name below is
+# supplied explicitly anyway, for clarity, not because the connection
+# string itself is ambiguous without it).
+#
+# consumer_group="iothub-consumer-group": a DEDICATED consumer group for
+# this function, not the shared $Default one -- so this function's own
+# checkpoint position (how far it's read) never collides with any other
+# reader of this same Event Hub, present or future. This consumer group
+# must already exist on the Event Hub itself (Azure Portal -> the Event
+# Hub -> Consumer Groups -> +Consumer Group) before this function can
+# use it -- creating/naming it here in code doesn't provision it on the
+# Event Hub side.
+#
+# No Dev-environment skip, unlike loadAirTableData/loadDeviceData --
+# there's no equivalent "wait for a schedule" concept to skip; a message
+# either exists to process or it doesn't, in every environment alike.
+@app.event_hub_message_trigger(
+    arg_name="events",
+    event_hub_name="provisiontesteventhub",
+    connection="PROVISIONED_EVENT_HUB_CONNECTION_STRING",
+    consumer_group="iothub-consumer-group",
+    cardinality="many",
+)
+def loadProvisionedPoleTelemetry(events: List[func.EventHubEvent]) -> None:
+    parsed_events = [json.loads(event.get_body()) for event in events]
+    logging.info(
+        "loadProvisionedPoleTelemetry: received %d event(s).", len(parsed_events)
+    )
+    process_provisioned_telemetry_events(parsed_events)
 
 
 # --------------------------------------------------------------------------

@@ -1,22 +1,72 @@
 -- Column list matches pole_telemetry_loader._ALL_COLUMNS exactly (order
 -- included) -- if that list ever changes, regenerate this from it rather
 -- than hand-editing, to avoid drift.
-SELECT TOP 1000
+--
+-- PERFORMANCE: resolved via a PoleContext CTE that looks up the pole's
+-- LocationId/ProvisionedPoleId BEFORE touching PoleTelemetry. This lets
+-- SQL Server seek on PoleTelemetry's composite PK (LocationId, LastUpload)
+-- rather than scanning the whole table and joining afterwards.
+--
+-- The OR join pattern caused a full scan on multi-million-row tables.
+-- Resolving the telemetry key(s) upfront from the small Poles table, then
+-- using UNION ALL to pull Leadsun and provisioned rows separately, gives
+-- SQL Server a seek on each branch independently.
+--
+-- ► To change the filter: edit the WHERE clause inside PoleContext.
+-- ► To change the row limit: edit the TOP value in the final SELECT.
+--
+-- PoleTimeZones join is split by source:
+--   Leadsun rows  → ptz.LocationId
+--   Provisioned   → ptz.ProvisionedPoleId
+-- so both sources get the correct timezone.
+
+WITH PoleContext AS (
+    SELECT
+        Id           AS PoleId,
+        PoleNumber,
+        LocationId          AS LeadsunLocationId,
+        ProvisionedPoleId   AS ProvisionedPoleId
+    FROM Poles
+    WHERE PoleNumber = 'TESTSL1-1002'  -- ← change filter here
+    -- WHERE LocationId = 'DRH-Orl'
+    -- WHERE ProvisionedPoleId = '0a10aced202194944a071358'
+),
+TelemetryForPole AS (
+    -- Leadsun branch: seeks on Poles.LocationId
+    SELECT t.*
+    FROM PoleContext pc
+    JOIN PoleTelemetry t ON t.LocationId = pc.LeadsunLocationId
+    WHERE pc.LeadsunLocationId IS NOT NULL
+
+    UNION ALL
+
+    -- Provisioned branch: seeks on Poles.ProvisionedPoleId
+    SELECT t.*
+    FROM PoleContext pc
+    JOIN PoleTelemetry t ON t.LocationId = pc.ProvisionedPoleId
+    WHERE pc.ProvisionedPoleId IS NOT NULL
+)
+SELECT TOP 1000  -- ← change row limit here
     t.LocationId,
-    p.PoleNumber,
-    LastUpload AT TIME ZONE ISNULL(ptz.WindowsTimeZone, 'Eastern Standard Time') AS LastUpload,
+    pc.PoleNumber,
+    t.LastUpload AT TIME ZONE ISNULL(
+        COALESCE(ptz_l.WindowsTimeZone, ptz_p.WindowsTimeZone),
+        'Eastern Standard Time'
+    ) AS LastUpload,
     IsOnline,
     IsOpenIssueFault,
-    -- Source,
-    -- SP_ExecId,
+    IsDaylight,
+    IsDaylightForLedFault,
+    IsDaylightForPanelFault,
+    t.Source,
+    SolarBoardVoltage,
+    SolarBoardElecCurrent,
     LampPower1,
     LampPower2,
     BatteryVoltage1,
     BatteryVoltage2,
     BatteryElecCurrent1,
     BatteryElecCurrent2,
-    SolarBoardVoltage,
-    SolarBoardElecCurrent,
     DcInVoltage,
     BatteryOutElecCurrent,
     BatteryTemperature1,
@@ -33,9 +83,6 @@ SELECT TOP 1000
     Lamp2State,
     ControllerCode,
     ProductId,
-    CreateTime,
-    SolarBoardDcStatus,
-    LampBatteryStatus,
     UserName,
     LeadsunId,
     GroupId,
@@ -45,92 +92,27 @@ SELECT TOP 1000
     LeadsunProjectName,
     ModelId,
     TimeoutFlag,
-    t.Longitude,
     t.Latitude,
+    t.Longitude,
     ControlModelCode,
     ControlModelName,
+    BatterySoC,
+    LightRatio,
+    PanelPercentage,
+    BatteryFault,
+    LEDFault,
+    ControllerFault,
     ExtraFieldsJson
-FROM PoleTelemetry t
-    LEFT JOIN Poles p ON t.LocationId = p.LocationId
-    LEFT JOIN PoleTimeZones ptz ON t.LocationId = ptz.LocationId
+FROM TelemetryForPole t
+JOIN PoleContext pc ON 1 = 1
+LEFT JOIN PoleTimeZones ptz_l ON t.Source = 'Leadsun'     AND t.LocationId = ptz_l.LocationId
+LEFT JOIN PoleTimeZones ptz_p ON t.Source = 'Provisioned' AND t.LocationId = ptz_p.ProvisionedPoleId
 WHERE 1 = 1
-AND p.PoleNumber = 'PAS-3005'
--- AND (t.LocationId = '12101-4938')
--- AND SP_ExecId = 442
--- AND IsDaylight IS NOT NULL
-    -- AND IsOnline = 0
-    -- AND LampPower1 > 0
-    -- AND LampPower2 > 0
-    -- AND IsOpenIssueFault = 1
-    
-ORDER BY LastUpload DESC;
-
--- SELECT MAX(LastUpload) AS ActualMaxLastUpload
--- FROM PoleTelemetry
--- WHERE LocationId = '12057-1700'
---   AND LastUpload <> '9999-12-31 23:59:59.999 +00:00';
-
--- SELECT TOP 5 StartDateTime, EndDateTime, TotalSuccessfulRecords, TotalErrorRecords, ErrorMessage
--- FROM SP_Execution
--- WHERE Name = 'backfillLatestHourPoleVitals'
--- ORDER BY StartDateTime DESC;
-
--- SELECT LocationId, MAX(LastUpload) AS MaxLastUpload
--- FROM PoleTelemetry
--- WHERE LastUpload <> '9999-12-31 23:59:59.999 +00:00'
--- GROUP BY LocationId
--- HAVING LocationId = '12057-1700';
-
--- SELECT WindowsTimeZone, Latitude, Longitude
--- FROM PoleTimeZones
--- WHERE LocationId = '12057-1700';
-
--- SELECT LocationId, PeriodType, PeriodStart, PeriodEnd, SP_ExecId, RecordCount
--- FROM PoleVitals
--- WHERE LocationId = '12057-1700' AND PeriodType = 'Hour'
--- ORDER BY PeriodStart DESC;
-
--- WITH TelemetryWithFaultFlags AS (
---     SELECT
---         p.PoleNumber,
---         t.LastUpload AT TIME ZONE ISNULL(ptz.WindowsTimeZone, 'Eastern Standard Time') AS LastUpload,
---         t.IsDaylight,
---         -- t.IsDaylightForLedFault,
---         CASE
---             WHEN t.IsDaylightForLedFault = 1 THEN 0
---             WHEN (t.LampPower1 + t.LampPower2) = 0 THEN 1
---             ELSE 0
---         END AS IsLedFaultFlag,
---         -- t.LampPower1,
---         -- t.LampPower2,
---         t.IsDaylightForPanelFault,
---         CASE
---             WHEN t.IsDaylightForPanelFault = 0 THEN 0
---             WHEN (t.BatteryVoltage1 + t.BatteryVoltage2) / 2.0 >= ISNULL(pm.BatteryChargingMin, 13.5) THEN 0
---             WHEN (t.SolarBoardVoltage * t.SolarBoardElecCurrent) = 0 THEN 1
---             ELSE 0
---         END AS IsPanelFaultFlag,
---         t.SolarBoardVoltage,
---         t.SolarBoardElecCurrent,
---         -- t.BatteryVoltage1,
---         -- t.BatteryVoltage2,
---         (t.BatteryVoltage1 + t.BatteryVoltage2) / 2.0 AS AvgBatteryVoltage,
---         ISNULL(pm.BatteryChargingMin, 13.5) AS BatteryChargingMin
---     FROM PoleTelemetry t
---     LEFT JOIN Poles p ON t.LocationId = p.LocationId
---     LEFT JOIN PoleModels pm ON t.ModelId = pm.ModelId
---     LEFT JOIN PoleTimeZones ptz ON t.LocationId = ptz.LocationId
---     WHERE t.LocationId = '12057-4424'
---         AND t.LastUpload >= DATEADD(HOUR, -48, SYSDATETIMEOFFSET())
---       AND t.LastUpload <> '9999-12-31 23:59:59.999 +00:00'
--- )
--- SELECT
---     *,
---     CASE
---         WHEN IsLedFaultFlag = 1 AND IsPanelFaultFlag = 1 THEN 'LED + Panel'
---         WHEN IsLedFaultFlag = 1 THEN 'LED'
---         WHEN IsPanelFaultFlag = 1 THEN 'Panel'
---     END AS FaultType
--- FROM TelemetryWithFaultFlags
--- -- WHERE IsLedFaultFlag = 1 OR IsPanelFaultFlag = 1
--- ORDER BY LastUpload DESC;
+    -- AND t.IsDaylight IS NULL
+    -- AND t.IsDaylight = 1
+    -- AND t.IsDaylightForPanelFault IS NULL
+    -- AND t.IsOnline = 0
+    -- AND t.LampPower1 > 0
+    -- AND t.Source = 'Provisioned'
+    -- AND t.IsOpenIssueFault = 1
+ORDER BY t.LastUpload DESC;

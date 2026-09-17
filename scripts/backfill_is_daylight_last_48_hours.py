@@ -2,11 +2,11 @@
 One-off script to fully backfill PoleTelemetry.IsDaylight for ONLY the
 last 48 hours -- i.e. specifically the window pole_vitals_loader.py's
 Last48Hours period type reads -- rather than waiting for
-load_pole_daylight_flags()'s normal, incremental, whole-history backfill
-(bounded at _BATCH_SIZE=20000 rows per 30-minute loadLeadsunData cycle)
+load_leadsun_pole_daylight_flags()'s normal, incremental, whole-history backfill
+(bounded at _BATCH_SIZE=20000 rows per 30-minute loadDeviceData cycle)
 to naturally work its way through however much unflagged history exists.
 
-Why this is needed at all, given load_pole_daylight_flags() already
+Why this is needed at all, given load_leadsun_pole_daylight_flags() already
 processes newest-first: with potentially over a million PoleTelemetry
 rows landing in any given 48-hour window (based on ~11,666 rows every
 ~30 minutes), even newest-first could take most of a day of normal
@@ -25,7 +25,7 @@ Reuses local.settings.json's "Values" (the same file `func start` reads
 and the same approach scripts/run_pole_vitals_backfill.py already uses),
 so if you've already got that configured for local manual-trigger
 testing, this needs no extra setup. Needs SQL_CONNECTION_STRING/
-ENVIRONMENT to run load_pole_daylight_flags() itself, plus
+ENVIRONMENT to run load_leadsun_pole_daylight_flags() itself, plus
 LEADSUN_CLIENT_CERT_PEM (and LEADSUN_SERVER_CA_CERT/
 LEADSUN_SKIP_HOSTNAME_CHECK, if your setup needs them) -- importing
 pole_daylight_flags_loader doesn't itself need these, but
@@ -61,7 +61,7 @@ _MAX_ITERATIONS = 300
 # A single iteration failing (e.g. a transient "Communication link
 # failure" from a dropped connection mid-batch) shouldn't kill this
 # entire, otherwise-successful run and lose all its progress -- each
-# retry opens a genuinely fresh connection (load_pole_daylight_flags()
+# retry opens a genuinely fresh connection (load_leadsun_pole_daylight_flags()
 # always does), giving a real chance of recovering from exactly that
 # kind of transient blip. But CONSECUTIVE failures, specifically, are a
 # different signal from occasional ones -- if it's failing over and
@@ -129,12 +129,12 @@ def count_remaining_unflagged_in_window(cutoff: str, sentinel: str) -> int:
     IsDaylight OR IsDaylightForLedFault IS NULL (see
     _COUNT_REMAINING_SQL's own comment for why both, not just the
     first), and a resolvable PoleTimeZones entry -- i.e. rows
-    load_pole_daylight_flags() COULD flag but hasn't yet. Mirrors
+    load_leadsun_pole_daylight_flags() COULD flag but hasn't yet. Mirrors
     _FIND_UNFLAGGED_SQL's own WindowsTimeZone IS NOT NULL / INNER JOIN
     conditions exactly, so a row that can never be flagged at all (no
     resolved timezone yet) doesn't count as "still pending" here either
     -- otherwise this loop would never terminate waiting on rows
-    load_pole_daylight_flags() itself would also skip forever.
+    load_leadsun_pole_daylight_flags() itself would also skip forever.
     """
     from shared.sql_client import get_connection
 
@@ -160,7 +160,7 @@ def run_backfill_loop(
     directly testable without mocking module-level imports or exercising
     the whole script-as-a-module machinery. load_pole_daylight_flags_fn/
     count_remaining_fn are taken as explicit parameters (rather than
-    calling load_pole_daylight_flags()/count_remaining_unflagged_in_window()
+    calling load_leadsun_pole_daylight_flags()/count_remaining_unflagged_in_window()
     directly) specifically so tests can substitute controlled fakes for
     both -- dependency injection for testability, not because either is
     otherwise reused. sleep_fn defaults to the real time.sleep, but tests
@@ -182,13 +182,13 @@ def run_backfill_loop(
             raise SystemExit(
                 f"Stopping after {_MAX_ITERATIONS} iterations with {remaining} row(s) "
                 "still unflagged in the last-48-hours window -- this is far more than "
-                "expected and likely means load_pole_daylight_flags() is failing "
+                "expected and likely means load_leadsun_pole_daylight_flags() is failing "
                 "repeatedly for the same rows rather than making progress. Check the "
                 "ERROR-level log lines above for the actual failure reason before "
                 "re-running this script."
             )
 
-        logging.info("Iteration %d: calling load_pole_daylight_flags() ...", iteration)
+        logging.info("Iteration %d: calling load_leadsun_pole_daylight_flags() ...", iteration)
         try:
             load_pole_daylight_flags_fn()
             consecutive_failures = 0
@@ -226,7 +226,7 @@ def run_backfill_loop(
 
 
 if __name__ == "__main__":
-    # Without this, load_pole_daylight_flags()'s logging.info()/
+    # Without this, load_leadsun_pole_daylight_flags()'s logging.info()/
     # logging.error() calls are silently swallowed -- there's no Azure
     # Functions runtime here to auto-configure a handler like there is
     # in production.
@@ -245,7 +245,7 @@ if __name__ == "__main__":
     environment = os.environ.get("ENVIRONMENT", "Dev")
     refuse_if_prod(environment)
 
-    from shared.pole_daylight_flags_loader import load_pole_daylight_flags
+    from shared.pole_daylight_flags_loader import load_leadsun_pole_daylight_flags
     from shared.pole_telemetry_loader import _MISSING_LAST_UPLOAD_SENTINEL
     from shared.pole_vitals_loader import _compute_cutoff
     from shared.datetime_utils import now_eastern
@@ -264,6 +264,6 @@ if __name__ == "__main__":
     run_backfill_loop(
         cutoff,
         _MISSING_LAST_UPLOAD_SENTINEL,
-        load_pole_daylight_flags,
+        load_leadsun_pole_daylight_flags,
         count_remaining_unflagged_in_window,
     )

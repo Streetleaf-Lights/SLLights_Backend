@@ -73,4 +73,4 @@ IF NOT EXISTS (
 BEGIN
     ALTER TABLE Projects ADD LeadsunProject NVARCHAR(MAX) NULL;
 END
-GO
+GO;

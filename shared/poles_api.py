@@ -132,8 +132,10 @@ SELECT
 FROM Poles p
 JOIN Projects proj ON p.ProjectId = proj.Id
 JOIN Customers c ON proj.CustomerId = c.Id
-LEFT JOIN PoleVitals rps ON p.LocationId = rps.LocationId AND rps.PeriodType = ?
-LEFT JOIN PoleTimeZones ptz ON p.LocationId = ptz.LocationId
+LEFT JOIN PoleVitals rps ON COALESCE(p.LocationId, p.ProvisionedPoleId) = rps.LocationId AND rps.PeriodType = ?
+LEFT JOIN PoleTimeZones ptz ON
+    (p.LocationId IS NOT NULL AND p.LocationId = ptz.LocationId)
+    OR (p.LocationId IS NULL AND p.ProvisionedPoleId IS NOT NULL AND p.ProvisionedPoleId = ptz.ProvisionedPoleId)
 OUTER APPLY (
     -- TOP 1 ... ORDER BY LastUpload DESC. OUTER (not CROSS): a pole with
     -- no LocationId, or zero matching PoleTelemetry rows at all, must
@@ -144,7 +146,7 @@ OUTER APPLY (
         pt.BatteryElecCurrent1, pt.BatteryElecCurrent2,
         pt.SolarBoardVoltage, pt.SolarBoardElecCurrent, pt.IsDaylightForPanelFault
     FROM PoleTelemetry pt
-    WHERE pt.LocationId = p.LocationId
+    WHERE pt.LocationId = COALESCE(p.LocationId, p.ProvisionedPoleId)
     ORDER BY pt.LastUpload DESC
 ) AS latest_pt
 {where_clause}

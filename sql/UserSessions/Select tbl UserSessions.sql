@@ -6,4 +6,4 @@ SELECT TOP (1000) [Id]
   FROM [dbo].[UserSessions]
 WHERE 1 = 1
   AND [UserId] = '1644b28b-d652-4594-985a-e208deedbffe'
-ORDER BY [CreatedAt] DESC
+ORDER BY [CreatedAt] DESC;

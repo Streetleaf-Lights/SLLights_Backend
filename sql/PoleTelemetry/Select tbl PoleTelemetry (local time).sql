@@ -21,7 +21,7 @@ SELECT TOP 1000
     IsDaylight,
     IsDaylightForLedFault,
     IsDaylightForPanelFault,
-    -- PoleTelemetry.Source,
+    t.Source,
     -- PoleTelemetry.SP_ExecId,
     SolarBoardVoltage,
     SolarBoardElecCurrent,
@@ -69,7 +69,7 @@ LEFT JOIN Poles p ON t.LocationId = p.LocationId
 LEFT JOIN PoleTimeZones ptz ON t.LocationId = ptz.LocationId
 WHERE 1 = 1
 -- AND t.LocationId = 'DRH-Orl'
-AND t.LocationId LIKE '%DRH-Orl%'
+-- AND t.LocationId LIKE '%TESTSL1-100%'
 -- AND p.PoleNumber LIKE '%HIL-4509%'
 -- AND t.SP_ExecId = 442
 -- AND t.IsDaylight IS NULL
@@ -81,6 +81,7 @@ AND t.LocationId LIKE '%DRH-Orl%'
     -- AND t.GatewayCode = 'GT12L94A22082467'
     -- AND t.ProductId = 'AEXSAM2324122936'
     -- AND t.LeadsunProjectId = 389
+    AND t.Source = 'Provisioned' -- 'Leadsun' rows are a different join key, see comment above
 ORDER BY t.LastUpload DESC;
 
 -- SELECT

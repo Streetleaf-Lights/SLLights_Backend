@@ -1,17 +1,25 @@
 SELECT
-    LocationId,
-    Latitude,
-    Longitude,
-    IanaTimeZone,
-    WindowsTimeZone,
-    Source,
-    SP_ExecId
-FROM PoleTimeZones
+    ptz.LocationId,
+    ptz.ProvisionedPoleId,
+    p.PoleNumber,
+    ptz.Latitude,
+    ptz.Longitude,
+    ptz.IanaTimeZone,
+    ptz.WindowsTimeZone,
+    ptz.Source,
+    ptz.SP_ExecId
+FROM PoleTimeZones ptz
+LEFT JOIN Poles p ON (
+    (ptz.LocationId IS NOT NULL AND p.LocationId = ptz.LocationId)
+    OR
+    (ptz.ProvisionedPoleId IS NOT NULL AND p.ProvisionedPoleId = ptz.ProvisionedPoleId)
+)
 WHERE 1 = 1
-AND LocationId = 'JAX-DEMO'
--- AND LocationId LIKE '%jacks%'
--- AND WindowsTimeZone IS NULL  -- unresolved/unmapped locations
-ORDER BY LocationId;
+-- AND ptz.LocationId = 'TESTSL1-1001'
+-- AND ptz.LocationId LIKE '%jacks%'
+-- AND ptz.ProvisionedPoleId IS NOT NULL          -- provisioned poles only
+-- AND ptz.WindowsTimeZone IS NULL  -- unresolved/unmapped locations
+ORDER BY ptz.LocationId;
 
 -- DELETE FROM PoleTimeZones WHERE LocationId = 'JAX-DEMO';
 

@@ -12,13 +12,13 @@ SELECT TOP (1000) [Id]
       ,[AirTableCreatedDateTime]
   FROM [dbo].[Projects]
   WHERE 1 = 1
-    -- AND id = 'recN0tGiFX8nUkO2B'
+    AND [Id] = 'recagXKKY76we25Zw'
 --   AND [CustomerId] = 'recLWjsXN8vskXZbm'
   -- AND PoleNumbers LIKE '%HIL-1333%'
     -- AND Name LIKE '%acacia%'
-    AND LeadsunProject IS NOT NULL
+    -- AND LeadsunProject IS NOT NULL
     -- AND Active = 1
-  ORDER BY [AirTableCreatedDateTime] DESC
+  ORDER BY [AirTableCreatedDateTime] DESC;
 
 -- SELECT DISTINCT t.LocationId
 -- FROM PoleTelemetry t

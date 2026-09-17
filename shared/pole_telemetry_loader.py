@@ -129,6 +129,16 @@ _ALL_COLUMNS = [
     "ControlModelCode",
     "ControlModelName",
     "ExtraFieldsJson",
+    # Provisioned-pole device-reported values, extracted from ExtraFieldsJson
+    # at ingestion time by provisioned_telemetry_loader.py. NULL for all
+    # Leadsun rows -- these columns only exist to give the provisioned vitals
+    # MERGE a clean column reference instead of JSON_VALUE() inside SQL.
+    "BatterySoC",       # device battery state-of-charge 0–100 → AvgBatteryPercentage
+    "LightRatio",       # device light output ratio 0–100   → AvgLightPercentage
+    "PanelPercentage",  # device panel output % 0–100       → AvgPanelPercentage
+    "BatteryFault",     # device battery fault flag (BIT)   → IsBatteryFault
+    "LEDFault",         # device LED fault flag (BIT)       → IsLedFault
+    "ControllerFault",  # device controller fault (BIT)     → IsPanelFault
 ]
 
 _PK_COLUMNS = ["LocationId", "LastUpload"]
@@ -197,7 +207,7 @@ def _map_lamp_record(record: dict) -> dict:
     # _MISSING_LAST_UPLOAD_SENTINEL above). A value that's PRESENT but
     # fails to parse is left as None on purpose -- that's a real parsing
     # problem (unexpected format), not a legitimately-missing timestamp,
-    # and load_pole_telemetry() still treats it as a row-level error rather
+    # and load_leadsun_pole_telemetry() still treats it as a row-level error rather
     # than silently sentineling over what might be a bug.
     raw_last_upload = capitalized.get("LastUpload")
     if raw_last_upload in (None, ""):
@@ -226,7 +236,7 @@ def _fetch_location_ids_with_open_issues(cursor) -> set:
     Every LocationId whose pole has at least one row in PoleOpenIssues --
     PoleOpenIssues.PoleId matches Poles.Id, not LocationId directly, so
     this needs the join through Poles. Fetched once per
-    load_pole_telemetry() run (a single, cheap query -- PoleOpenIssues
+    load_leadsun_pole_telemetry() run (a single, cheap query -- PoleOpenIssues
     only ever holds currently-open issues, not the full issue history,
     so this stays small) rather than a per-row lookup, then checked via
     simple set membership when mapping each lamp record below.
@@ -326,7 +336,13 @@ CREATE TABLE #PoleTelemetryStaging (
     Latitude               FLOAT NULL,
     ControlModelCode       VARCHAR(50) NULL,
     ControlModelName       NVARCHAR(100) NULL,
-    ExtraFieldsJson        NVARCHAR(MAX) NULL
+    ExtraFieldsJson        NVARCHAR(MAX) NULL,
+    BatterySoC             FLOAT NULL,
+    LightRatio             FLOAT NULL,
+    PanelPercentage        FLOAT NULL,
+    BatteryFault           BIT NULL,
+    LEDFault               BIT NULL,
+    ControllerFault        BIT NULL
 );
 """
 
@@ -382,7 +398,7 @@ DELETE FROM PoleTelemetry WHERE LastUpload < DATEADD(MONTH, -{RETENTION_MONTHS},
 """
 
 
-def load_pole_telemetry() -> None:
+def load_leadsun_pole_telemetry() -> None:
     start_time = _to_dto_string(_now_eastern())
     conn = get_connection()
     cursor = conn.cursor()
@@ -537,7 +553,7 @@ def load_pole_telemetry() -> None:
 # essentially every pole regardless of whether it actually had an open
 # issue, since this loader was first built.
 #
-# load_pole_telemetry() itself needs NO fix -- _fetch_location_ids_with_
+# load_leadsun_pole_telemetry() itself needs NO fix -- _fetch_location_ids_with_
 # open_issues() already re-queries PoleOpenIssues/Poles fresh on every
 # single run, so any NEW telemetry ingested after PoleOpenIssues.PoleId
 # is corrected (i.e. after loadPoleOpenIssues runs again with that fix
@@ -567,7 +583,7 @@ def load_pole_telemetry() -> None:
 # accepted limitation of PoleOpenIssues' own data model, not an
 # oversight here.
 _BACKFILL_IS_OPEN_ISSUE_FAULT_PER_POLE_SQL = """
-;WITH LocationIdsWithOpenIssues AS (
+WITH LocationIdsWithOpenIssues AS (
     SELECT DISTINCT p.LocationId
     FROM Poles p
     JOIN PoleOpenIssues poi ON poi.PoleId = p.Id
@@ -588,7 +604,10 @@ JOIN MaxReadingPerPole mr ON t.LocationId = mr.LocationId
 LEFT JOIN LocationIdsWithOpenIssues loi ON t.LocationId = loi.LocationId
 WHERE t.LastUpload > DATEADD(HOUR, -48, mr.MaxLastUpload)
   AND t.LastUpload <= mr.MaxLastUpload
-  AND ISNULL(t.IsOpenIssueFault, 0) <> CASE WHEN loi.LocationId IS NOT NULL THEN 1 ELSE 0 END;
+  AND (
+      t.IsOpenIssueFault IS NULL  -- NULL rows always need to be set explicitly
+      OR t.IsOpenIssueFault <> CASE WHEN loi.LocationId IS NOT NULL THEN 1 ELSE 0 END
+  );
 """
 
 
@@ -605,7 +624,7 @@ def backfill_is_open_issue_fault_for_all_poles() -> None:
     no history of past open/closed status).
 
     NOT needed for any telemetry ingested AFTER loadPoleOpenIssues runs
-    with the corrected field mapping -- load_pole_telemetry() itself
+    with the corrected field mapping -- load_leadsun_pole_telemetry() itself
     already re-resolves this fresh on every single run, so new readings
     get the right value automatically. This is purely for rows already
     written with the wrong value baked in before that point.
@@ -613,7 +632,7 @@ def backfill_is_open_issue_fault_for_all_poles() -> None:
     Intended to be run manually, once, as a one-off correction after
     deploying the PoleOpenIssues.PoleId fix (and after running
     loadPoleOpenIssues at least once with that fix in place) -- NOT part
-    of the normal, scheduled loadLeadsunData cycle. See
+    of the normal, scheduled loadDeviceData cycle. See
     scripts/backfill_is_open_issue_fault.py for how to invoke it.
 
     Run this BEFORE re-running
@@ -885,7 +904,7 @@ WHERE JSON_VALUE(LeadsunProject, '$.ProjectId') IS NOT NULL
 """
 
 _FETCH_TELEMETRY_FOR_PROJECT_AGGREGATION_SQL = """
-;WITH RecentTelemetry AS (
+WITH RecentTelemetry AS (
     SELECT
         LeadsunProjectId, LeadsunProjectName, GroupId, GroupName,
         GatewayCode, LeadsunId, LocationId, ControllerCode, ProductId,
@@ -910,11 +929,11 @@ WHERE rt.rn = 1
 # pole's own history, so that matched EVERY historical row for EVERY
 # pole ever recorded, not just its current state; a real production
 # incident -- update_leadsun_project_details() ran immediately after
-# load_pole_telemetry() finished, then failed itself after a long,
+# load_leadsun_pole_telemetry() finished, then failed itself after a long,
 # unexplained delay, root-caused to exactly this unbounded scan).
 #
 # This function runs every 30 minutes, immediately after
-# load_pole_telemetry() has just refreshed every currently-reporting
+# load_leadsun_pole_telemetry() has just refreshed every currently-reporting
 # pole's own row -- so a pole that's genuinely still active will always
 # have a LastUpload well within this window. 3 hours (matching this
 # project's own established "recent lookback" convention elsewhere,
@@ -937,8 +956,8 @@ def update_leadsun_project_details() -> None:
     Enriches every Project's own LeadsunProject JSON with the full
     ProjectName/UserName/groups/products structure, aggregated fresh
     from whatever PoleTelemetry currently holds -- run this AFTER
-    load_pole_telemetry() has refreshed that table (see
-    function_app.py's own loadLeadsunData/loadLeadsunDataManual, where
+    load_leadsun_pole_telemetry() has refreshed that table (see
+    function_app.py's own loadDeviceData/loadDeviceDataManual, where
     this is wired in immediately after it), not on its own separate
     schedule -- there would be nothing new to aggregate otherwise.
 

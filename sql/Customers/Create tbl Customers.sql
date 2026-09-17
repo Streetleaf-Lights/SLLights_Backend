@@ -27,7 +27,7 @@ BEGIN
 
     CREATE NONCLUSTERED INDEX IX_Customers_Name_City_State
         ON Customers (Name, City, State);
-END
+END;
 
 -- EXEC sp_rename 'Customers.BatchId', 'SP_ExecId', 'COLUMN';
 

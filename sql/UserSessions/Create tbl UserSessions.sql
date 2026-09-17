@@ -32,4 +32,4 @@ BEGIN
 
     CREATE NONCLUSTERED INDEX IX_UserSessions_ExpiresAt
         ON UserSessions (ExpiresAt);  -- for a future cleanup job purging long-expired rows
-END
+END;

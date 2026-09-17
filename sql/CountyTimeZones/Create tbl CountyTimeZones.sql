@@ -3217,5 +3217,5 @@ VALUES
     ('44001', N'Bristol County', 'RI', 41.70433095052489, -71.28855246916844, 'America/New_York', 'Eastern Standard Time', NULL),
     ('44005', N'Newport County', 'RI', 41.506365576778116, -71.28645960678055, 'America/New_York', 'Eastern Standard Time', NULL),
     ('44003', N'Kent County', 'RI', 41.67802801243245, -71.5721479509472, 'America/New_York', 'Eastern Standard Time', NULL);
-GO
+GO;
 

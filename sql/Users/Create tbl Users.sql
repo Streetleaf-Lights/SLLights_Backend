@@ -60,4 +60,4 @@ BEGIN
 
     CREATE NONCLUSTERED INDEX IX_Users_ResetToken
         ON Users (ResetToken);
-END
+END;

@@ -38,4 +38,4 @@ IF NOT EXISTS (
 )
 BEGIN
     ALTER TABLE Poles ADD IsRemovedFromAirtable BIT NOT NULL DEFAULT 0;
-END
+END;

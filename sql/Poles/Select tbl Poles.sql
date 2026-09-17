@@ -3,6 +3,8 @@ SELECT --TOP (1000)
       ,[PoleNumber]
       ,[LocationId]
       ,[ControllerId]
+      ,ProvisionedPoleId
+      ,PoleModelId
       ,CountyFips
       ,Active
       ,[ProjectId]
@@ -12,13 +14,14 @@ SELECT --TOP (1000)
       ,[Long]
       ,[SP_ExecId]
       ,[AirTableCreatedDateTime]
+      ,ProvisionedPoleCreatedDateTime
   FROM [dbo].[Poles]
   WHERE 1 = 1
     -- AND Id = 'recBlYYoOlMDMisfv' 
 --   AND [LocationId] = 'WREC-1044'
     -- AND LocationId LIKE '%jacks%'
-    -- AND PoleNumber = 'PAS-4938'
-    -- AND PoleNumber LIKE '%12009-100%'
+    -- AND PoleNumber = 'TESTSL1-1001'
+    AND PoleNumber LIKE '%TESTSL1-100%'
     -- AND (Long IS NULL OR Lat IS NULL)
     -- AND CountyFips IS NOT NULL
     -- AND ControllerId IS NULL

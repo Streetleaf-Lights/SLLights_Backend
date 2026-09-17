@@ -88,14 +88,14 @@ class TestMapRecordToIssue:
         "PoleId" field links to a synced/mirror table, NOT the real
         Poles table this project's own Poles.Id comes from -- its record
         ids never actually lined up with Poles.Id, despite the matching
-        name. "PoleRecordID" is the field that genuinely does, and must
+        name. "OriginalPoleRecordID" is the field that genuinely does, and must
         be the one used here regardless of what "PoleId" itself holds."""
         record = {
             "id": "recSampleIssue002",
             "fields": {
                 "IssueID": "some-issue-id",
                 "PoleId": ["recFromTheWrongSyncTable"],
-                "PoleRecordID": ["recFromTheRealPolesTable"],
+                "OriginalPoleRecordID": ["recFromTheRealPolesTable"],
                 "Status": "Open",
                 "Pole Status": ["Electrical Issue"],
             },
@@ -113,12 +113,12 @@ class TestMapRecordToIssue:
                 # Both fields present, matching a real Airtable record --
                 # PoleId links to a synced/mirror table (its ids don't
                 # line up with this project's own Poles.Id at all), while
-                # PoleRecordID is the one that genuinely does. Confirms
+                # OriginalPoleRecordID is the one that genuinely does. Confirms
                 # the correct one is specifically chosen, not just that
                 # the new field name happens to work when the old one is
                 # absent.
                 "PoleId": ["recWrongSyncTableId"],
-                "PoleRecordID": ["recC8GYNmkJDei0PV"],
+                "OriginalPoleRecordID": ["recC8GYNmkJDei0PV"],
                 "Status": "Open",
                 "Pole Status": ["Electrical Issue"],
             },

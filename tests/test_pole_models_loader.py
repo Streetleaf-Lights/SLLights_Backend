@@ -196,7 +196,7 @@ class TestStagingMergeSqlStructure:
 
 
 # --------------------------------------------------------------------------
-# load_pole_models() -- full flow
+# load_leadsun_pole_models() -- full flow
 # --------------------------------------------------------------------------
 
 
@@ -214,7 +214,7 @@ class TestLoadPoleModelsSuccessFlow:
         record2 = make_model_record(model_id=83)
         patch_fetch_models.return_value = [record1, record2]
 
-        pole_models_loader.load_pole_models()
+        pole_models_loader.load_leadsun_pole_models()
 
         calls = mock_cursor.execute.call_args_list
         # insert SP_Execution, staging create, merge-from-staging, truncate,
@@ -251,7 +251,7 @@ class TestLoadPoleModelsSuccessFlow:
     ):
         patch_fetch_models.return_value = []
 
-        pole_models_loader.load_pole_models()
+        pole_models_loader.load_leadsun_pole_models()
 
         calls = mock_cursor.execute.call_args_list
         assert len(calls) == 2  # insert + final update -- no staging table needed
@@ -266,7 +266,7 @@ class TestLoadPoleModelsSuccessFlow:
         bad_record = {"modelName": "Broken"}  # missing modelId
         patch_fetch_models.return_value = [good_record, bad_record]
 
-        pole_models_loader.load_pole_models()
+        pole_models_loader.load_leadsun_pole_models()
 
         final_update_args = mock_cursor.execute.call_args_list[-1].args
         success, errors = final_update_args[2], final_update_args[3]
@@ -292,7 +292,7 @@ class TestLoadPoleModelsPartialFailure:
             None, None, None, None, RuntimeError("bad row"), None,
         ]
 
-        pole_models_loader.load_pole_models()  # must not raise
+        pole_models_loader.load_leadsun_pole_models()  # must not raise
 
         final_update_args = mock_cursor.execute.call_args_list[-1].args
         success, errors = final_update_args[2], final_update_args[3]
@@ -307,7 +307,7 @@ class TestLoadPoleModelsTopLevelFailure:
         patch_fetch_models.side_effect = RuntimeError("leadsun api is down")
 
         with pytest.raises(RuntimeError, match="leadsun api is down"):
-            pole_models_loader.load_pole_models()
+            pole_models_loader.load_leadsun_pole_models()
 
         error_update_calls = [
             call for call in mock_cursor.execute.call_args_list if "ErrorMessage" in call.args[0]

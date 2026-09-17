@@ -55,4 +55,4 @@ BEGIN
 
     CREATE NONCLUSTERED INDEX IX_PoleModels_SP_ExecId
         ON PoleModels (SP_ExecId);
-END
+END;

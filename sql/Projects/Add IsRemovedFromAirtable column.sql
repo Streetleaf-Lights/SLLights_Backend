@@ -36,4 +36,4 @@ IF NOT EXISTS (
 )
 BEGIN
     ALTER TABLE Projects ADD IsRemovedFromAirtable BIT NOT NULL DEFAULT 0;
-END
+END;

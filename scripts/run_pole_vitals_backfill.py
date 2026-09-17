@@ -1,7 +1,7 @@
 """
 One-off script to run a full historical backfill of PoleVitals -- i.e.
-pole_vitals_loader.load_pole_vitals(backfill=True) -- outside of the
-normal loadLeadsunData timer cycle, which only recomputes recent buckets.
+pole_vitals_loader.load_leadsun_pole_vitals(backfill=True) -- outside of the
+normal loadDeviceData timer cycle, which only recomputes recent buckets.
 
 Usage (from the Backend/ project root):
 
@@ -10,7 +10,7 @@ Usage (from the Backend/ project root):
 Reuses local.settings.json's "Values" (the same file `func start` reads),
 so if you've already got that configured for local manual-trigger testing,
 this needs no extra setup. Only needs SQL_CONNECTION_STRING/ENVIRONMENT to
-run load_pole_vitals() itself, but importing pole_vitals_loader pulls in
+run load_leadsun_pole_vitals() itself, but importing pole_vitals_loader pulls in
 pole_telemetry_loader -> leadsun_client, which reads LEADSUN_CLIENT_CERT_PEM
 eagerly at import time even though this script never calls fetch_lamps()
 -- so that (and LEADSUN_SERVER_CA_CERT/LEADSUN_SKIP_HOSTNAME_CHECK, if your
@@ -67,7 +67,7 @@ def refuse_if_prod(environment: str) -> None:
 
 
 if __name__ == "__main__":
-    # Without this, load_pole_vitals()'s logging.info()/logging.error()
+    # Without this, load_leadsun_pole_vitals()'s logging.info()/logging.error()
     # calls are silently swallowed -- there's no Azure Functions runtime
     # here to auto-configure a handler like there is in production.
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -85,8 +85,8 @@ if __name__ == "__main__":
     environment = os.environ.get("ENVIRONMENT", "Dev")
     refuse_if_prod(environment)
 
-    from shared.pole_vitals_loader import load_pole_vitals
+    from shared.pole_vitals_loader import load_leadsun_pole_vitals
 
     logging.info("Running PoleVitals backfill against ENVIRONMENT=%s ...", environment)
-    load_pole_vitals(backfill=True)
+    load_leadsun_pole_vitals(backfill=True)
     logging.info("Backfill complete.")

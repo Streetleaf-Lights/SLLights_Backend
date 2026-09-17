@@ -38,4 +38,4 @@ BEGIN
         UpdatedAt         DATETIMEOFFSET NOT NULL DEFAULT SYSDATETIMEOFFSET(),
         CONSTRAINT PK_LeadsunEdgeAccounts PRIMARY KEY (Username)
     );
-END
+END;

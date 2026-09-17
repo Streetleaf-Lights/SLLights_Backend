@@ -269,7 +269,7 @@ WHEN NOT MATCHED THEN
 """
 
 
-def load_pole_models() -> None:
+def load_leadsun_pole_models() -> None:
     start_time = _to_dto_string(_now_eastern())
     conn = get_connection()
     cursor = conn.cursor()

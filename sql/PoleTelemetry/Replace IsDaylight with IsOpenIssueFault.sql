@@ -97,4 +97,4 @@ IF EXISTS (
 )
 BEGIN
     ALTER TABLE PoleTelemetry DROP COLUMN IsDaylight;
-END
+END;

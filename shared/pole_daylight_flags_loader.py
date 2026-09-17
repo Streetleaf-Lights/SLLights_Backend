@@ -11,13 +11,14 @@ from shared.daylight_utils import is_daylight
 
 ENVIRONMENT = os.environ.get("ENVIRONMENT", "Dev")
 SOURCE_NAME = "Leadsun"
+PROVISIONED_SOURCE_NAME = "Provisioned"
 
 # Bounds how many not-yet-flagged rows get processed per run. Mainly
 # relevant right after IsDaylight is first added (when potentially the
 # entire existing PoleTelemetry history is unflagged, needing several
 # runs to fully backfill) -- ongoing operation only ever has a small
 # number of newly-arrived, not-yet-flagged rows per 30-minute cycle
-# (loadLeadsunData's current schedule), well under this cap.
+# (loadDeviceData's current schedule), well under this cap.
 _BATCH_SIZE = 20000
 
 # How often (in rows processed) to log a progress line during the
@@ -60,7 +61,7 @@ _PANEL_FAULT_SUNSET_WINDDOWN_PERIOD = timedelta(hours=1)
 
 # INNER JOIN (not LEFT): a row whose LocationId has no PoleTimeZones
 # entry yet can't have its daylight status computed at all -- it's left
-# for a later cycle once load_pole_timezones() has caught up, matching
+# for a later cycle once load_leadsun_pole_timezones() has caught up, matching
 # the load-order dependency (TimeZones runs before this loader).
 #
 # WindowsTimeZone IS NOT NULL: a NULL WindowsTimeZone means that
@@ -162,7 +163,7 @@ WHERE LocationId = ? AND LastUpload = ?
 """
 
 
-def load_pole_daylight_flags() -> None:
+def load_leadsun_pole_daylight_flags() -> None:
     """
     Computes and caches IsDaylight, IsDaylightForLedFault, AND
     IsDaylightForPanelFault on PoleTelemetry rows missing any one of
@@ -479,6 +480,219 @@ def load_pole_daylight_flags() -> None:
                     "failure in SP_Execution (Id=%s): %s -- that row will be left with "
                     "EndDateTime still NULL. The ORIGINAL failure (%s) is what's actually "
                     "raised below, not this one.",
+                    sp_exec_id,
+                    recording_error,
+                    ex,
+                )
+        raise
+    finally:
+        cursor.close()
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Provisioned-pole daylight flag computation
+# ---------------------------------------------------------------------------
+#
+# Mirrors _FIND_UNFLAGGED_SQL above but joins PoleTimeZones on
+# ProvisionedPoleId instead of LocationId. Provisioned telemetry is stored
+# in PoleTelemetry with LocationId = Poles.ProvisionedPoleId (the device
+# UID from the Event Hub message -- see provisioned_telemetry_loader.py's
+# own comments). PoleTimeZones rows for provisioned poles are keyed on
+# ProvisionedPoleId (populated by load_provisioned_pole_timezones()), not
+# LocationId (which is NULL for those rows), so the join must cross from
+# PoleTelemetry.LocationId to PoleTimeZones.ProvisionedPoleId.
+#
+# All other logic (INNER JOIN so unresolved poles wait, WindowsTimeZone IS
+# NOT NULL guard, sentinel-row exclusion, newest-first ORDER BY, same
+# grace periods and IsDaylight/IsDaylightForLedFault/IsDaylightForPanelFault
+# triple computation) is identical to the Leadsun path -- same hardware
+# characteristics, same fault-detection logic, same load-order dependency
+# (load_provisioned_pole_timezones() must have run first).
+_FIND_PROVISIONED_UNFLAGGED_SQL = """
+SELECT TOP (?) t.LocationId, t.LastUpload, ptz.Latitude, ptz.Longitude
+FROM PoleTelemetry t
+JOIN PoleTimeZones ptz ON t.LocationId = ptz.ProvisionedPoleId
+WHERE (t.IsDaylight IS NULL OR t.IsDaylightForLedFault IS NULL OR t.IsDaylightForPanelFault IS NULL)
+  AND ptz.WindowsTimeZone IS NOT NULL
+  AND t.LastUpload <> '9999-12-31 23:59:59.999 +00:00'
+ORDER BY t.LastUpload DESC
+"""
+
+
+def load_provisioned_pole_daylight_flags() -> None:
+    """
+    Computes and caches IsDaylight, IsDaylightForLedFault, and
+    IsDaylightForPanelFault on PoleTelemetry rows for provisioned poles
+    that are missing any one of them.
+
+    Identical to load_leadsun_pole_daylight_flags() in all respects except
+    the PoleTimeZones join: provisioned telemetry rows store ProvisionedPoleId
+    as their LocationId, so the join crosses PoleTelemetry.LocationId to
+    PoleTimeZones.ProvisionedPoleId rather than PoleTimeZones.LocationId.
+
+    Must run after load_provisioned_pole_timezones() -- same load-order
+    dependency as the Leadsun pair.
+    """
+    start_time = _to_dto_string(_now_eastern())
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    sp_exec_id = None
+    total_success = 0
+    total_errors = 0
+    batch_count = 0
+
+    try:
+        cursor.execute(
+            """
+            INSERT INTO SP_Execution (Name, Environment, StartDateTime, Source, BatchCount, IsFinalBatch)
+            OUTPUT INSERTED.Id
+            VALUES (?, ?, ?, ?, 0, 0)
+            """,
+            "loadProvisionedPoleDaylightFlags",
+            ENVIRONMENT,
+            start_time,
+            PROVISIONED_SOURCE_NAME,
+        )
+        sp_exec_id = cursor.fetchone()[0]
+        conn.commit()
+
+        while True:
+            cursor.execute(_FIND_PROVISIONED_UNFLAGGED_SQL, _BATCH_SIZE)
+            rows = cursor.fetchall()
+            if not rows:
+                break
+
+            batch_count += 1
+            updates = []
+            for i, (location_id, last_upload, latitude, longitude) in enumerate(rows):
+                if i > 0 and i % _PROGRESS_LOG_INTERVAL == 0:
+                    logging.info(
+                        "loadProvisionedPoleDaylightFlags: computed %d/%d rows in batch %d.",
+                        i, len(rows), batch_count,
+                    )
+                try:
+                    is_day = is_daylight(last_upload, latitude, longitude)
+                    is_day_led = (
+                        is_daylight(last_upload - _LED_FAULT_GRACE_PERIOD, latitude, longitude)
+                        or is_day
+                        or is_daylight(last_upload + _LED_FAULT_GRACE_PERIOD, latitude, longitude)
+                    )
+                    is_day_panel = (
+                        is_day
+                        and is_daylight(last_upload - _PANEL_FAULT_SUNRISE_WARMUP_PERIOD, latitude, longitude)
+                        and is_daylight(last_upload + _PANEL_FAULT_SUNSET_WINDDOWN_PERIOD, latitude, longitude)
+                    )
+                    updates.append((is_day, is_day_led, is_day_panel, location_id, last_upload))
+                except Exception as row_ex:
+                    total_errors += 1
+                    logging.warning(
+                        "loadProvisionedPoleDaylightFlags: failed to compute IsDaylight "
+                        "for %s @ %s: %s",
+                        location_id, last_upload, row_ex,
+                    )
+
+            if not updates:
+                break
+
+            chunk_size = 2000
+            for chunk_start in range(0, len(updates), chunk_size):
+                chunk = updates[chunk_start: chunk_start + chunk_size]
+                try:
+                    cursor.executemany(_UPDATE_IS_DAYLIGHT_SQL, chunk)
+                    conn.commit()
+                    total_success += len(chunk)
+                except Exception as chunk_ex:
+                    conn.rollback()
+                    logging.warning(
+                        "loadProvisionedPoleDaylightFlags: chunk of %d failed (%s); "
+                        "falling back to row-by-row.",
+                        len(chunk), chunk_ex,
+                    )
+                    for is_day, is_day_led, is_day_panel, location_id, last_upload in chunk:
+                        try:
+                            cursor.execute(
+                                _UPDATE_IS_DAYLIGHT_SQL,
+                                is_day, is_day_led, is_day_panel, location_id, last_upload,
+                            )
+                            conn.commit()
+                            total_success += 1
+                        except Exception as row_ex:
+                            conn.rollback()
+                            total_errors += 1
+                            logging.warning(
+                                "loadProvisionedPoleDaylightFlags: failed to store "
+                                "IsDaylight for %s @ %s: %s",
+                                location_id, last_upload, row_ex,
+                            )
+
+            cursor.execute(
+                """
+                UPDATE SP_Execution
+                SET BatchCount = ?, TotalSuccessfulRecords = ?, TotalErrorRecords = ?
+                WHERE Id = ?
+                """,
+                batch_count, total_success, total_errors, sp_exec_id,
+            )
+            conn.commit()
+
+            if len(rows) < _BATCH_SIZE:
+                break
+
+        cursor.execute(
+            """
+            UPDATE SP_Execution
+            SET EndDateTime = ?,
+                TotalSuccessfulRecords = ?,
+                TotalErrorRecords = ?,
+                BatchCount = ?,
+                IsFinalBatch = 1
+            WHERE Id = ?
+            """,
+            _to_dto_string(_now_eastern()),
+            total_success,
+            total_errors,
+            batch_count,
+            sp_exec_id,
+        )
+        conn.commit()
+
+        logging.info(
+            "loadProvisionedPoleDaylightFlags: complete. %d updated, %d errors, %d batch(es).",
+            total_success, total_errors, batch_count,
+        )
+
+    except Exception as ex:
+        logging.error("loadProvisionedPoleDaylightFlags: run failed: %s", ex)
+        if sp_exec_id:
+            try:
+                recovery_conn = get_connection()
+                recovery_cursor = recovery_conn.cursor()
+                try:
+                    recovery_cursor.execute(
+                        """
+                        UPDATE SP_Execution
+                        SET EndDateTime = ?, ErrorMessage = ?,
+                            TotalSuccessfulRecords = ?, TotalErrorRecords = ?
+                        WHERE Id = ?
+                        """,
+                        _to_dto_string(_now_eastern()),
+                        str(ex),
+                        total_success,
+                        total_errors,
+                        sp_exec_id,
+                    )
+                    recovery_conn.commit()
+                finally:
+                    recovery_cursor.close()
+                    recovery_conn.close()
+            except Exception as recording_error:
+                logging.error(
+                    "loadProvisionedPoleDaylightFlags: additionally failed to record this "
+                    "run's failure in SP_Execution (Id=%s): %s -- that row will be left "
+                    "with EndDateTime still NULL. The ORIGINAL failure (%s) is what's "
+                    "actually raised below, not this one.",
                     sp_exec_id,
                     recording_error,
                     ex,

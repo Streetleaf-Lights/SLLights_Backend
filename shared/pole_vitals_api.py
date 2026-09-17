@@ -95,7 +95,7 @@ _ROLLUP_PERIOD_TYPE = "Last48Hours"
 # must still appear, with every count column at 0, rather than being
 # silently dropped from the result entirely.
 _FETCH_SQL_TEMPLATE = """
-;WITH RecentPoleStats AS (
+WITH RecentPoleStats AS (
     SELECT LocationId, IsOnline, IsOpenIssueFault, IsPoleFault
     FROM PoleVitals
     WHERE PeriodType = ?
@@ -108,7 +108,7 @@ PoleWithStatus AS (
         rps.IsOpenIssueFault,
         rps.IsPoleFault
     FROM Poles p
-    LEFT JOIN RecentPoleStats rps ON p.LocationId = rps.LocationId
+    LEFT JOIN RecentPoleStats rps ON COALESCE(p.LocationId, p.ProvisionedPoleId) = rps.LocationId
 ),
 ProjectAgg AS (
     SELECT
@@ -252,8 +252,10 @@ SELECT
 FROM Poles p
 JOIN Projects proj ON p.ProjectId = proj.Id
 JOIN Customers c ON proj.CustomerId = c.Id
-LEFT JOIN PoleVitals rps ON p.LocationId = rps.LocationId AND rps.PeriodType = ?
-LEFT JOIN PoleTimeZones ptz ON p.LocationId = ptz.LocationId
+LEFT JOIN PoleVitals rps ON COALESCE(p.LocationId, p.ProvisionedPoleId) = rps.LocationId AND rps.PeriodType = ?
+LEFT JOIN PoleTimeZones ptz ON
+    (p.LocationId IS NOT NULL AND p.LocationId = ptz.LocationId)
+    OR (p.LocationId IS NULL AND p.ProvisionedPoleId IS NOT NULL AND p.ProvisionedPoleId = ptz.ProvisionedPoleId)
 OUTER APPLY (
     SELECT TOP 1
         pt.LastUpload, pt.ControllerCode, pt.GroupId, pt.ProductId, pt.UserName,
@@ -262,7 +264,7 @@ OUTER APPLY (
         pt.BatteryElecCurrent1, pt.BatteryElecCurrent2,
         pt.SolarBoardVoltage, pt.SolarBoardElecCurrent, pt.IsDaylightForPanelFault
     FROM PoleTelemetry pt
-    WHERE pt.LocationId = p.LocationId
+    WHERE pt.LocationId = COALESCE(p.LocationId, p.ProvisionedPoleId)
     ORDER BY pt.LastUpload DESC
 ) AS latest_pt
 {where_clause}
@@ -889,14 +891,16 @@ SELECT
     latest_pt.SolarBoardVoltage AS SolarBoardVoltage,
     latest_pt.SolarBoardElecCurrent AS SolarBoardElecCurrent
 FROM Poles p
-LEFT JOIN PoleTimeZones ptz ON p.LocationId = ptz.LocationId
+LEFT JOIN PoleTimeZones ptz ON
+    (p.LocationId IS NOT NULL AND p.LocationId = ptz.LocationId)
+    OR (p.LocationId IS NULL AND p.ProvisionedPoleId IS NOT NULL AND p.ProvisionedPoleId = ptz.ProvisionedPoleId)
 OUTER APPLY (
     SELECT TOP 1
         pt.LastUpload, pt.LampPower1, pt.LampPower2,
         pt.BatteryElecCurrent1, pt.BatteryElecCurrent2,
         pt.SolarBoardVoltage, pt.SolarBoardElecCurrent
     FROM PoleTelemetry pt
-    WHERE pt.LocationId = p.LocationId
+    WHERE pt.LocationId = COALESCE(p.LocationId, p.ProvisionedPoleId)
     ORDER BY pt.LastUpload DESC
 ) AS latest_pt
 WHERE p.Id = ?
@@ -964,12 +968,14 @@ WHERE p.Id = ?
 # controlling row count, generating exactly `limit` rows by
 # construction).
 _POLE_VITALS_HOUR_HISTORY_SQL_TEMPLATE = """
-;WITH PoleContext AS (
+WITH PoleContext AS (
     SELECT
-        p.LocationId,
+        COALESCE(p.LocationId, p.ProvisionedPoleId) AS LocationId,
         ISNULL(ptz.WindowsTimeZone, 'Eastern Standard Time') AS TimeZoneName
     FROM Poles p
-    LEFT JOIN PoleTimeZones ptz ON p.LocationId = ptz.LocationId
+    LEFT JOIN PoleTimeZones ptz ON
+        (p.LocationId IS NOT NULL AND p.LocationId = ptz.LocationId)
+        OR (p.LocationId IS NULL AND p.ProvisionedPoleId IS NOT NULL AND p.ProvisionedPoleId = ptz.ProvisionedPoleId)
     WHERE p.Id = ?
 ),
 CurrentBucket AS (

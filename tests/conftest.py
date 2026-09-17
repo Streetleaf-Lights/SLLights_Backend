@@ -15,6 +15,10 @@ os.environ.setdefault("AIRTABLE_API_KEY", "test-airtable-key")
 os.environ.setdefault("AIRTABLE_BASE_ID", "test-base-id")
 os.environ.setdefault("AIRTABLE_POLE_ISSUES_BASE_ID", "test-pole-issues-base-id")
 os.environ.setdefault("SQL_CONNECTION_STRING", "test-connection-string")
+os.environ.setdefault("PROVISIONED_DB_CONNECTION_STRING", "test-provisioned-connection-string")
+os.environ.setdefault(
+    "PROVISIONED_EVENT_HUB_CONNECTION_STRING", "test-provisioned-event-hub-connection-string"
+)
 os.environ.setdefault("ENVIRONMENT", "Dev")
 os.environ.setdefault("AUTH_JWT_SECRET", "test-jwt-secret")
 os.environ.setdefault("MS365_TENANT_ID", "test-tenant-id")
@@ -322,6 +326,42 @@ def patch_get_connection_pole_models(mocker, mock_conn):
     return mocker.patch(
         "shared.pole_models_loader.get_connection", return_value=mock_conn
     )
+
+
+@pytest.fixture
+def patch_get_connection_provisioned_telemetry(mocker, mock_conn):
+    """Patches shared.provisioned_telemetry_loader.get_connection to
+    return mock_conn."""
+    return mocker.patch(
+        "shared.provisioned_telemetry_loader.get_connection", return_value=mock_conn
+    )
+
+
+@pytest.fixture
+def patch_get_connection_provisioned_data(mocker, mock_conn):
+    """Patches shared.provisioned_data_loader.get_connection (THIS
+    project's own database) to return mock_conn -- the same mock_conn/
+    mock_cursor every other loader's tests already use."""
+    return mocker.patch(
+        "shared.provisioned_data_loader.get_connection", return_value=mock_conn
+    )
+
+
+@pytest.fixture
+def patch_get_provisioned_connection(mocker):
+    """Patches shared.provisioned_data_loader.get_provisioned_connection
+    (Streetleaf's OWN separate provisioned-poles database) with its own
+    distinct mock conn/cursor pair -- deliberately NOT mock_conn/
+    mock_cursor, since a test exercising this loader needs to tell
+    apart which calls went to which database."""
+    provisioned_conn = MagicMock(name="provisioned_conn")
+    provisioned_cursor = MagicMock(name="provisioned_cursor")
+    provisioned_conn.cursor.return_value = provisioned_cursor
+    mocker.patch(
+        "shared.provisioned_data_loader.get_provisioned_connection",
+        return_value=provisioned_conn,
+    )
+    return provisioned_conn, provisioned_cursor
 
 
 @pytest.fixture

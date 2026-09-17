@@ -148,7 +148,7 @@ class TestFetchSqlStructure:
 
     def test_left_joins_poles_to_recent_pole_stats(self):
         sql = m._FETCH_SQL_TEMPLATE
-        assert "LEFT JOIN RecentPoleStats rps ON p.LocationId = rps.LocationId" in sql
+        assert "COALESCE(p.LocationId, p.ProvisionedPoleId) = rps.LocationId" in sql
 
     def test_left_joins_projects_and_project_agg_for_phantom_rows(self):
         sql = m._FETCH_SQL_TEMPLATE
@@ -173,7 +173,7 @@ class TestPoleDetailsSqlStructure:
         """Last48Hours is a single row per pole -- no aggregation CTE
         needed at all, unlike the old Hour-window design."""
         sql = m._POLE_DETAILS_SQL_TEMPLATE
-        assert "LEFT JOIN PoleVitals rps ON p.LocationId = rps.LocationId AND rps.PeriodType = ?" in sql
+        assert "COALESCE(p.LocationId, p.ProvisionedPoleId) = rps.LocationId AND rps.PeriodType = ?" in sql
         assert "RecentPoleStats" not in sql
 
     def test_all_five_fault_flags_present(self):
@@ -215,7 +215,7 @@ class TestPoleDetailsSqlStructure:
 
     def test_joins_pole_time_zones_for_the_conversion(self):
         sql = m._POLE_DETAILS_SQL_TEMPLATE
-        assert "LEFT JOIN PoleTimeZones ptz ON p.LocationId = ptz.LocationId" in sql
+        assert "p.ProvisionedPoleId = ptz.ProvisionedPoleId" in sql
 
     def test_outer_apply_still_used_for_telemetry_not_cross(self):
         sql = m._POLE_DETAILS_SQL_TEMPLATE
@@ -992,7 +992,7 @@ class TestGetPoleVitalsByPeriod:
     def test_hour_history_query_resolves_timezone_via_pole_context_cte(self):
         sql = m._POLE_VITALS_HOUR_HISTORY_SQL_TEMPLATE
         assert "WITH PoleContext AS (" in sql
-        assert "LEFT JOIN PoleTimeZones ptz ON p.LocationId = ptz.LocationId" in sql
+        assert "p.ProvisionedPoleId = ptz.ProvisionedPoleId" in sql
         assert "ISNULL(ptz.WindowsTimeZone, 'Eastern Standard Time')" in sql
 
     def test_hour_history_query_no_longer_needs_the_missing_last_upload_sentinel(self):

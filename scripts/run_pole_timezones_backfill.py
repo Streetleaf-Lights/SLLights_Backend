@@ -1,7 +1,7 @@
 """
 One-off script to run a full RE-resolution of PoleTimeZones -- i.e.
-pole_timezones_loader.load_pole_timezones(backfill=True) -- outside of
-the normal loadLeadsunData timer cycle, which only resolves LocationIds
+pole_timezones_loader.load_leadsun_pole_timezones(backfill=True) -- outside of
+the normal loadDeviceData timer cycle, which only resolves LocationIds
 that don't already have a PoleTimeZones row.
 
 Why this is needed at all: this project's poles were resolved via the
@@ -77,7 +77,7 @@ def refuse_if_prod(environment: str) -> None:
 
 
 if __name__ == "__main__":
-    # Without this, load_pole_timezones()'s logging.info()/logging.error()
+    # Without this, load_leadsun_pole_timezones()'s logging.info()/logging.error()
     # calls are silently swallowed -- there's no Azure Functions runtime
     # here to auto-configure a handler like there is in production.
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -93,14 +93,14 @@ if __name__ == "__main__":
     environment = os.environ.get("ENVIRONMENT", "Dev")
     refuse_if_prod(environment)
 
-    from shared.pole_timezones_loader import load_pole_timezones
+    from shared.pole_timezones_loader import load_leadsun_pole_timezones
 
     logging.info(
         "Running PoleTimeZones backfill (re-resolving EVERY pole via CountyFips, "
         "overwriting any existing row) against ENVIRONMENT=%s ...",
         environment,
     )
-    load_pole_timezones(backfill=True)
+    load_leadsun_pole_timezones(backfill=True)
     logging.info(
         "Backfill complete. loadPoleVitals/loadPoleDaylightFlags' next runs will "
         "use the newly-resolved timezones."

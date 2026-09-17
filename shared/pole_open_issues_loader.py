@@ -84,8 +84,8 @@ def _map_record_to_issue(record: dict) -> dict:
         # confirmed that field links to a SYNCED/mirror table, not the
         # real Poles table this project's own Poles.Id comes from, so
         # its record ids don't actually line up with Poles.Id at all.
-        # "PoleRecordID" is the field that genuinely does.
-        "PoleId": _first_linked_value(fields.get("PoleRecordID")),
+        # "OriginalPoleRecordID" is the field that genuinely does.
+        "PoleId": _first_linked_value(fields.get("OriginalPoleRecordID")),
         "Status": fields.get("Status"),
         # Lookup/multi-select field -- list of plain category strings
         # (not record ids), first taken.

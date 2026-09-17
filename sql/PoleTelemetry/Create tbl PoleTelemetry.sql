@@ -100,4 +100,4 @@ BEGIN
                                    -- pole_daylight_flags_loader.py's find-unflagged
                                    -- query filters on, and NULL rows are a small,
                                    -- shrinking subset of the table, not most of it
-END
+END;

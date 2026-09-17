@@ -66,4 +66,4 @@ BEGIN
             IsDaylight
         )
         WITH (ONLINE = ON, RESUMABLE = ON);
-END
+END;

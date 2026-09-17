@@ -127,3 +127,57 @@ def test_get_connection_does_not_swallow_pyodbc_errors(monkeypatch, mocker):
 
     with pytest.raises(RuntimeError, match="login failed"):
         sql_client.get_connection()
+
+
+class TestGetProvisionedConnectionRegistersOutputConverter:
+    def test_registers_decoder_for_sql_type_minus_155_on_the_connection(
+        self, monkeypatch, mocker
+    ):
+        monkeypatch.setenv(
+            "PROVISIONED_DB_CONNECTION_STRING", "Driver=X;Server=ProvisionedY;Database=ProvisionedZ;"
+        )
+        mock_conn = mocker.MagicMock()
+        mocker.patch("shared.sql_client.pyodbc.connect", return_value=mock_conn)
+
+        result = sql_client.get_provisioned_connection()
+
+        mock_conn.add_output_converter.assert_called_once_with(
+            -155, sql_client._decode_datetimeoffset
+        )
+        assert result is mock_conn
+
+
+def test_get_provisioned_connection_uses_its_own_env_connection_string(monkeypatch, mocker):
+    """Confirms it reads PROVISIONED_DB_CONNECTION_STRING specifically,
+    not SQL_CONNECTION_STRING -- these must be two independent settings,
+    pointing at two genuinely different Azure SQL servers."""
+    monkeypatch.setenv(
+        "PROVISIONED_DB_CONNECTION_STRING", "Driver=X;Server=ProvisionedY;Database=ProvisionedZ;"
+    )
+    monkeypatch.setenv("SQL_CONNECTION_STRING", "Driver=X;Server=OurOwnServer;Database=OurOwnDb;")
+    mock_conn = mocker.MagicMock()
+    mock_connect = mocker.patch("shared.sql_client.pyodbc.connect", return_value=mock_conn)
+
+    result = sql_client.get_provisioned_connection()
+
+    mock_connect.assert_called_once_with("Driver=X;Server=ProvisionedY;Database=ProvisionedZ;")
+    assert result is mock_conn
+
+
+def test_get_provisioned_connection_missing_env_var_raises_keyerror(monkeypatch, mocker):
+    monkeypatch.delenv("PROVISIONED_DB_CONNECTION_STRING", raising=False)
+    mocker.patch("shared.sql_client.pyodbc.connect")
+
+    with pytest.raises(KeyError):
+        sql_client.get_provisioned_connection()
+
+
+def test_get_provisioned_connection_does_not_swallow_pyodbc_errors(monkeypatch, mocker):
+    monkeypatch.setenv("PROVISIONED_DB_CONNECTION_STRING", "bad-string")
+    mocker.patch(
+        "shared.sql_client.pyodbc.connect",
+        side_effect=RuntimeError("login failed"),
+    )
+
+    with pytest.raises(RuntimeError, match="login failed"):
+        sql_client.get_provisioned_connection()

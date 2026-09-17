@@ -15,4 +15,4 @@ SELECT TOP (1000) [Id]
 --   AND [Id] = 'recEKgOsGbo5LtZpa'
   and name LIKE '%Streetleaf%'
     -- AND Active = 0
-  ORDER BY [Name]
+  ORDER BY [Name];

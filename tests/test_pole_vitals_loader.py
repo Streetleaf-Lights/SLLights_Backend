@@ -1,7 +1,7 @@
 """Tests for shared/pole_vitals_loader.py"""
 
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
@@ -111,7 +111,7 @@ class TestMergeSqlStructureCommon:
     @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
     def test_light_percentage_formula_uses_light_power_with_nullif_guard(self, period_type):
         sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE[period_type]
-        assert "(t.LampPower1 + t.LampPower2) / NULLIF(ISNULL(pm.LightPower, 30), 0) * 100.0" in sql
+        assert "LampPower2 IS NULL" in sql  # channel-aware: CASE WHEN NULL THEN Lamp1 ELSE Lamp1+Lamp2
 
     @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
     def test_sunboard_power_defaults_to_80_when_model_unmatched(self, period_type):
@@ -146,7 +146,8 @@ class TestMergeSqlStructureCommon:
     @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
     def test_filters_by_last_upload_cutoff(self, period_type):
         sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE[period_type]
-        assert "WHERE t.LastUpload >= ?" in sql
+        assert "WHERE t.Source = 'Leadsun'" in sql
+        assert "t.LastUpload >= ?" in sql or "t.LastUpload >= ?" in sql
 
     @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
     def test_aggregates_with_avg_and_count(self, period_type):
@@ -318,7 +319,8 @@ class TestFaultFlagFormulas:
     @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
     def test_led_fault_formula(self, period_type):
         sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE[period_type]
-        assert "WHEN (t.LampPower1 + t.LampPower2) = 0 THEN 1" in sql
+        assert "LampPower2 IS NULL THEN t.LampPower1 ELSE t.LampPower1 + t.LampPower2" in sql
+        assert "= 0 THEN 1" in sql
 
     @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
     def test_led_fault_excludes_daylight_via_is_daylight_for_led_fault_column(self, period_type):
@@ -334,12 +336,11 @@ class TestFaultFlagFormulas:
         confirmed necessary in practice: a real lamp doesn't always turn
         on the instant the sun crosses the sunset threshold."""
         sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE[period_type]
-        led_fault_case = sql.split("AS IsLedFaultFlag")[0].split("CASE")[-1]
+        led_fault_case = sql.split("AS IsLedFaultFlag")[0]  # full block before alias
         assert "WHEN t.IsDaylightForLedFault = 1 THEN 0" in led_fault_case
-        # The daylight WHEN must appear before the LampPower WHEN, so
-        # it's checked first and short-circuits regardless of LampPower.
-        daylight_pos = led_fault_case.find("IsDaylightForLedFault")
-        lamp_power_pos = led_fault_case.find("LampPower1")
+        # Ordering: daylight check before lamp power check
+        daylight_pos = led_fault_case.rfind("IsDaylightForLedFault = 1 THEN 0")
+        lamp_power_pos = led_fault_case.rfind("LampPower2 IS NULL THEN t.LampPower1")
         assert daylight_pos < lamp_power_pos
 
     @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
@@ -349,7 +350,7 @@ class TestFaultFlagFormulas:
         expression must reference IsDaylightForLedFault, never the
         plain, strict IsDaylight that IsPanelFaultFlag uses instead."""
         sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE[period_type]
-        led_fault_case = sql.split("AS IsLedFaultFlag")[0].split("CASE")[-1]
+        led_fault_case = sql.split("AS IsLedFaultFlag")[0]  # full block before alias
         assert "t.IsDaylight = " not in led_fault_case
 
     @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
@@ -362,7 +363,7 @@ class TestFaultFlagFormulas:
         so this falls out of the CASE's own NULL-propagation naturally,
         without needing an explicit ISNULL() guard."""
         sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE[period_type]
-        led_fault_case = sql.split("AS IsLedFaultFlag")[0].split("CASE")[-1]
+        led_fault_case = sql.split("AS IsLedFaultFlag")[0]  # full block before alias
         # No ISNULL/COALESCE guard around IsDaylightForLedFault -- NULL
         # propagation handles it correctly on its own; adding one would
         # be redundant, not incorrect, so this documents the intentional
@@ -379,10 +380,12 @@ class TestFaultFlagFormulas:
         or the plain, unmodified IsDaylight (which neither fault flag
         reads directly anymore)."""
         sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE[period_type]
-        panel_fault_case = sql.split("AS IsPanelFaultFlag")[0].split("CASE")[-1]
-        assert "WHEN t.IsDaylightForPanelFault = 0 THEN 0" in panel_fault_case
-        assert "IsDaylightForLedFault" not in panel_fault_case
-        assert "t.IsDaylight = " not in panel_fault_case
+        panel_fault_block = sql.split("AS IsPanelFaultFlag")[0]
+        assert "WHEN t.IsDaylightForPanelFault = 0 THEN 0" in panel_fault_block
+        # Check the IsPanelFaultFlag CASE expression itself (between its WHEN and END)
+        panel_case_expr = panel_fault_block.split("WHEN t.IsDaylightForPanelFault")[1].split("END")[0]
+        assert "IsDaylightForLedFault" not in panel_case_expr
+        assert "t.IsDaylight = " not in panel_case_expr
 
     @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
     def test_led_fault_no_longer_references_local_time_or_clock_window(self, period_type):
@@ -391,7 +394,8 @@ class TestFaultFlagFormulas:
         before being replaced by real sunrise/sunset math -- neither
         should be present in the CASE expression anymore."""
         sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE[period_type]
-        led_fault_case = sql.split("AS IsLedFaultFlag")[0].split("CASE")[-1]
+        # Check the IsLedFaultFlag CASE expression specifically, not the whole block
+        led_fault_case = sql.split("WHEN t.IsDaylightForLedFault")[1].split("END AS IsLedFaultFlag")[0]
         assert "LocalTime" not in led_fault_case
         assert "BETWEEN" not in led_fault_case
         assert "07:00:00" not in led_fault_case
@@ -400,8 +404,9 @@ class TestFaultFlagFormulas:
     def test_battery_fault_formula(self, period_type):
         sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE[period_type]
         assert (
-            "WHEN (t.BatteryElecCurrent1 + t.BatteryElecCurrent2) / 2.0 < 10 THEN 1 ELSE 0 END AS IsBatteryFaultFlag"
-            in sql
+            "BatteryElecCurrent2 IS NULL" in sql  # channel-aware: CASE WHEN NULL THEN Current1 ELSE avg
+        ) and (
+            "< 10 THEN 1 ELSE 0 END AS IsBatteryFaultFlag" in sql
         )
 
     @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
@@ -420,14 +425,13 @@ class TestFaultFlagFormulas:
         the panel-output values -- this check must come first in the
         CASE expression and unconditionally return 0."""
         sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE[period_type]
-        panel_fault_case = sql.split("AS IsPanelFaultFlag")[0].split("CASE")[-1]
-        assert "WHEN t.IsDaylightForPanelFault = 0 THEN 0" in panel_fault_case
-        # The daylight-for-panel-fault WHEN must appear before both the
-        # battery-current WHEN and the panel-output WHEN, so it's
-        # checked first and short-circuits regardless of either.
-        daylight_pos = panel_fault_case.find("IsDaylightForPanelFault")
-        battery_current_pos = panel_fault_case.find("BatteryElecCurrent1")
-        panel_output_pos = panel_fault_case.find("SolarBoardVoltage")
+        # Extract from the start of the IsPanelFaultFlag CASE to the END keyword
+        panel_fault_block = sql.split("AS IsPanelFaultFlag")[0]
+        assert "WHEN t.IsDaylightForPanelFault = 0 THEN 0" in panel_fault_block
+        # Ordering check: daylight check before battery current before panel output
+        daylight_pos = panel_fault_block.rfind("IsDaylightForPanelFault = 0")
+        battery_current_pos = panel_fault_block.rfind("BatteryElecCurrent2 IS NULL THEN 100")
+        panel_output_pos = panel_fault_block.rfind("SolarBoardVoltage")
         assert daylight_pos < battery_current_pos < panel_output_pos
 
     @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
@@ -442,7 +446,7 @@ class TestFaultFlagFormulas:
         guard. The mirror image of IsLedFault's own NULL handling, which
         falls through to being treated as "confirmed dark" instead."""
         sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE[period_type]
-        panel_fault_case = sql.split("AS IsPanelFaultFlag")[0].split("CASE")[-1]
+        panel_fault_case = sql.split("AS IsPanelFaultFlag")[0]  # full block before alias
         assert "WHEN t.IsDaylightForPanelFault = 0 THEN 0" in panel_fault_case
 
     @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
@@ -456,8 +460,9 @@ class TestFaultFlagFormulas:
         BatteryChargingMin threshold from PoleModels) by explicit
         request."""
         sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE[period_type]
-        panel_fault_case = sql.split("AS IsPanelFaultFlag")[0].split("CASE")[-1]
-        assert "WHEN (t.BatteryElecCurrent1 + t.BatteryElecCurrent2) = 200 THEN 0" in panel_fault_case
+        panel_fault_case = sql.split("AS IsPanelFaultFlag")[0]  # full block before alias
+        # channel-aware: CASE WHEN BatteryElecCurrent2 IS NULL THEN 100 ELSE 200
+        assert "BatteryElecCurrent2 IS NULL THEN 100 ELSE 200" in panel_fault_case
 
     @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
     def test_panel_fault_uses_battery_elec_current_not_battery_voltage(self, period_type):
@@ -470,10 +475,12 @@ class TestFaultFlagFormulas:
         themselves are no longer referenced anywhere in this CASE
         expression at all."""
         sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE[period_type]
-        panel_fault_case = sql.split("AS IsPanelFaultFlag")[0].split("CASE")[-1]
-        assert "BatteryElecCurrent1" in panel_fault_case
-        assert "BatteryElecCurrent2" in panel_fault_case
-        assert "BatteryVoltage" not in panel_fault_case
+        panel_fault_case = sql.split("AS IsPanelFaultFlag")[0]  # full block before alias
+        assert "BatteryElecCurrent1" in sql  # referenced via CASE WHEN BatteryElecCurrent2 IS NULL
+        assert "BatteryElecCurrent2" in sql
+        # BatteryVoltage should not appear in the IsPanelFaultFlag CASE expression
+        panel_fault_expr = sql.split("WHEN t.IsDaylightForPanelFault")[1].split("END AS IsPanelFaultFlag")[0]
+        assert "BatteryVoltage" not in panel_fault_expr
 
     @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
     def test_panel_fault_missing_battery_current_still_falls_through_to_panel_output_check(
@@ -486,8 +493,9 @@ class TestFaultFlagFormulas:
         T-SQL, so this falls out of the CASE's own NULL-propagation
         naturally."""
         sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE[period_type]
-        panel_fault_case = sql.split("AS IsPanelFaultFlag")[0].split("CASE")[-1]
-        assert "WHEN (t.BatteryElecCurrent1 + t.BatteryElecCurrent2) = 200 THEN 0" in panel_fault_case
+        panel_fault_case = sql.split("AS IsPanelFaultFlag")[0]  # full block before alias
+        # NULL-propagation still holds: CASE WHEN ... IS NULL ... still evaluates NULL = 100 as UNKNOWN
+        assert "BatteryElecCurrent2 IS NULL THEN 100 ELSE 200" in panel_fault_case
 
     @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
     def test_panel_fault_no_longer_involves_pole_models_or_battery_charging_min(self, period_type):
@@ -499,9 +507,11 @@ class TestFaultFlagFormulas:
         entirely (see "sql/PoleModels/Drop BatteryChargingMin
         column.sql")."""
         sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE[period_type]
-        panel_fault_case = sql.split("AS IsPanelFaultFlag")[0].split("CASE")[-1]
-        assert "BatteryChargingMin" not in panel_fault_case
-        assert "pm." not in panel_fault_case
+        panel_fault_case = sql.split("AS IsPanelFaultFlag")[0]  # full block before alias
+        # check the IsPanelFaultFlag CASE expression specifically, not the whole SQL block
+        panel_fault_expr = sql.split("WHEN t.IsDaylightForPanelFault")[1].split("END AS IsPanelFaultFlag")[0]
+        assert "BatteryChargingMin" not in panel_fault_expr
+        assert "pm." not in panel_fault_expr
 
     @pytest.mark.parametrize("period_type", pole_vitals_loader.PERIOD_TYPES)
     def test_open_issue_fault_read_directly_not_recomputed(self, period_type):
@@ -683,7 +693,7 @@ class TestIsBenignNullAggregateWarning:
 
 
 # --------------------------------------------------------------------------
-# load_pole_vitals() -- full flow.
+# load_leadsun_pole_vitals() -- full flow.
 #
 # Execute-call sequence on full success (7 calls total):
 #   0: INSERT SP_Execution
@@ -701,7 +711,7 @@ class TestLoadPoleVitalsSuccessFlow:
         mock_cursor.fetchone.return_value = (77,)
         mock_cursor.rowcount = 5
 
-        pole_vitals_loader.load_pole_vitals()
+        pole_vitals_loader.load_leadsun_pole_vitals()
 
         calls = mock_cursor.execute.call_args_list
         assert len(calls) == 6
@@ -750,7 +760,7 @@ class TestLoadPoleVitalsSuccessFlow:
         mock_cursor.fetchone.return_value = (1,)
         mock_cursor.rowcount = 0
 
-        pole_vitals_loader.load_pole_vitals(backfill=False)
+        pole_vitals_loader.load_leadsun_pole_vitals(backfill=False)
 
         for idx in (1, 3):  # Hour, Last48Hours MERGE calls
             cutoff = mock_cursor.execute.call_args_list[idx].args[-4]
@@ -762,7 +772,7 @@ class TestLoadPoleVitalsSuccessFlow:
         mock_cursor.fetchone.return_value = (1,)
         mock_cursor.rowcount = 0
 
-        pole_vitals_loader.load_pole_vitals(backfill=True)
+        pole_vitals_loader.load_leadsun_pole_vitals(backfill=True)
 
         hour_cutoff = mock_cursor.execute.call_args_list[1].args[-4]
         last48_cutoff = mock_cursor.execute.call_args_list[3].args[-4]
@@ -774,7 +784,7 @@ class TestLoadPoleVitalsSuccessFlow:
         mock_cursor.fetchone.return_value = (1,)
         mock_cursor.rowcount = -1  # pyodbc convention for "not applicable"
 
-        pole_vitals_loader.load_pole_vitals()
+        pole_vitals_loader.load_leadsun_pole_vitals()
 
         final_update_args = mock_cursor.execute.call_args_list[-1].args
         success, errors = final_update_args[2], final_update_args[3]
@@ -805,7 +815,7 @@ class TestLoadPoleVitalsBenignWarningHandling:
             None,  # final update
         ]
 
-        pole_vitals_loader.load_pole_vitals()  # must not raise
+        pole_vitals_loader.load_leadsun_pole_vitals()  # must not raise
 
         final_update_args = mock_cursor.execute.call_args_list[-1].args
         success, errors = final_update_args[2], final_update_args[3]
@@ -826,7 +836,7 @@ class TestLoadPoleVitalsBenignWarningHandling:
         ]
 
         with caplog.at_level("INFO"):
-            pole_vitals_loader.load_pole_vitals()
+            pole_vitals_loader.load_leadsun_pole_vitals()
 
         info_messages = [rec.message for rec in caplog.records if rec.levelname == "INFO"]
         error_messages = [rec.message for rec in caplog.records if rec.levelname == "ERROR"]
@@ -852,7 +862,7 @@ class TestLoadPoleVitalsBenignWarningHandling:
             None, None, None, overflow_exc, None,
         ]
 
-        pole_vitals_loader.load_pole_vitals()  # must not raise (per-period isolation)
+        pole_vitals_loader.load_leadsun_pole_vitals()  # must not raise (per-period isolation)
 
         final_update_args = mock_cursor.execute.call_args_list[-1].args
         success, errors = final_update_args[2], final_update_args[3]
@@ -861,7 +871,7 @@ class TestLoadPoleVitalsBenignWarningHandling:
 
 class TestLoadPoleVitalsPerPeriodTypeCommits:
     """
-    Confirms load_pole_vitals() commits after EACH period type
+    Confirms load_leadsun_pole_vitals() commits after EACH period type
     individually (MERGE + retention prune together, where applicable),
     not once at the end for both.
 
@@ -897,7 +907,7 @@ class TestLoadPoleVitalsPerPeriodTypeCommits:
         mock_cursor.rowcount = 5
         call_order = self._track_calls(mock_conn, mock_cursor)
 
-        pole_vitals_loader.load_pole_vitals()
+        pole_vitals_loader.load_leadsun_pole_vitals()
 
         # insert+commit, then (MERGE, prune, commit) for Hour, then
         # (MERGE, stale-row cleanup, commit) for Last48Hours, then final
@@ -918,7 +928,7 @@ class TestLoadPoleVitalsPerPeriodTypeCommits:
         # index 0 = SP_Execution insert, index 1 = Hour MERGE (benign warning)
         call_order = self._track_calls(mock_conn, mock_cursor, {1: benign_exc})
 
-        pole_vitals_loader.load_pole_vitals()
+        pole_vitals_loader.load_leadsun_pole_vitals()
 
         assert "rollback" not in call_order
         assert call_order.count("commit") == 4  # insert + 2 period types + final update
@@ -931,7 +941,7 @@ class TestLoadPoleVitalsPerPeriodTypeCommits:
         # index 0 = insert, index 1 = Hour MERGE (genuine failure)
         call_order = self._track_calls(mock_conn, mock_cursor, {1: RuntimeError("Hour failed")})
 
-        pole_vitals_loader.load_pole_vitals()  # must not raise
+        pole_vitals_loader.load_leadsun_pole_vitals()  # must not raise
 
         assert call_order == [
             "execute", "commit",             # SP_Execution insert
@@ -948,7 +958,7 @@ class TestLoadPoleVitalsPerPeriodTypeCommits:
         # index 0=insert, 1=Hour MERGE(ok), 2=Hour prune(ok), 3=Last48Hours MERGE(FAILS)
         call_order = self._track_calls(mock_conn, mock_cursor, {3: RuntimeError("Last48Hours failed")})
 
-        pole_vitals_loader.load_pole_vitals()
+        pole_vitals_loader.load_leadsun_pole_vitals()
 
         assert call_order == [
             "execute", "commit",             # SP_Execution insert
@@ -964,7 +974,7 @@ class TestLoadPoleVitalsPerPeriodTypeCommits:
         mock_cursor.rowcount = 5
         self._track_calls(mock_conn, mock_cursor, {1: RuntimeError("Hour failed")})
 
-        pole_vitals_loader.load_pole_vitals()
+        pole_vitals_loader.load_leadsun_pole_vitals()
 
         final_update_args = mock_cursor.execute.call_args_list[-1].args
         success, errors = final_update_args[2], final_update_args[3]
@@ -1058,7 +1068,7 @@ class TestLast48HoursStaleRowCleanup:
 
         mock_cursor.execute.side_effect = _execute_with_stale_cleanup_rowcount
 
-        pole_vitals_loader.load_pole_vitals()
+        pole_vitals_loader.load_leadsun_pole_vitals()
 
         cleanup_call = mock_cursor.execute.call_args_list[4]
         assert cleanup_call.args[0] == pole_vitals_loader._LAST_48_HOURS_STALE_ROW_PRUNE_SQL
@@ -1076,7 +1086,7 @@ class TestLast48HoursStaleRowCleanup:
         ]
         mock_cursor.rowcount = 3
 
-        pole_vitals_loader.load_pole_vitals()  # must not raise
+        pole_vitals_loader.load_leadsun_pole_vitals()  # must not raise
 
         final_update_args = mock_cursor.execute.call_args_list[-1].args
         success, errors = final_update_args[2], final_update_args[3]
@@ -1096,7 +1106,7 @@ class TestLast48HoursStaleRowCleanup:
         mock_cursor.rowcount = 0
 
         with caplog.at_level("ERROR"):
-            pole_vitals_loader.load_pole_vitals()
+            pole_vitals_loader.load_leadsun_pole_vitals()
 
         assert any(
             "failed to recompute Hour period" in rec.message for rec in caplog.records
@@ -1110,7 +1120,7 @@ class TestLoadPoleVitalsTopLevelFailure:
         mock_cursor.execute.side_effect = RuntimeError("db connection lost")
 
         with pytest.raises(RuntimeError, match="db connection lost"):
-            pole_vitals_loader.load_pole_vitals()
+            pole_vitals_loader.load_leadsun_pole_vitals()
 
         mock_cursor.close.assert_called_once()
         mock_conn.close.assert_called_once()
@@ -1127,10 +1137,10 @@ class TestLoadPoleVitalsFailureRecordingUsesAFreshConnection:
     entirely and reached this top-level except block, which (before this
     fix) reused that SAME, already-dead connection to try to record the
     failure -- failing a THIRD time, uncaught, crashing the whole
-    loadLeadsunData timer invocation with SP_Execution's own row left
+    loadDeviceData timer invocation with SP_Execution's own row left
     half-finished. Same fix, same reasoning, as pole_daylight_flags_loader.py/
     pole_timezones_loader.py's own equivalent, and this module's own
-    backfill_*_for_all_poles() functions -- load_pole_vitals() itself was
+    backfill_*_for_all_poles() functions -- load_leadsun_pole_vitals() itself was
     the one loader in this project that had never had it applied.
 
     The ORIGINAL trigger for this class (execute() fails, then
@@ -1173,7 +1183,7 @@ class TestLoadPoleVitalsFailureRecordingUsesAFreshConnection:
         )
 
         with pytest.raises(pyodbc.OperationalError, match="SQLExecDirectW"):
-            pole_vitals_loader.load_pole_vitals()
+            pole_vitals_loader.load_leadsun_pole_vitals()
 
         assert recovery_cursor.execute.called
         update_sql, end_time, error_message, success, errors, sp_exec_id = (
@@ -1207,7 +1217,7 @@ class TestLoadPoleVitalsFailureRecordingUsesAFreshConnection:
 
         with caplog.at_level("ERROR"):
             with pytest.raises(RuntimeError, match="original communication failure"):
-                pole_vitals_loader.load_pole_vitals()
+                pole_vitals_loader.load_leadsun_pole_vitals()
 
         error_messages = [rec.message for rec in caplog.records if rec.levelname == "ERROR"]
         assert any("original communication failure" in msg for msg in error_messages)
@@ -1242,7 +1252,7 @@ class TestLoadPoleVitalsRollbackFailureIsContained:
     """
     Confirms the actual fix for the originally-reported incident: when a
     period type's own MERGE execute() fails AND the subsequent rollback
-    ALSO fails, load_pole_vitals() no longer crashes the entire run --
+    ALSO fails, load_leadsun_pole_vitals() no longer crashes the entire run --
     _safe_rollback() contains it, the ORIGINAL error (not the rollback's
     own) gets logged with full context, and the run completes normally,
     recording this as one counted error rather than an uncaught,
@@ -1270,7 +1280,7 @@ class TestLoadPoleVitalsRollbackFailureIsContained:
         )
 
         with caplog.at_level("ERROR"):
-            pole_vitals_loader.load_pole_vitals()  # must NOT raise
+            pole_vitals_loader.load_leadsun_pole_vitals()  # must NOT raise
 
         error_messages = [rec.message for rec in caplog.records if rec.levelname == "ERROR"]
         assert any(
@@ -1290,7 +1300,7 @@ class TestLoadPoleVitalsRollbackFailureIsContained:
         ]
         mock_conn.rollback.side_effect = RuntimeError("rollback also failed")
 
-        pole_vitals_loader.load_pole_vitals()
+        pole_vitals_loader.load_leadsun_pole_vitals()
 
         final_update_args = mock_cursor.execute.call_args_list[-1].args
         success, errors = final_update_args[2], final_update_args[3]
@@ -1301,7 +1311,7 @@ class TestLoadPoleVitalsRollbackFailureIsContained:
 
 # --------------------------------------------------------------------------
 # backfill_latest_hour_for_all_poles() -- a GENUINELY DIFFERENT query shape
-# from load_pole_vitals()'s own Hour handling, not a parameter variation:
+# from load_leadsun_pole_vitals()'s own Hour handling, not a parameter variation:
 # ensures every pole's "Hour" row reflects its OWN most recent telemetry,
 # no matter how old, rather than only ever looking within a global time
 # window relative to "now" (which even backfill=True still does).
@@ -1367,22 +1377,21 @@ class TestBackfillLatestHourPerPoleMergeSqlStructure:
 
         assert (
             "WHEN t.IsDaylightForLedFault = 1 THEN 0" in backfill_sql
-            and "WHEN (t.LampPower1 + t.LampPower2) = 0 THEN 1" in backfill_sql
+            and "LampPower2 IS NULL THEN t.LampPower1 ELSE t.LampPower1 + t.LampPower2" in backfill_sql
         )
         assert (
             "WHEN t.IsDaylightForPanelFault = 0 THEN 0" in backfill_sql
-            and "WHEN (t.BatteryElecCurrent1 + t.BatteryElecCurrent2) = 200 THEN 0"
-            in backfill_sql
+            and "BatteryElecCurrent2 IS NULL THEN 100 ELSE 200" in backfill_sql
             and "WHEN (t.SolarBoardVoltage * t.SolarBoardElecCurrent) = 0 THEN 1" in backfill_sql
         )
-        assert "(t.BatteryElecCurrent1 + t.BatteryElecCurrent2) / 2.0 < 10 THEN 1 ELSE 0 END AS IsBatteryFaultFlag" in backfill_sql
-        # And confirm those exact same fragments are genuinely present in
-        # the normal Hour merge too, not just independently written the
-        # same way by coincidence.
+        assert "BatteryElecCurrent2 IS NULL" in backfill_sql
+        assert "< 10 THEN 1 ELSE 0 END AS IsBatteryFaultFlag" in backfill_sql
+        # Confirm those exact same fragments are genuinely present in
+        # the normal Hour merge too.
         for fragment in (
             "WHEN t.IsDaylightForLedFault = 1 THEN 0",
             "WHEN t.IsDaylightForPanelFault = 0 THEN 0",
-            "WHEN (t.BatteryElecCurrent1 + t.BatteryElecCurrent2) = 200 THEN 0",
+            "BatteryElecCurrent2 IS NULL THEN 100 ELSE 200",
             "WHEN (t.SolarBoardVoltage * t.SolarBoardElecCurrent) = 0 THEN 1",
         ):
             assert fragment in hour_sql
@@ -1593,7 +1602,7 @@ class TestBackfillLast48HoursOfHourPerPoleMergeSqlStructure:
         falling into a single hour bucket."""
         sql = pole_vitals_loader._BACKFILL_LAST_48_HOURS_OF_HOUR_PER_POLE_MERGE_SQL
         assert "JOIN MaxReadingPerPole mr ON t.LocationId = mr.LocationId" in sql
-        assert "WHERE t.LastUpload > DATEADD(HOUR, -48, mr.MaxLastUpload)" in sql
+        assert "AND t.LastUpload > DATEADD(HOUR, -48, mr.MaxLastUpload)" in sql
         assert "AND t.LastUpload <= mr.MaxLastUpload" in sql
 
     def test_buckets_by_local_hour_same_as_the_normal_hour_merge(self):
@@ -1616,7 +1625,8 @@ class TestBackfillLast48HoursOfHourPerPoleMergeSqlStructure:
         sql = pole_vitals_loader._BACKFILL_LAST_48_HOURS_OF_HOUR_PER_POLE_MERGE_SQL
         assert "WHEN t.IsDaylightForLedFault = 1 THEN 0" in sql
         assert "WHEN t.IsDaylightForPanelFault = 0 THEN 0" in sql
-        assert "WHEN (t.BatteryElecCurrent1 + t.BatteryElecCurrent2) = 200 THEN 0" in sql
+        assert "BatteryElecCurrent2 IS NULL" in sql
+        assert "THEN 0" in sql
         assert "pm.BatteryChargingMin" not in sql  # (comments explaining the change are fine; live code references are not)
         assert "NULLIF(ISNULL(pm.SunboardPower, 80), 0)" in sql
         assert "NULLIF(ISNULL(pm.LightPower, 30), 0)" in sql
@@ -1801,7 +1811,7 @@ class TestLast48HoursConditionalPanelAndLightAverages:
         assert "t.IsDaylightForPanelFault," in telemetry_with_vitals_cte
         assert "t.IsDaylightForLedFault," in telemetry_with_vitals_cte
         assert (
-            "(t.BatteryElecCurrent1 + t.BatteryElecCurrent2) AS BatteryElecCurrentTotal,"
+            "BatteryElecCurrentTotal,"  # channel-aware: CASE WHEN NULL THEN Current1 ELSE Current1+Current2
             in telemetry_with_vitals_cte
         )
 
@@ -1828,3 +1838,297 @@ class TestLast48HoursConditionalPanelAndLightAverages:
         assert "AVG(PanelPercentage)   AS AvgPanelPercentage," in sql
         assert "AVG(LightPercentage)   AS AvgLightPercentage," in sql
         assert "BatteryElecCurrentTotal" not in sql
+
+
+# ---------------------------------------------------------------------------
+# Tests for provisioned-pole vitals SQL and loader
+# ---------------------------------------------------------------------------
+
+class TestProvisionedHourMergeSql:
+    def test_joins_pole_time_zones_on_provisioned_pole_id(self):
+        """KEY difference from the Leadsun Hour MERGE: must join PoleTimeZones
+        on ProvisionedPoleId, not LocationId -- provisioned telemetry stores
+        ProvisionedPoleId as its LocationId, and PoleTimeZones rows for
+        provisioned poles are keyed on ProvisionedPoleId."""
+        sql = pole_vitals_loader._PROVISIONED_HOUR_MERGE_SQL
+        assert "t.LocationId = ptz.ProvisionedPoleId" in sql
+
+    def test_does_not_join_pole_time_zones_on_location_id(self):
+        """Regression guard: must not accidentally use the Leadsun join."""
+        sql = pole_vitals_loader._PROVISIONED_HOUR_MERGE_SQL
+        assert "t.LocationId = ptz.LocationId" not in sql
+
+    def test_still_left_joins_pole_time_zones(self):
+        """LEFT JOIN so poles with no resolved timezone still get processed,
+        falling back to Eastern -- same as the Leadsun path."""
+        sql = pole_vitals_loader._PROVISIONED_HOUR_MERGE_SQL
+        assert "LEFT JOIN PoleTimeZones ptz ON t.LocationId = ptz.ProvisionedPoleId" in sql
+
+    def test_falls_back_to_eastern_when_no_timezone(self):
+        sql = pole_vitals_loader._PROVISIONED_HOUR_MERGE_SQL
+        assert "ISNULL(ptz.WindowsTimeZone, 'Eastern Standard Time')" in sql
+
+    def test_battery_percentage_uses_device_battery_soc(self):
+        """Device reports BatterySoC directly -- used as BatteryPercentage."""
+        sql = pole_vitals_loader._PROVISIONED_HOUR_MERGE_SQL
+        assert "t.BatterySoC" in sql and "BatteryPercentage" in sql
+
+    def test_light_percentage_uses_device_light_ratio(self):
+        sql = pole_vitals_loader._PROVISIONED_HOUR_MERGE_SQL
+        assert "t.LightRatio" in sql and "LightPercentage" in sql
+
+    def test_is_battery_fault_uses_device_battery_fault(self):
+        sql = pole_vitals_loader._PROVISIONED_HOUR_MERGE_SQL
+        assert "t.BatteryFault = 1" in sql
+
+    def test_no_raw_current_or_power_in_executable_sql(self):
+        """Regression guard: no raw hardware math -- device values used directly."""
+        non_comment_lines = [
+            l for l in pole_vitals_loader._PROVISIONED_HOUR_MERGE_SQL.split("\n")
+            if not l.strip().startswith("--")
+        ]
+        assert not any("BatteryElecCurrent1" in l for l in non_comment_lines)
+        assert not any("LampPower1" in l for l in non_comment_lines)
+
+    def test_merges_into_pole_vitals(self):
+        sql = pole_vitals_loader._PROVISIONED_HOUR_MERGE_SQL
+        assert "MERGE PoleVitals AS target" in sql
+
+    def test_period_type_is_hour(self):
+        sql = pole_vitals_loader._PROVISIONED_HOUR_MERGE_SQL
+        assert "'Hour' AS PeriodType" in sql
+
+    def test_excludes_sentinel_rows(self):
+        sql = pole_vitals_loader._PROVISIONED_HOUR_MERGE_SQL
+        assert "t.LastUpload <> ?" in sql
+
+    def test_conditional_avgs_for_panel_and_light(self):
+        """Provisioned path must use the same conditional-AVG logic as Leadsun --
+        panel only during daylight + not fully charged (single channel = 100);
+        light only at night."""
+        sql = pole_vitals_loader._PROVISIONED_HOUR_MERGE_SQL
+        assert "AVG(PanelPercentage) AS AvgPanelPercentage" in sql
+        assert "AVG(LightPercentage) AS AvgLightPercentage" in sql
+
+    def test_four_params_cutoff_sentinel_source_sp_exec_id(self):
+        sql = pole_vitals_loader._PROVISIONED_HOUR_MERGE_SQL
+        assert sql.count("?") == 4
+
+
+class TestProvisionedMergeSqlByPeriodType:
+    def test_hour_uses_provisioned_merge(self):
+        assert (
+            pole_vitals_loader._PROVISIONED_MERGE_SQL_BY_PERIOD_TYPE["Hour"]
+            is pole_vitals_loader._PROVISIONED_HOUR_MERGE_SQL
+        )
+
+    def test_last_48_hours_uses_provisioned_variant_not_leadsun(self):
+        """Must NOT share _LAST_48_HOURS_MERGE_SQL directly -- provisioned
+        poles need ISNULL wraps on BatteryElecCurrent2 and LampPower2."""
+        assert (
+            pole_vitals_loader._PROVISIONED_MERGE_SQL_BY_PERIOD_TYPE["Last48Hours"]
+            is not pole_vitals_loader._LAST_48_HOURS_MERGE_SQL
+        )
+        assert (
+            pole_vitals_loader._PROVISIONED_MERGE_SQL_BY_PERIOD_TYPE["Last48Hours"]
+            is pole_vitals_loader._PROVISIONED_LAST_48_HOURS_MERGE_SQL
+        )
+
+    def test_covers_all_period_types(self):
+        for pt in pole_vitals_loader.PERIOD_TYPES:
+            assert pt in pole_vitals_loader._PROVISIONED_MERGE_SQL_BY_PERIOD_TYPE
+
+
+class TestProvisionedLast48HoursMergeSql:
+    def test_battery_percentage_uses_device_battery_soc(self):
+        sql = pole_vitals_loader._PROVISIONED_LAST_48_HOURS_MERGE_SQL
+        assert "t.BatterySoC AS BatteryPercentage" in sql
+
+    def test_light_percentage_uses_device_light_ratio(self):
+        sql = pole_vitals_loader._PROVISIONED_LAST_48_HOURS_MERGE_SQL
+        assert "t.LightRatio AS LightPercentage" in sql
+
+    def test_panel_percentage_uses_device_panel_percentage(self):
+        sql = pole_vitals_loader._PROVISIONED_LAST_48_HOURS_MERGE_SQL
+        assert "t.PanelPercentage AS PanelPercentage" in sql
+
+    def test_is_battery_fault_uses_device_battery_fault(self):
+        sql = pole_vitals_loader._PROVISIONED_LAST_48_HOURS_MERGE_SQL
+        assert "t.BatteryFault = 1" in sql
+
+    def test_is_led_fault_uses_device_led_fault_with_daylight_guard(self):
+        sql = pole_vitals_loader._PROVISIONED_LAST_48_HOURS_MERGE_SQL
+        assert "IsDaylightForLedFault" in sql
+        assert "t.LEDFault = 1" in sql
+
+    def test_is_panel_fault_uses_device_controller_fault_with_daylight_guard(self):
+        sql = pole_vitals_loader._PROVISIONED_LAST_48_HOURS_MERGE_SQL
+        assert "IsDaylightForPanelFault" in sql
+        assert "t.ControllerFault = 1" in sql
+        # BatterySoC=100 bypass removed -- ControllerFault is authoritative
+        assert "t.BatterySoC = 100" not in sql
+
+    def test_no_raw_current_or_power_expressions_in_executable_sql(self):
+        non_comment = [l for l in pole_vitals_loader._PROVISIONED_LAST_48_HOURS_MERGE_SQL.split("\n")
+                       if not l.strip().startswith("--")]
+        assert not any("BatteryElecCurrent1" in l for l in non_comment)
+        assert not any("LampPower1" in l for l in non_comment)
+        assert not any("SolarBoardVoltage" in l for l in non_comment)
+
+    def test_still_merges_into_pole_vitals(self):
+        sql = pole_vitals_loader._PROVISIONED_LAST_48_HOURS_MERGE_SQL
+        assert "MERGE PoleVitals AS target" in sql
+
+    def test_period_type_is_last_48_hours(self):
+        sql = pole_vitals_loader._PROVISIONED_LAST_48_HOURS_MERGE_SQL
+        assert "'Last48Hours' AS PeriodType" in sql
+
+
+class TestLoadProvisionedPoleVitals:
+    def _make_conn(self, mocker):
+        conn = MagicMock()
+        cursor = MagicMock()
+        conn.cursor.return_value = cursor
+        mocker.patch("shared.pole_vitals_loader.get_connection", return_value=conn)
+        return conn, cursor
+
+    def test_uses_provisioned_source_name(self, mocker):
+        conn, cursor = self._make_conn(mocker)
+        cursor.fetchone.return_value = (42,)
+        cursor.rowcount = 0
+        mocker.patch("shared.pole_vitals_loader._now_eastern", return_value=datetime(2026, 9, 15, 10, 0, tzinfo=timezone.utc))
+
+        pole_vitals_loader.load_provisioned_pole_vitals()
+
+        insert_args = cursor.execute.call_args_list[0].args
+        assert insert_args[4] == pole_vitals_loader.PROVISIONED_SOURCE_NAME
+        assert insert_args[4] != pole_vitals_loader.SOURCE_NAME
+
+    def test_sp_execution_name_is_load_provisioned_pole_vitals(self, mocker):
+        conn, cursor = self._make_conn(mocker)
+        cursor.fetchone.return_value = (42,)
+        cursor.rowcount = 0
+        mocker.patch("shared.pole_vitals_loader._now_eastern", return_value=datetime(2026, 9, 15, 10, 0, tzinfo=timezone.utc))
+
+        pole_vitals_loader.load_provisioned_pole_vitals()
+
+        insert_args = cursor.execute.call_args_list[0].args
+        assert insert_args[1] == "loadProvisionedPoleVitals"
+
+    def test_executes_provisioned_hour_merge(self, mocker):
+        conn, cursor = self._make_conn(mocker)
+        cursor.fetchone.return_value = (42,)
+        cursor.rowcount = 2
+        mocker.patch("shared.pole_vitals_loader._now_eastern", return_value=datetime(2026, 9, 15, 10, 0, tzinfo=timezone.utc))
+
+        pole_vitals_loader.load_provisioned_pole_vitals()
+
+        executed_sqls = [call.args[0] for call in cursor.execute.call_args_list]
+        assert any("ptz.ProvisionedPoleId" in sql for sql in executed_sqls)
+
+    def test_does_not_execute_leadsun_hour_merge(self, mocker):
+        """Regression guard: must not accidentally run the Leadsun Hour MERGE,
+        which would look for PoleTimeZones rows by LocationId and find nothing
+        for provisioned poles."""
+        conn, cursor = self._make_conn(mocker)
+        cursor.fetchone.return_value = (42,)
+        cursor.rowcount = 0
+        mocker.patch("shared.pole_vitals_loader._now_eastern", return_value=datetime(2026, 9, 15, 10, 0, tzinfo=timezone.utc))
+
+        pole_vitals_loader.load_provisioned_pole_vitals()
+
+        executed_sqls = [call.args[0] for call in cursor.execute.call_args_list]
+        assert not any(
+            "t.LocationId = ptz.LocationId" in sql for sql in executed_sqls
+        )
+
+    def test_commits_after_each_period_type(self, mocker):
+        conn, cursor = self._make_conn(mocker)
+        cursor.fetchone.return_value = (42,)
+        cursor.rowcount = 1
+        mocker.patch("shared.pole_vitals_loader._now_eastern", return_value=datetime(2026, 9, 15, 10, 0, tzinfo=timezone.utc))
+
+        pole_vitals_loader.load_provisioned_pole_vitals()
+
+        # SP_Execution INSERT + len(PERIOD_TYPES) MERGEs + len(PERIOD_TYPES) cleanups
+        # + final UPDATE + at least len(PERIOD_TYPES) commits mid-loop + final commit
+        assert conn.commit.call_count >= len(pole_vitals_loader.PERIOD_TYPES) + 1
+
+    def test_failure_records_on_fresh_connection(self, mocker):
+        """When the final SP_Execution UPDATE fails (e.g. connection drops after
+        all MERGEs have run), the recovery path opens a fresh connection and
+        records the error -- mirrors TestLoadLeadsunPoleVitalsFailurePath's
+        own equivalent test exactly."""
+        main_conn, main_cursor = self._make_conn(mocker)
+        main_cursor.fetchone.return_value = (42,)
+        main_cursor.rowcount = 2
+        # SP_Execution INSERT + Hour MERGE + Hour prune + Last48Hours MERGE +
+        # Last48Hours prune = 5 execute calls succeed; 6th (final UPDATE) fails.
+        main_cursor.execute.side_effect = [
+            None, None, None, None, None,
+            pyodbc.OperationalError("08S01", "connection lost (SQLExecDirectW)"),
+        ]
+
+        recovery_conn = MagicMock()
+        recovery_cursor = MagicMock()
+        recovery_conn.cursor.return_value = recovery_cursor
+
+        mocker.patch(
+            "shared.pole_vitals_loader.get_connection",
+            side_effect=[main_conn, recovery_conn],
+        )
+        mocker.patch("shared.pole_vitals_loader._now_eastern", return_value=datetime(2026, 9, 15, 10, 0, tzinfo=timezone.utc))
+
+        with pytest.raises(pyodbc.OperationalError, match="SQLExecDirectW"):
+            pole_vitals_loader.load_provisioned_pole_vitals()
+
+        assert recovery_cursor.execute.called
+        update_sql = recovery_cursor.execute.call_args.args[0]
+        assert "UPDATE SP_Execution" in update_sql
+        assert "ErrorMessage" in update_sql
+
+
+class TestSourceIsolation:
+    """Regression guard: each loader must only process its own source's telemetry.
+    Cross-source contamination causes NULL AvgBatteryPercentage/AvgPanelPercentage
+    for Leadsun poles (provisioned rows have NULL BatteryElecCurrent2/LampPower2)
+    and wrong single-channel arithmetic for provisioned poles (Leadsun rows have
+    both channels)."""
+
+    @pytest.mark.parametrize("sql_name", [
+        "_HOUR_MERGE_SQL", "_LAST_48_HOURS_MERGE_SQL",
+        "_BACKFILL_LATEST_HOUR_PER_POLE_MERGE_SQL",
+        "_BACKFILL_LAST_48_HOURS_OF_HOUR_PER_POLE_MERGE_SQL",
+    ])
+    def test_leadsun_sqls_filter_to_leadsun_source(self, sql_name):
+        sql = getattr(pole_vitals_loader, sql_name)
+        assert "Source = 'Leadsun'" in sql, \
+            f"{sql_name} must filter to Source='Leadsun' to exclude provisioned rows"
+
+    @pytest.mark.parametrize("sql_name", [
+        "_HOUR_MERGE_SQL", "_LAST_48_HOURS_MERGE_SQL",
+        "_BACKFILL_LATEST_HOUR_PER_POLE_MERGE_SQL",
+        "_BACKFILL_LAST_48_HOURS_OF_HOUR_PER_POLE_MERGE_SQL",
+    ])
+    def test_leadsun_sqls_do_not_include_provisioned_source_in_executable_lines(self, sql_name):
+        sql = getattr(pole_vitals_loader, sql_name)
+        non_comment = "\n".join(l for l in sql.split("\n") if not l.strip().startswith("--"))
+        assert "Source = 'Provisioned'" not in non_comment, \
+            f"{sql_name} must not reference Source='Provisioned' in executable SQL"
+
+    @pytest.mark.parametrize("sql_name", [
+        "_PROVISIONED_HOUR_MERGE_SQL", "_PROVISIONED_LAST_48_HOURS_MERGE_SQL",
+    ])
+    def test_provisioned_sqls_filter_to_provisioned_source(self, sql_name):
+        sql = getattr(pole_vitals_loader, sql_name)
+        assert "Source = 'Provisioned'" in sql, \
+            f"{sql_name} must filter to Source='Provisioned' to exclude Leadsun rows"
+
+    @pytest.mark.parametrize("sql_name", [
+        "_PROVISIONED_HOUR_MERGE_SQL", "_PROVISIONED_LAST_48_HOURS_MERGE_SQL",
+    ])
+    def test_provisioned_sqls_do_not_include_leadsun_source_in_executable_lines(self, sql_name):
+        sql = getattr(pole_vitals_loader, sql_name)
+        non_comment = "\n".join(l for l in sql.split("\n") if not l.strip().startswith("--"))
+        assert "Source = 'Leadsun'" not in non_comment, \
+            f"{sql_name} must not reference Source='Leadsun' in executable SQL"

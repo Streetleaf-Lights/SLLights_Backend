@@ -233,7 +233,7 @@ class TestLoadPoleTimezonesDuplicateLocationIdWarning:
 
         with patch("shared.pole_timezones_loader.get_connection", return_value=mock_conn):
             with caplog.at_level("WARNING"):
-                m.load_pole_timezones()
+                m.load_leadsun_pole_timezones()
 
         warnings = [rec.message for rec in caplog.records if rec.levelname == "WARNING"]
         assert any("3 LocationId(s)" in w and "claimed by more than one Poles row" in w for w in warnings)
@@ -247,7 +247,7 @@ class TestLoadPoleTimezonesDuplicateLocationIdWarning:
 
         with patch("shared.pole_timezones_loader.get_connection", return_value=mock_conn):
             with caplog.at_level("WARNING"):
-                m.load_pole_timezones()
+                m.load_leadsun_pole_timezones()
 
         warnings = [rec.message for rec in caplog.records if rec.levelname == "WARNING"]
         assert not any("claimed by more than one Poles row" in w for w in warnings)
@@ -260,7 +260,7 @@ class TestLoadPoleTimezonesDuplicateLocationIdWarning:
         mock_cursor.rowcount = 5
 
         with patch("shared.pole_timezones_loader.get_connection", return_value=mock_conn):
-            m.load_pole_timezones()
+            m.load_leadsun_pole_timezones()
 
         final_update_args = mock_cursor.execute.call_args_list[-1].args
         errors = final_update_args[3]
@@ -279,7 +279,7 @@ class TestLoadPoleTimezonesBackfillParameter:
         mock_cursor.rowcount = 5
 
         with patch("shared.pole_timezones_loader.get_connection", return_value=mock_conn):
-            m.load_pole_timezones()
+            m.load_leadsun_pole_timezones()
 
         merge_sql = mock_cursor.execute.call_args_list[1].args[0]
         count_sql = mock_cursor.execute.call_args_list[2].args[0]
@@ -294,7 +294,7 @@ class TestLoadPoleTimezonesBackfillParameter:
         mock_cursor.rowcount = 5
 
         with patch("shared.pole_timezones_loader.get_connection", return_value=mock_conn):
-            m.load_pole_timezones(backfill=True)
+            m.load_leadsun_pole_timezones(backfill=True)
 
         merge_sql = mock_cursor.execute.call_args_list[1].args[0]
         count_sql = mock_cursor.execute.call_args_list[2].args[0]
@@ -312,7 +312,7 @@ class TestLoadPoleTimezonesBackfillParameter:
         mock_cursor.rowcount = 5
 
         with patch("shared.pole_timezones_loader.get_connection", return_value=mock_conn):
-            m.load_pole_timezones(backfill=True)
+            m.load_leadsun_pole_timezones(backfill=True)
 
         merge_call_args = mock_cursor.execute.call_args_list[1].args
         _, source1, sp_exec_id1, source2, sp_exec_id2 = merge_call_args
@@ -328,7 +328,7 @@ class TestLoadPoleTimezonesBackfillParameter:
 
         with patch("shared.pole_timezones_loader.get_connection", return_value=mock_conn):
             with caplog.at_level("INFO"):
-                m.load_pole_timezones(backfill=True)
+                m.load_leadsun_pole_timezones(backfill=True)
 
         info_messages = [rec.message for rec in caplog.records if rec.levelname == "INFO"]
         assert any("backfill" in msg for msg in info_messages)
@@ -342,7 +342,7 @@ class TestLoadPoleTimezonesBackfillParameter:
 
         with patch("shared.pole_timezones_loader.get_connection", return_value=mock_conn):
             with caplog.at_level("INFO"):
-                m.load_pole_timezones()
+                m.load_leadsun_pole_timezones()
 
         info_messages = [rec.message for rec in caplog.records if rec.levelname == "INFO"]
         assert not any("backfill" in msg for msg in info_messages)
@@ -357,7 +357,7 @@ class TestLoadPoleTimezonesBackfillParameter:
         mock_cursor.rowcount = 15
 
         with patch("shared.pole_timezones_loader.get_connection", return_value=mock_conn):
-            m.load_pole_timezones()
+            m.load_leadsun_pole_timezones()
 
         calls = mock_cursor.execute.call_args_list
         assert len(calls) == 5
@@ -392,7 +392,7 @@ class TestLoadPoleTimezonesBackfillParameter:
         mock_cursor.rowcount = -1  # pyodbc convention for "not applicable"
 
         with patch("shared.pole_timezones_loader.get_connection", return_value=mock_conn):
-            m.load_pole_timezones()
+            m.load_leadsun_pole_timezones()
 
         final_update_args = mock_cursor.execute.call_args_list[-1].args
         success = final_update_args[2]
@@ -407,7 +407,7 @@ class TestLoadPoleTimezonesBackfillParameter:
 
         with patch("shared.pole_timezones_loader.get_connection", return_value=mock_conn):
             with caplog.at_level("WARNING"):
-                m.load_pole_timezones()
+                m.load_leadsun_pole_timezones()
 
         warnings = [rec.message for rec in caplog.records if rec.levelname == "WARNING"]
         assert any("7 pole(s)" in w and "no resolvable CountyFips" in w for w in warnings)
@@ -421,7 +421,7 @@ class TestLoadPoleTimezonesBackfillParameter:
 
         with patch("shared.pole_timezones_loader.get_connection", return_value=mock_conn):
             with caplog.at_level("WARNING"):
-                m.load_pole_timezones()
+                m.load_leadsun_pole_timezones()
 
         warnings = [rec.message for rec in caplog.records if rec.levelname == "WARNING"]
         assert not any("no resolvable CountyFips" in w for w in warnings)
@@ -437,7 +437,7 @@ class TestLoadPoleTimezonesBackfillParameter:
         mock_cursor.rowcount = 3
 
         with patch("shared.pole_timezones_loader.get_connection", return_value=mock_conn):
-            m.load_pole_timezones()
+            m.load_leadsun_pole_timezones()
 
         final_update_args = mock_cursor.execute.call_args_list[-1].args
         errors = final_update_args[3]
@@ -453,7 +453,7 @@ class TestLoadPoleTimezonesTopLevelFailure:
 
         with patch("shared.pole_timezones_loader.get_connection", return_value=mock_conn):
             with pytest.raises(RuntimeError, match="db down"):
-                m.load_pole_timezones()
+                m.load_leadsun_pole_timezones()
 
         mock_cursor.close.assert_called_once()
         mock_conn.close.assert_called_once()
@@ -487,7 +487,7 @@ class TestFailureRecordingUsesAFreshConnection:
         )
 
         with pytest.raises(RuntimeError, match="communication link failure"):
-            m.load_pole_timezones()
+            m.load_leadsun_pole_timezones()
 
         assert recovery_cursor.execute.called
         update_sql, end_time, error_message, success, errors, sp_exec_id = (
@@ -517,7 +517,7 @@ class TestFailureRecordingUsesAFreshConnection:
 
         with caplog.at_level("ERROR"):
             with pytest.raises(RuntimeError, match="original communication failure"):
-                m.load_pole_timezones()
+                m.load_leadsun_pole_timezones()
 
         error_messages = [rec.message for rec in caplog.records if rec.levelname == "ERROR"]
         assert any("original communication failure" in msg for msg in error_messages)
@@ -525,3 +525,221 @@ class TestFailureRecordingUsesAFreshConnection:
             "additionally failed to record this run's failure" in msg and "recovery also failed" in msg
             for msg in error_messages
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests for provisioned-pole timezone resolution
+# ---------------------------------------------------------------------------
+
+
+class TestResolveProvisionedFromCountySql:
+    def test_merges_into_pole_time_zones(self):
+        assert "MERGE PoleTimeZones AS target" in m._RESOLVE_PROVISIONED_FROM_COUNTY_SQL
+
+    def test_keyed_on_provisioned_pole_id_not_location_id(self):
+        sql = m._RESOLVE_PROVISIONED_FROM_COUNTY_SQL
+        assert "ProvisionedPoleId" in sql
+        assert "ON target.ProvisionedPoleId = source.ProvisionedPoleId" in sql
+
+    def test_no_location_id_references_in_provisioned_merge(self):
+        """Regression guard: the provisioned MERGE must not accidentally
+        key on LocationId (which is NULL for provisioned poles and would
+        produce a spurious MERGE match on NULL = NULL in some DB modes)."""
+        sql = m._RESOLVE_PROVISIONED_FROM_COUNTY_SQL
+        assert "LocationId" not in sql
+
+    def test_joins_county_time_zones_via_county_fips(self):
+        sql = m._RESOLVE_PROVISIONED_FROM_COUNTY_SQL
+        assert "JOIN CountyTimeZones ctz ON p.CountyFips = ctz.FIPS" in sql
+
+    def test_inner_join_county_not_left(self):
+        sql = m._RESOLVE_PROVISIONED_FROM_COUNTY_SQL
+        assert "LEFT JOIN CountyTimeZones" not in sql
+
+    def test_left_joins_pole_time_zones_to_find_unresolved_ones(self):
+        sql = m._RESOLVE_PROVISIONED_FROM_COUNTY_SQL
+        assert "LEFT JOIN PoleTimeZones ptz ON p.ProvisionedPoleId = ptz.ProvisionedPoleId" in sql
+        assert "ptz.ProvisionedPoleId IS NULL" in sql
+
+    def test_filters_out_poles_with_no_provisioned_pole_id_yet(self):
+        """ProvisionedPoleId is NULL until load_provisioned_pole_serials()
+        runs -- without this filter a NULL would satisfy the LEFT JOIN's
+        'not yet resolved' condition and attempt a spurious insert."""
+        sql = m._RESOLVE_PROVISIONED_FROM_COUNTY_SQL
+        assert "p.ProvisionedPoleId IS NOT NULL" in sql
+
+    def test_deduplicates_by_provisioned_pole_id_via_row_number(self):
+        sql = m._RESOLVE_PROVISIONED_FROM_COUNTY_SQL
+        assert "ROW_NUMBER() OVER (PARTITION BY p.ProvisionedPoleId ORDER BY p.Id)" in sql
+
+    def test_four_placeholders_for_source_and_sp_exec_id_twice(self):
+        sql = m._RESOLVE_PROVISIONED_FROM_COUNTY_SQL
+        assert sql.count("?") == 4
+
+    def test_inserts_provisioned_pole_id_not_location_id(self):
+        sql = m._RESOLVE_PROVISIONED_FROM_COUNTY_SQL
+        assert "INSERT (ProvisionedPoleId," in sql
+
+
+class TestCountUnresolvableProvisionedSql:
+    def test_left_joins_both_pole_time_zones_and_county_time_zones(self):
+        sql = m._COUNT_UNRESOLVABLE_PROVISIONED_SQL
+        assert "LEFT JOIN PoleTimeZones ptz ON p.ProvisionedPoleId = ptz.ProvisionedPoleId" in sql
+        assert "LEFT JOIN CountyTimeZones ctz ON p.CountyFips = ctz.FIPS" in sql
+
+    def test_counts_provisioned_poles_not_yet_resolved_and_unresolvable(self):
+        sql = m._COUNT_UNRESOLVABLE_PROVISIONED_SQL
+        assert "ptz.ProvisionedPoleId IS NULL" in sql
+        assert "p.ProvisionedPoleId IS NOT NULL" in sql
+        assert "ctz.FIPS IS NULL" in sql
+
+    def test_no_location_id_references(self):
+        assert "LocationId" not in m._COUNT_UNRESOLVABLE_PROVISIONED_SQL
+
+    def test_is_a_count_not_a_write(self):
+        sql = m._COUNT_UNRESOLVABLE_PROVISIONED_SQL
+        assert "SELECT COUNT(*)" in sql
+        assert "INSERT" not in sql
+        assert "UPDATE" not in sql
+        assert "MERGE" not in sql
+
+
+class TestLoadProvisionedPoleTimeZones:
+    def _make_conn(self, mocker):
+        conn = MagicMock(name="conn")
+        cursor = MagicMock(name="cursor")
+        conn.cursor.return_value = cursor
+        return conn, cursor
+
+    def test_inserts_sp_execution_row_with_correct_name(self, mocker):
+        conn, cursor = self._make_conn(mocker)
+        cursor.fetchone.side_effect = [(99,), (0,)]  # sp_exec_id, unresolvable count
+        cursor.rowcount = 3
+        mocker.patch("shared.pole_timezones_loader.get_connection", return_value=conn)
+
+        m.load_provisioned_pole_timezones()
+
+        first_execute_sql = cursor.execute.call_args_list[0].args[0]
+        assert "INSERT INTO SP_Execution" in first_execute_sql
+        assert cursor.execute.call_args_list[0].args[1] == "loadProvisionedPoleTimeZones"
+
+    def test_uses_provisioned_as_execution_source(self, mocker):
+        """SP_Execution.Source should be 'Provisioned', not 'Leadsun' --
+        this loader belongs to the provisioned pipeline, not the Leadsun one."""
+        conn, cursor = self._make_conn(mocker)
+        cursor.fetchone.side_effect = [(99,), (0,)]
+        cursor.rowcount = 0
+        mocker.patch("shared.pole_timezones_loader.get_connection", return_value=conn)
+
+        m.load_provisioned_pole_timezones()
+
+        insert_args = cursor.execute.call_args_list[0].args
+        # Source is the 4th positional param after the SQL
+        assert insert_args[4] == m.PROVISIONED_EXECUTION_SOURCE
+        assert insert_args[4] != m.EXECUTION_SOURCE
+
+    def test_executes_provisioned_merge_sql(self, mocker):
+        conn, cursor = self._make_conn(mocker)
+        cursor.fetchone.side_effect = [(99,), (0,)]
+        cursor.rowcount = 2
+        mocker.patch("shared.pole_timezones_loader.get_connection", return_value=conn)
+
+        m.load_provisioned_pole_timezones()
+
+        executed_sqls = [call.args[0] for call in cursor.execute.call_args_list]
+        assert any("ProvisionedPoleId" in sql for sql in executed_sqls)
+
+    def test_does_not_execute_location_id_merge(self, mocker):
+        """Regression guard: must not accidentally run the Leadsun-keyed
+        MERGE (which would silently no-op for provisioned poles but
+        indicates a wrong code path)."""
+        conn, cursor = self._make_conn(mocker)
+        cursor.fetchone.side_effect = [(99,), (0,)]
+        cursor.rowcount = 0
+        mocker.patch("shared.pole_timezones_loader.get_connection", return_value=conn)
+
+        m.load_provisioned_pole_timezones()
+
+        # The Leadsun resolve SQL is the only one with LocationId in the USING clause
+        executed_sqls = [call.args[0] for call in cursor.execute.call_args_list]
+        assert not any(
+            "PARTITION BY p.LocationId" in sql for sql in executed_sqls
+        )
+
+    def test_logs_warning_when_unresolvable_provisioned_poles_exist(self, mocker, caplog):
+        conn, cursor = self._make_conn(mocker)
+        cursor.fetchone.side_effect = [(99,), (5,)]  # 5 unresolvable
+        cursor.rowcount = 0
+        mocker.patch("shared.pole_timezones_loader.get_connection", return_value=conn)
+
+        with caplog.at_level("WARNING"):
+            m.load_provisioned_pole_timezones()
+
+        assert any(
+            "5 provisioned pole(s)" in rec.message and "ProvisionedPoleId" in rec.message
+            for rec in caplog.records
+        )
+
+    def test_no_warning_when_all_provisioned_poles_resolved(self, mocker, caplog):
+        conn, cursor = self._make_conn(mocker)
+        cursor.fetchone.side_effect = [(99,), (0,)]
+        cursor.rowcount = 4
+        mocker.patch("shared.pole_timezones_loader.get_connection", return_value=conn)
+
+        with caplog.at_level("WARNING"):
+            m.load_provisioned_pole_timezones()
+
+        assert not any(
+            "provisioned pole(s)" in rec.message for rec in caplog.records
+            if rec.levelname == "WARNING"
+        )
+
+    def test_updates_sp_execution_on_completion(self, mocker):
+        conn, cursor = self._make_conn(mocker)
+        cursor.fetchone.side_effect = [(99,), (0,)]
+        cursor.rowcount = 3
+        mocker.patch("shared.pole_timezones_loader.get_connection", return_value=conn)
+
+        m.load_provisioned_pole_timezones()
+
+        update_calls = [
+            call for call in cursor.execute.call_args_list
+            if "UPDATE SP_Execution" in call.args[0] and "IsFinalBatch = 1" in call.args[0]
+        ]
+        assert len(update_calls) == 1
+        # TotalSuccessfulRecords = rowcount = 3
+        assert update_calls[0].args[2] == 3
+
+    def test_failure_records_error_on_sp_execution_via_fresh_connection(self, mocker):
+        main_conn, main_cursor = self._make_conn(mocker)
+        main_cursor.fetchone.return_value = (99,)
+        main_cursor.execute.side_effect = [None, RuntimeError("merge failed")]
+
+        recovery_conn, recovery_cursor = self._make_conn(mocker)
+
+        mocker.patch(
+            "shared.pole_timezones_loader.get_connection",
+            side_effect=[main_conn, recovery_conn],
+        )
+
+        with pytest.raises(RuntimeError, match="merge failed"):
+            m.load_provisioned_pole_timezones()
+
+        assert recovery_cursor.execute.called
+        update_sql = recovery_cursor.execute.call_args.args[0]
+        assert "UPDATE SP_Execution" in update_sql
+        error_msg = recovery_cursor.execute.call_args.args[2]
+        assert "merge failed" in error_msg
+
+    def test_sp_execution_insert_failure_reraises(self, mocker):
+        conn, cursor = self._make_conn(mocker)
+        cursor.execute.side_effect = RuntimeError("db down")
+
+        mocker.patch("shared.pole_timezones_loader.get_connection", return_value=conn)
+
+        with pytest.raises(RuntimeError, match="db down"):
+            m.load_provisioned_pole_timezones()
+
+        cursor.close.assert_called_once()
+        conn.close.assert_called_once()
+

@@ -32,4 +32,4 @@ BEGIN
     CREATE NONCLUSTERED INDEX IX_PoleTelemetry_IsDaylight
         ON PoleTelemetry (IsDaylight)
         WHERE IsDaylight IS NULL;
-END
+END;

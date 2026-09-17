@@ -36,9 +36,9 @@ ENVIRONMENT = os.environ.get("ENVIRONMENT", "Dev")
 # the richer shape (ProjectName/UserName/groups/products, all sourced
 # from Leadsun telemetry) gets filled in SEPARATELY, LATER, by
 # pole_telemetry_loader.update_leadsun_project_details() after
-# load_pole_telemetry() runs on its own, independent schedule (every 30
+# load_leadsun_pole_telemetry() runs on its own, independent schedule (every 30
 # minutes, vs this loader's twice-a-day cadence -- see function_app.py's
-# own loadAirTableData/loadLeadsunData comments).
+# own loadAirTableData/loadDeviceData comments).
 #
 # Given that, THIS loader's own UPDATE must be a SURGICAL merge into just
 # the "ProjectId" key -- NEVER a full-column overwrite. A plain

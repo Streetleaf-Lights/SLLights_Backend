@@ -67,7 +67,7 @@ class TestCountRemainingSql:
     def test_mirrors_find_unflagged_sqls_own_conditions(self):
         """Must match _FIND_UNFLAGGED_SQL's own WindowsTimeZone IS NOT
         NULL / INNER JOIN conditions exactly -- a row that
-        load_pole_daylight_flags() itself would never flag (no resolved
+        load_leadsun_pole_daylight_flags() itself would never flag (no resolved
         timezone) must not count as "still pending" here either, or this
         script's loop would never terminate waiting on it."""
         sql = _COUNT_REMAINING_SQL

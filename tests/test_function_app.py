@@ -292,18 +292,18 @@ class TestLoadAirTableDataManual:
 
 
 # --------------------------------------------------------------------------
-# loadLeadsunData / loadLeadsunDataManual (Leadsun, separate from
+# loadDeviceData / loadDeviceDataManual (Leadsun, separate from
 # loadAirTableData -- different source, different cadence, no dependency
 # between the two pipelines). Renamed from loadPoleRawData now that it
-# orchestrates four loaders (load_pole_models -> load_pole_telemetry ->
-# load_pole_timezones -> load_pole_vitals), not one.
+# orchestrates four loaders (load_leadsun_pole_models -> load_leadsun_pole_telemetry ->
+# load_leadsun_pole_timezones -> load_leadsun_pole_vitals), not one.
 # --------------------------------------------------------------------------
 
 
 def make_leadsun_http_request():
     return func.HttpRequest(
         method="POST",
-        url="/api/loadLeadsunDataManual",
+        url="/api/loadDeviceDataManual",
         headers={},
         params={},
         body=b"",
@@ -312,32 +312,55 @@ def make_leadsun_http_request():
 
 def patch_leadsun_loaders(mocker):
     """
-    Patches load_pole_models, load_pole_telemetry,
-    update_leadsun_project_details, load_pole_timezones,
-    load_pole_daylight_flags, and load_pole_vitals, tracking call order
-    via a shared list so tests can assert Models -> Telemetry ->
-    ProjectDetails -> TimeZones -> DaylightFlags -> Vitals.
+    Patches load_leadsun_pole_models, load_leadsun_pole_telemetry,
+    update_leadsun_project_details, load_leadsun_pole_timezones,
+    load_leadsun_pole_daylight_flags, load_leadsun_pole_vitals,
+    load_provisioned_pole_models, load_provisioned_pole_serials, and
+    load_provisioned_pole_timezones, tracking call order via a shared list
+    so tests can assert Models -> Telemetry -> ProjectDetails -> TimeZones
+    -> DaylightFlags -> Vitals -> ProvisionedPoleModels ->
+    ProvisionedPoleSerials -> ProvisionedPoleTimeZones.
     """
     call_order = []
     mock_model = mocker.patch(
-        "function_app.load_pole_models", side_effect=lambda: call_order.append("model")
+        "function_app.load_leadsun_pole_models", side_effect=lambda: call_order.append("model")
     )
     mock_raw_data = mocker.patch(
-        "function_app.load_pole_telemetry", side_effect=lambda: call_order.append("raw_data")
+        "function_app.load_leadsun_pole_telemetry", side_effect=lambda: call_order.append("raw_data")
     )
     mock_project_details = mocker.patch(
         "function_app.update_leadsun_project_details",
         side_effect=lambda: call_order.append("project_details"),
     )
     mock_timezones = mocker.patch(
-        "function_app.load_pole_timezones", side_effect=lambda: call_order.append("timezones")
+        "function_app.load_leadsun_pole_timezones", side_effect=lambda: call_order.append("timezones")
     )
     mock_daylight_flags = mocker.patch(
-        "function_app.load_pole_daylight_flags",
+        "function_app.load_leadsun_pole_daylight_flags",
         side_effect=lambda: call_order.append("daylight_flags"),
     )
     mock_vitals = mocker.patch(
-        "function_app.load_pole_vitals", side_effect=lambda: call_order.append("vitals")
+        "function_app.load_leadsun_pole_vitals", side_effect=lambda: call_order.append("vitals")
+    )
+    mock_provisioned = mocker.patch(
+        "function_app.load_provisioned_pole_models",
+        side_effect=lambda: call_order.append("provisioned"),
+    )
+    mock_provisioned_serials = mocker.patch(
+        "function_app.load_provisioned_pole_serials",
+        side_effect=lambda: call_order.append("provisioned_serials"),
+    )
+    mock_provisioned_timezones = mocker.patch(
+        "function_app.load_provisioned_pole_timezones",
+        side_effect=lambda: call_order.append("provisioned_timezones"),
+    )
+    mock_provisioned_daylight = mocker.patch(
+        "function_app.load_provisioned_pole_daylight_flags",
+        side_effect=lambda: call_order.append("provisioned_daylight"),
+    )
+    mock_provisioned_vitals = mocker.patch(
+        "function_app.load_provisioned_pole_vitals",
+        side_effect=lambda: call_order.append("provisioned_vitals"),
     )
     return (
         mock_model,
@@ -346,6 +369,11 @@ def patch_leadsun_loaders(mocker):
         mock_timezones,
         mock_daylight_flags,
         mock_vitals,
+        mock_provisioned,
+        mock_provisioned_serials,
+        mock_provisioned_timezones,
+        mock_provisioned_daylight,
+        mock_provisioned_vitals,
         call_order,
     )
 
@@ -362,63 +390,78 @@ class TestLoadLeadsunDataTimer:
     def test_runs_unconditionally(self, mocker):
         """Unlike loadAirTableData, there's no hour-gating -- every timer
         fire (every 10 minutes) should call all six steps."""
-        mock_model, mock_raw_data, mock_project_details, mock_timezones, mock_daylight_flags, mock_vitals, _ = (
-            patch_leadsun_loaders(mocker)
-        )
-        function_app.loadLeadsunData(make_timer_request())
+        (
+            mock_model, mock_raw_data, mock_project_details, mock_timezones,
+            mock_daylight_flags, mock_vitals, mock_provisioned,
+            mock_provisioned_serials, mock_provisioned_timezones, mock_provisioned_daylight, mock_provisioned_vitals, _,
+        ) = patch_leadsun_loaders(mocker)
+        function_app.loadDeviceData(make_timer_request())
         mock_model.assert_called_once()
         mock_raw_data.assert_called_once()
         mock_project_details.assert_called_once()
         mock_timezones.assert_called_once()
         mock_daylight_flags.assert_called_once()
         mock_vitals.assert_called_once()
+        mock_provisioned.assert_called_once()
+        mock_provisioned_serials.assert_called_once()
+        mock_provisioned_timezones.assert_called_once()
+        mock_provisioned_daylight.assert_called_once()
+        mock_provisioned_vitals.assert_called_once()
 
     def test_models_then_telemetry_then_project_details_then_timezones_then_daylight_then_vitals(
         self, mocker
     ):
-        _, _, _, _, _, _, call_order = patch_leadsun_loaders(mocker)
-        function_app.loadLeadsunData(make_timer_request())
+        _, _, _, _, _, _, _, _, _, _, _, call_order = patch_leadsun_loaders(mocker)
+        function_app.loadDeviceData(make_timer_request())
         assert call_order == [
             "model", "raw_data", "project_details", "timezones", "daylight_flags", "vitals",
+            "provisioned", "provisioned_serials", "provisioned_timezones", "provisioned_daylight", "provisioned_vitals",
         ]
 
     def test_past_due_still_runs_and_logs_warning(self, mocker, caplog):
-        mock_model, mock_raw_data, mock_project_details, mock_timezones, mock_daylight_flags, mock_vitals, _ = (
-            patch_leadsun_loaders(mocker)
-        )
+        (
+            mock_model, mock_raw_data, mock_project_details, mock_timezones,
+            mock_daylight_flags, mock_vitals, mock_provisioned,
+            mock_provisioned_serials, mock_provisioned_timezones, mock_provisioned_daylight, mock_provisioned_vitals, _,
+        ) = patch_leadsun_loaders(mocker)
         with caplog.at_level("WARNING"):
-            function_app.loadLeadsunData(make_timer_request(past_due=True))
+            function_app.loadDeviceData(make_timer_request(past_due=True))
         mock_model.assert_called_once()
         mock_raw_data.assert_called_once()
         mock_project_details.assert_called_once()
         mock_timezones.assert_called_once()
         mock_daylight_flags.assert_called_once()
         mock_vitals.assert_called_once()
+        mock_provisioned.assert_called_once()
+        mock_provisioned_serials.assert_called_once()
+        mock_provisioned_timezones.assert_called_once()
+        mock_provisioned_daylight.assert_called_once()
+        mock_provisioned_vitals.assert_called_once()
         assert any("past due" in rec.message for rec in caplog.records)
 
     def test_propagates_exception(self, mocker):
-        mocker.patch("function_app.load_pole_models")
-        mocker.patch("function_app.load_pole_telemetry")
+        mocker.patch("function_app.load_leadsun_pole_models")
+        mocker.patch("function_app.load_leadsun_pole_telemetry")
         mocker.patch("function_app.update_leadsun_project_details")
-        mocker.patch("function_app.load_pole_timezones")
-        mocker.patch("function_app.load_pole_daylight_flags")
-        mocker.patch("function_app.load_pole_vitals", side_effect=RuntimeError("leadsun down"))
+        mocker.patch("function_app.load_leadsun_pole_timezones")
+        mocker.patch("function_app.load_leadsun_pole_daylight_flags")
+        mocker.patch("function_app.load_leadsun_pole_vitals", side_effect=RuntimeError("leadsun down"))
         with pytest.raises(RuntimeError, match="leadsun down"):
-            function_app.loadLeadsunData(make_timer_request())
+            function_app.loadDeviceData(make_timer_request())
 
     def test_telemetry_not_called_if_model_fails(self, mocker):
         """Model runs first with no exception handling around it, so a
         failure there prevents everything after it from running at all
         in this invocation."""
-        mocker.patch("function_app.load_pole_models", side_effect=RuntimeError("model failed"))
-        mock_raw_data = mocker.patch("function_app.load_pole_telemetry")
+        mocker.patch("function_app.load_leadsun_pole_models", side_effect=RuntimeError("model failed"))
+        mock_raw_data = mocker.patch("function_app.load_leadsun_pole_telemetry")
         mock_project_details = mocker.patch("function_app.update_leadsun_project_details")
-        mock_timezones = mocker.patch("function_app.load_pole_timezones")
-        mock_daylight_flags = mocker.patch("function_app.load_pole_daylight_flags")
-        mock_vitals = mocker.patch("function_app.load_pole_vitals")
+        mock_timezones = mocker.patch("function_app.load_leadsun_pole_timezones")
+        mock_daylight_flags = mocker.patch("function_app.load_leadsun_pole_daylight_flags")
+        mock_vitals = mocker.patch("function_app.load_leadsun_pole_vitals")
 
         with pytest.raises(RuntimeError, match="model failed"):
-            function_app.loadLeadsunData(make_timer_request())
+            function_app.loadDeviceData(make_timer_request())
 
         mock_raw_data.assert_not_called()
         mock_project_details.assert_not_called()
@@ -427,17 +470,17 @@ class TestLoadLeadsunDataTimer:
         mock_vitals.assert_not_called()
 
     def test_downstream_not_called_if_telemetry_fails(self, mocker):
-        mocker.patch("function_app.load_pole_models")
+        mocker.patch("function_app.load_leadsun_pole_models")
         mocker.patch(
-            "function_app.load_pole_telemetry", side_effect=RuntimeError("telemetry failed")
+            "function_app.load_leadsun_pole_telemetry", side_effect=RuntimeError("telemetry failed")
         )
         mock_project_details = mocker.patch("function_app.update_leadsun_project_details")
-        mock_timezones = mocker.patch("function_app.load_pole_timezones")
-        mock_daylight_flags = mocker.patch("function_app.load_pole_daylight_flags")
-        mock_vitals = mocker.patch("function_app.load_pole_vitals")
+        mock_timezones = mocker.patch("function_app.load_leadsun_pole_timezones")
+        mock_daylight_flags = mocker.patch("function_app.load_leadsun_pole_daylight_flags")
+        mock_vitals = mocker.patch("function_app.load_leadsun_pole_vitals")
 
         with pytest.raises(RuntimeError, match="telemetry failed"):
-            function_app.loadLeadsunData(make_timer_request())
+            function_app.loadDeviceData(make_timer_request())
 
         mock_project_details.assert_not_called()
         mock_timezones.assert_not_called()
@@ -445,48 +488,50 @@ class TestLoadLeadsunDataTimer:
         mock_vitals.assert_not_called()
 
     def test_downstream_not_called_if_project_details_fails(self, mocker):
-        mocker.patch("function_app.load_pole_models")
-        mocker.patch("function_app.load_pole_telemetry")
+        mocker.patch("function_app.load_leadsun_pole_models")
+        mocker.patch("function_app.load_leadsun_pole_telemetry")
         mocker.patch(
             "function_app.update_leadsun_project_details",
             side_effect=RuntimeError("project details failed"),
         )
-        mock_timezones = mocker.patch("function_app.load_pole_timezones")
-        mock_daylight_flags = mocker.patch("function_app.load_pole_daylight_flags")
-        mock_vitals = mocker.patch("function_app.load_pole_vitals")
+        mock_timezones = mocker.patch("function_app.load_leadsun_pole_timezones")
+        mock_daylight_flags = mocker.patch("function_app.load_leadsun_pole_daylight_flags")
+        mock_vitals = mocker.patch("function_app.load_leadsun_pole_vitals")
 
         with pytest.raises(RuntimeError, match="project details failed"):
-            function_app.loadLeadsunData(make_timer_request())
+            function_app.loadDeviceData(make_timer_request())
 
         mock_timezones.assert_not_called()
         mock_daylight_flags.assert_not_called()
         mock_vitals.assert_not_called()
 
     def test_vitals_not_called_if_timezones_fails(self, mocker):
-        mocker.patch("function_app.load_pole_models")
-        mocker.patch("function_app.load_pole_telemetry")
+        mocker.patch("function_app.load_leadsun_pole_models")
+        mocker.patch("function_app.load_leadsun_pole_telemetry")
         mocker.patch("function_app.update_leadsun_project_details")
         mocker.patch(
-            "function_app.load_pole_timezones", side_effect=RuntimeError("timezones failed")
+            "function_app.load_leadsun_pole_timezones", side_effect=RuntimeError("timezones failed")
         )
-        mock_daylight_flags = mocker.patch("function_app.load_pole_daylight_flags")
-        mock_vitals = mocker.patch("function_app.load_pole_vitals")
+        mock_daylight_flags = mocker.patch("function_app.load_leadsun_pole_daylight_flags")
+        mock_vitals = mocker.patch("function_app.load_leadsun_pole_vitals")
 
         with pytest.raises(RuntimeError, match="timezones failed"):
-            function_app.loadLeadsunData(make_timer_request())
+            function_app.loadDeviceData(make_timer_request())
 
         mock_daylight_flags.assert_not_called()
         mock_vitals.assert_not_called()
 
     def test_does_not_touch_airtable_loaders(self, mocker):
-        """loadLeadsunData is a separate function -- it must not call any
+        """loadDeviceData is a separate function -- it must not call any
         of the Airtable-sourced loaders."""
-        mock_model, mock_raw_data, mock_project_details, mock_timezones, mock_daylight_flags, mock_vitals, _ = (
-            patch_leadsun_loaders(mocker)
-        )
+        (
+            mock_model, mock_raw_data, mock_project_details, mock_timezones,
+            mock_daylight_flags, mock_vitals, mock_provisioned,
+            mock_provisioned_serials, mock_provisioned_timezones, mock_provisioned_daylight, mock_provisioned_vitals, _,
+        ) = patch_leadsun_loaders(mocker)
         mock_poles, mock_projects, mock_customers, _ = patch_all_loaders(mocker)
 
-        function_app.loadLeadsunData(make_timer_request())
+        function_app.loadDeviceData(make_timer_request())
 
         mock_model.assert_called_once()
         mock_raw_data.assert_called_once()
@@ -494,17 +539,24 @@ class TestLoadLeadsunDataTimer:
         mock_timezones.assert_called_once()
         mock_daylight_flags.assert_called_once()
         mock_vitals.assert_called_once()
+        mock_provisioned.assert_called_once()
+        mock_provisioned_serials.assert_called_once()
+        mock_provisioned_timezones.assert_called_once()
+        mock_provisioned_daylight.assert_called_once()
+        mock_provisioned_vitals.assert_called_once()
         mock_poles.assert_not_called()
         mock_projects.assert_not_called()
         mock_customers.assert_not_called()
 
     def test_skips_entirely_when_environment_is_dev(self, mocker, monkeypatch):
         monkeypatch.setattr(function_app, "ENVIRONMENT", "Dev")
-        mock_model, mock_raw_data, mock_project_details, mock_timezones, mock_daylight_flags, mock_vitals, _ = (
-            patch_leadsun_loaders(mocker)
-        )
+        (
+            mock_model, mock_raw_data, mock_project_details, mock_timezones,
+            mock_daylight_flags, mock_vitals, mock_provisioned,
+            mock_provisioned_serials, mock_provisioned_timezones, mock_provisioned_daylight, mock_provisioned_vitals, _,
+        ) = patch_leadsun_loaders(mocker)
 
-        function_app.loadLeadsunData(make_timer_request())
+        function_app.loadDeviceData(make_timer_request())
 
         mock_model.assert_not_called()
         mock_raw_data.assert_not_called()
@@ -512,18 +564,20 @@ class TestLoadLeadsunDataTimer:
         mock_timezones.assert_not_called()
         mock_daylight_flags.assert_not_called()
         mock_vitals.assert_not_called()
+        mock_provisioned.assert_not_called()
+        mock_provisioned_serials.assert_not_called()
 
     def test_dev_skip_logs_and_does_not_check_past_due(self, mocker, monkeypatch, caplog):
         """Dev-skip happens before anything else -- not even past_due
         gets logged or inspected."""
         monkeypatch.setattr(function_app, "ENVIRONMENT", "Dev")
-        mocker.patch("function_app.load_pole_models")
-        mocker.patch("function_app.load_pole_telemetry")
-        mocker.patch("function_app.load_pole_timezones")
-        mocker.patch("function_app.load_pole_vitals")
+        mocker.patch("function_app.load_leadsun_pole_models")
+        mocker.patch("function_app.load_leadsun_pole_telemetry")
+        mocker.patch("function_app.load_leadsun_pole_timezones")
+        mocker.patch("function_app.load_leadsun_pole_vitals")
 
         with caplog.at_level("INFO"):
-            function_app.loadLeadsunData(make_timer_request(past_due=True))
+            function_app.loadDeviceData(make_timer_request(past_due=True))
 
         assert any(
             "skipping timer-triggered run in Dev" in rec.message for rec in caplog.records
@@ -534,11 +588,13 @@ class TestLoadLeadsunDataTimer:
 class TestLoadLeadsunDataManual:
     def test_blocked_in_prod(self, mocker, monkeypatch):
         monkeypatch.setattr(function_app, "ENVIRONMENT", "Prod")
-        mock_model, mock_raw_data, mock_project_details, mock_timezones, mock_daylight_flags, mock_vitals, _ = (
-            patch_leadsun_loaders(mocker)
-        )
+        (
+            mock_model, mock_raw_data, mock_project_details, mock_timezones,
+            mock_daylight_flags, mock_vitals, mock_provisioned,
+            mock_provisioned_serials, mock_provisioned_timezones, mock_provisioned_daylight, mock_provisioned_vitals, _,
+        ) = patch_leadsun_loaders(mocker)
 
-        response = function_app.loadLeadsunDataManual(make_leadsun_http_request())
+        response = function_app.loadDeviceDataManual(make_leadsun_http_request())
 
         assert response.status_code == 403
         mock_model.assert_not_called()
@@ -547,19 +603,27 @@ class TestLoadLeadsunDataManual:
         mock_timezones.assert_not_called()
         mock_daylight_flags.assert_not_called()
         mock_vitals.assert_not_called()
+        mock_provisioned.assert_not_called()
+        mock_provisioned_serials.assert_not_called()
 
     def test_runs_when_not_prod(self, mocker, monkeypatch):
         monkeypatch.setattr(function_app, "ENVIRONMENT", "Dev")
-        mock_model, mock_raw_data, mock_project_details, mock_timezones, mock_daylight_flags, mock_vitals, _ = (
-            patch_leadsun_loaders(mocker)
-        )
+        (
+            mock_model, mock_raw_data, mock_project_details, mock_timezones,
+            mock_daylight_flags, mock_vitals, mock_provisioned,
+            mock_provisioned_serials, mock_provisioned_timezones, mock_provisioned_daylight, mock_provisioned_vitals, _,
+        ) = patch_leadsun_loaders(mocker)
 
-        response = function_app.loadLeadsunDataManual(make_leadsun_http_request())
+        response = function_app.loadDeviceDataManual(make_leadsun_http_request())
 
         assert response.status_code == 200
         assert response.get_body() == (
             b"loadPoleModels + loadPoleTelemetry + updateLeadsunProjectDetails + "
-            b"loadPoleTimeZones + loadPoleDaylightFlags + loadPoleVitals run complete."
+            b"loadPoleTimeZones + loadPoleDaylightFlags + loadPoleVitals + "
+            b"loadProvisionedPoleModels + loadProvisionedPoleSerials + "
+            b"loadProvisionedPoleTimeZones + "
+            b"loadProvisionedPoleDaylightFlags + "
+            b"loadProvisionedPoleVitals run complete."
         )
         mock_model.assert_called_once()
         mock_raw_data.assert_called_once()
@@ -567,42 +631,48 @@ class TestLoadLeadsunDataManual:
         mock_timezones.assert_called_once()
         mock_daylight_flags.assert_called_once()
         mock_vitals.assert_called_once()
+        mock_provisioned.assert_called_once()
+        mock_provisioned_serials.assert_called_once()
+        mock_provisioned_timezones.assert_called_once()
+        mock_provisioned_daylight.assert_called_once()
+        mock_provisioned_vitals.assert_called_once()
 
     def test_models_then_telemetry_then_project_details_then_timezones_then_daylight_then_vitals(
         self, mocker, monkeypatch
     ):
         monkeypatch.setattr(function_app, "ENVIRONMENT", "Dev")
-        _, _, _, _, _, _, call_order = patch_leadsun_loaders(mocker)
+        _, _, _, _, _, _, _, _, _, _, _, call_order = patch_leadsun_loaders(mocker)
 
-        function_app.loadLeadsunDataManual(make_leadsun_http_request())
+        function_app.loadDeviceDataManual(make_leadsun_http_request())
 
         assert call_order == [
             "model", "raw_data", "project_details", "timezones", "daylight_flags", "vitals",
+            "provisioned", "provisioned_serials", "provisioned_timezones", "provisioned_daylight", "provisioned_vitals",
         ]
 
     def test_is_synchronous_exception_propagates_to_caller(self, mocker, monkeypatch):
         monkeypatch.setattr(function_app, "ENVIRONMENT", "Dev")
-        mocker.patch("function_app.load_pole_models")
-        mocker.patch("function_app.load_pole_telemetry")
+        mocker.patch("function_app.load_leadsun_pole_models")
+        mocker.patch("function_app.load_leadsun_pole_telemetry")
         mocker.patch("function_app.update_leadsun_project_details")
-        mocker.patch("function_app.load_pole_timezones")
-        mocker.patch("function_app.load_pole_daylight_flags")
-        mocker.patch("function_app.load_pole_vitals", side_effect=RuntimeError("leadsun down"))
+        mocker.patch("function_app.load_leadsun_pole_timezones")
+        mocker.patch("function_app.load_leadsun_pole_daylight_flags")
+        mocker.patch("function_app.load_leadsun_pole_vitals", side_effect=RuntimeError("leadsun down"))
 
         with pytest.raises(RuntimeError, match="leadsun down"):
-            function_app.loadLeadsunDataManual(make_leadsun_http_request())
+            function_app.loadDeviceDataManual(make_leadsun_http_request())
 
     def test_telemetry_not_called_if_model_fails(self, mocker, monkeypatch):
         monkeypatch.setattr(function_app, "ENVIRONMENT", "Dev")
-        mocker.patch("function_app.load_pole_models", side_effect=RuntimeError("model failed"))
-        mock_raw_data = mocker.patch("function_app.load_pole_telemetry")
+        mocker.patch("function_app.load_leadsun_pole_models", side_effect=RuntimeError("model failed"))
+        mock_raw_data = mocker.patch("function_app.load_leadsun_pole_telemetry")
         mock_project_details = mocker.patch("function_app.update_leadsun_project_details")
-        mock_timezones = mocker.patch("function_app.load_pole_timezones")
-        mock_daylight_flags = mocker.patch("function_app.load_pole_daylight_flags")
-        mock_vitals = mocker.patch("function_app.load_pole_vitals")
+        mock_timezones = mocker.patch("function_app.load_leadsun_pole_timezones")
+        mock_daylight_flags = mocker.patch("function_app.load_leadsun_pole_daylight_flags")
+        mock_vitals = mocker.patch("function_app.load_leadsun_pole_vitals")
 
         with pytest.raises(RuntimeError, match="model failed"):
-            function_app.loadLeadsunDataManual(make_leadsun_http_request())
+            function_app.loadDeviceDataManual(make_leadsun_http_request())
 
         mock_raw_data.assert_not_called()
         mock_project_details.assert_not_called()
@@ -612,17 +682,17 @@ class TestLoadLeadsunDataManual:
 
     def test_vitals_not_called_if_telemetry_fails(self, mocker, monkeypatch):
         monkeypatch.setattr(function_app, "ENVIRONMENT", "Dev")
-        mocker.patch("function_app.load_pole_models")
+        mocker.patch("function_app.load_leadsun_pole_models")
         mocker.patch(
-            "function_app.load_pole_telemetry", side_effect=RuntimeError("telemetry failed")
+            "function_app.load_leadsun_pole_telemetry", side_effect=RuntimeError("telemetry failed")
         )
         mock_project_details = mocker.patch("function_app.update_leadsun_project_details")
-        mock_timezones = mocker.patch("function_app.load_pole_timezones")
-        mock_daylight_flags = mocker.patch("function_app.load_pole_daylight_flags")
-        mock_vitals = mocker.patch("function_app.load_pole_vitals")
+        mock_timezones = mocker.patch("function_app.load_leadsun_pole_timezones")
+        mock_daylight_flags = mocker.patch("function_app.load_leadsun_pole_daylight_flags")
+        mock_vitals = mocker.patch("function_app.load_leadsun_pole_vitals")
 
         with pytest.raises(RuntimeError, match="telemetry failed"):
-            function_app.loadLeadsunDataManual(make_leadsun_http_request())
+            function_app.loadDeviceDataManual(make_leadsun_http_request())
 
         mock_project_details.assert_not_called()
         mock_timezones.assert_not_called()
@@ -631,18 +701,18 @@ class TestLoadLeadsunDataManual:
 
     def test_vitals_not_called_if_project_details_fails(self, mocker, monkeypatch):
         monkeypatch.setattr(function_app, "ENVIRONMENT", "Dev")
-        mocker.patch("function_app.load_pole_models")
-        mocker.patch("function_app.load_pole_telemetry")
+        mocker.patch("function_app.load_leadsun_pole_models")
+        mocker.patch("function_app.load_leadsun_pole_telemetry")
         mocker.patch(
             "function_app.update_leadsun_project_details",
             side_effect=RuntimeError("project details failed"),
         )
-        mock_timezones = mocker.patch("function_app.load_pole_timezones")
-        mock_daylight_flags = mocker.patch("function_app.load_pole_daylight_flags")
-        mock_vitals = mocker.patch("function_app.load_pole_vitals")
+        mock_timezones = mocker.patch("function_app.load_leadsun_pole_timezones")
+        mock_daylight_flags = mocker.patch("function_app.load_leadsun_pole_daylight_flags")
+        mock_vitals = mocker.patch("function_app.load_leadsun_pole_vitals")
 
         with pytest.raises(RuntimeError, match="project details failed"):
-            function_app.loadLeadsunDataManual(make_leadsun_http_request())
+            function_app.loadDeviceDataManual(make_leadsun_http_request())
 
         mock_timezones.assert_not_called()
         mock_daylight_flags.assert_not_called()
@@ -1941,3 +2011,43 @@ class TestSetPoleLights:
         )
 
         assert response.status_code == 404
+
+
+class TestLoadProvisionedPoleTelemetry:
+    def _make_event_hub_events(self, payloads):
+        """Builds a list of mock EventHubEvent-like objects, each with a
+        get_body() returning the JSON-encoded payload as bytes -- matching
+        the real azure.functions.EventHubEvent interface this trigger
+        actually receives."""
+        events = []
+        for payload in payloads:
+            event = MagicMock()
+            event.get_body.return_value = json.dumps(payload).encode()
+            events.append(event)
+        return events
+
+    def test_parses_each_event_body_and_delegates_to_the_processor(self, mocker):
+        mock_process = mocker.patch("function_app.process_provisioned_telemetry_events")
+        payload_1 = {"PoleID": "uid-1", "Timestamp": 1789391964}
+        payload_2 = {"PoleID": "uid-2", "Timestamp": 1789391970}
+
+        function_app.loadProvisionedPoleTelemetry(
+            self._make_event_hub_events([payload_1, payload_2])
+        )
+
+        mock_process.assert_called_once_with([payload_1, payload_2])
+
+    def test_single_event_batch(self, mocker):
+        mock_process = mocker.patch("function_app.process_provisioned_telemetry_events")
+        payload = {"PoleID": "uid-1", "Timestamp": 1789391964}
+
+        function_app.loadProvisionedPoleTelemetry(self._make_event_hub_events([payload]))
+
+        mock_process.assert_called_once_with([payload])
+
+    def test_empty_batch_still_calls_processor_with_empty_list(self, mocker):
+        mock_process = mocker.patch("function_app.process_provisioned_telemetry_events")
+
+        function_app.loadProvisionedPoleTelemetry([])
+
+        mock_process.assert_called_once_with([])

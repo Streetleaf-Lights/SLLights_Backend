@@ -38,4 +38,4 @@ IF NOT EXISTS (
 )
 BEGIN
     ALTER TABLE PoleModels ADD BatteryChargingMin FLOAT NOT NULL CONSTRAINT DF_PoleModels_BatteryChargingMin DEFAULT 13.5;
-END
+END;

@@ -89,7 +89,7 @@ class TestLoadPoleDaylightFlagsSuccessFlow:
             side_effect=[True, True, True, False, False, False],
         )
 
-        pole_daylight_flags_loader.load_pole_daylight_flags()
+        pole_daylight_flags_loader.load_leadsun_pole_daylight_flags()
 
         calls = mock_cursor.execute.call_args_list
         assert "INSERT INTO SP_Execution" in calls[0].args[0]
@@ -156,7 +156,7 @@ class TestLoadPoleDaylightFlagsSuccessFlow:
             "shared.pole_daylight_flags_loader.is_daylight", side_effect=[True, True, True]
         )
 
-        pole_daylight_flags_loader.load_pole_daylight_flags()  # must not raise StopIteration
+        pole_daylight_flags_loader.load_leadsun_pole_daylight_flags()  # must not raise StopIteration
 
         assert mock_resolve.call_count == 3
 
@@ -175,7 +175,7 @@ class TestLoadPoleDaylightFlagsSuccessFlow:
             "shared.pole_daylight_flags_loader.is_daylight", side_effect=[False, True]
         )
 
-        pole_daylight_flags_loader.load_pole_daylight_flags()
+        pole_daylight_flags_loader.load_leadsun_pole_daylight_flags()
 
         executemany_params = mock_cursor.executemany.call_args.args[1]
         is_daylight_value, is_daylight_for_led_fault_value = executemany_params[0][0], executemany_params[0][1]
@@ -199,7 +199,7 @@ class TestLoadPoleDaylightFlagsSuccessFlow:
             "shared.pole_daylight_flags_loader.is_daylight", side_effect=[False, False, True]
         )
 
-        pole_daylight_flags_loader.load_pole_daylight_flags()
+        pole_daylight_flags_loader.load_leadsun_pole_daylight_flags()
 
         executemany_params = mock_cursor.executemany.call_args.args[1]
         is_daylight_value, is_daylight_for_led_fault_value = executemany_params[0][0], executemany_params[0][1]
@@ -219,7 +219,7 @@ class TestLoadPoleDaylightFlagsSuccessFlow:
             "shared.pole_daylight_flags_loader.is_daylight", side_effect=[False, False, False]
         )
 
-        pole_daylight_flags_loader.load_pole_daylight_flags()
+        pole_daylight_flags_loader.load_leadsun_pole_daylight_flags()
 
         assert mock_resolve.call_count == 3
         executemany_params = mock_cursor.executemany.call_args.args[1]
@@ -242,7 +242,7 @@ class TestLoadPoleDaylightFlagsSuccessFlow:
             "shared.pole_daylight_flags_loader.is_daylight", side_effect=[False, False, False]
         )
 
-        pole_daylight_flags_loader.load_pole_daylight_flags()  # must not raise StopIteration
+        pole_daylight_flags_loader.load_leadsun_pole_daylight_flags()  # must not raise StopIteration
 
         executemany_params = mock_cursor.executemany.call_args.args[1]
         is_daylight_for_panel_fault_value = executemany_params[0][2]
@@ -263,7 +263,7 @@ class TestLoadPoleDaylightFlagsSuccessFlow:
             "shared.pole_daylight_flags_loader.is_daylight", side_effect=[True, False]
         )
 
-        pole_daylight_flags_loader.load_pole_daylight_flags()
+        pole_daylight_flags_loader.load_leadsun_pole_daylight_flags()
 
         executemany_params = mock_cursor.executemany.call_args.args[1]
         is_daylight_value = executemany_params[0][0]
@@ -285,7 +285,7 @@ class TestLoadPoleDaylightFlagsSuccessFlow:
             "shared.pole_daylight_flags_loader.is_daylight", side_effect=[True, True, True]
         )
 
-        pole_daylight_flags_loader.load_pole_daylight_flags()
+        pole_daylight_flags_loader.load_leadsun_pole_daylight_flags()
 
         assert mock_resolve.call_count == 3
         mock_resolve.assert_any_call(
@@ -314,7 +314,7 @@ class TestLoadPoleDaylightFlagsSuccessFlow:
             "shared.pole_daylight_flags_loader.is_daylight", side_effect=[True, True, False]
         )
 
-        pole_daylight_flags_loader.load_pole_daylight_flags()
+        pole_daylight_flags_loader.load_leadsun_pole_daylight_flags()
 
         assert mock_resolve.call_count == 3
         mock_resolve.assert_any_call(
@@ -340,7 +340,7 @@ class TestLoadPoleDaylightFlagsSuccessFlow:
             "shared.pole_daylight_flags_loader.is_daylight", side_effect=[True, True, True]
         )
 
-        pole_daylight_flags_loader.load_pole_daylight_flags()
+        pole_daylight_flags_loader.load_leadsun_pole_daylight_flags()
 
         call_args_list = [c.args for c in mock_resolve.call_args_list]
         winddown_call = (
@@ -369,7 +369,7 @@ class TestLoadPoleDaylightFlagsSuccessFlow:
             "shared.pole_daylight_flags_loader.is_daylight", side_effect=[False, True]
         )
 
-        pole_daylight_flags_loader.load_pole_daylight_flags()
+        pole_daylight_flags_loader.load_leadsun_pole_daylight_flags()
 
         executemany_params = mock_cursor.executemany.call_args.args[1]
         is_daylight_for_led_fault_value = executemany_params[0][1]
@@ -383,7 +383,7 @@ class TestLoadPoleDaylightFlagsSuccessFlow:
         mock_cursor.fetchone.return_value = (1,)
         mock_cursor.fetchall.return_value = []
 
-        pole_daylight_flags_loader.load_pole_daylight_flags()
+        pole_daylight_flags_loader.load_leadsun_pole_daylight_flags()
 
         mock_cursor.executemany.assert_not_called()
         final_update_args = mock_cursor.execute.call_args_list[-1].args
@@ -413,7 +413,7 @@ class TestLoadPoleDaylightFlagsSuccessFlow:
         mock_cursor.fetchall.return_value = [("12009-1000", datetime(2026, 7, 15, 12, 0, tzinfo=timezone.utc), 27.99507, -80.7236)]
         mocker.patch("shared.pole_daylight_flags_loader.is_daylight", return_value=True)
 
-        pole_daylight_flags_loader.load_pole_daylight_flags()
+        pole_daylight_flags_loader.load_leadsun_pole_daylight_flags()
 
         assert "fast_executemany" not in mock_cursor.__dict__
 
@@ -440,7 +440,7 @@ class TestProgressLogging:
         mocker.patch("shared.pole_daylight_flags_loader.is_daylight", return_value=True)
 
         with caplog.at_level("INFO"):
-            pole_daylight_flags_loader.load_pole_daylight_flags()
+            pole_daylight_flags_loader.load_leadsun_pole_daylight_flags()
 
         progress_messages = [
             rec.message
@@ -462,7 +462,7 @@ class TestProgressLogging:
         mocker.patch("shared.pole_daylight_flags_loader.is_daylight", return_value=True)
 
         with caplog.at_level("INFO"):
-            pole_daylight_flags_loader.load_pole_daylight_flags()
+            pole_daylight_flags_loader.load_leadsun_pole_daylight_flags()
 
         progress_messages = [
             rec.message
@@ -494,7 +494,7 @@ class TestLastUploadIsFormattedAsDtoString:
         mock_cursor.fetchall.return_value = [("12009-1000", reading_time, 27.99507, -80.7236)]
         mocker.patch("shared.pole_daylight_flags_loader.is_daylight", return_value=True)
 
-        pole_daylight_flags_loader.load_pole_daylight_flags()
+        pole_daylight_flags_loader.load_leadsun_pole_daylight_flags()
 
         _, params = mock_cursor.executemany.call_args.args
         written_last_upload = params[0][4]
@@ -509,7 +509,7 @@ class TestLastUploadIsFormattedAsDtoString:
         mock_cursor.fetchall.return_value = [("12009-1000", reading_time, 27.99507, -80.7236)]
         mocker.patch("shared.pole_daylight_flags_loader.is_daylight", return_value=True)
 
-        pole_daylight_flags_loader.load_pole_daylight_flags()
+        pole_daylight_flags_loader.load_leadsun_pole_daylight_flags()
 
         _, params = mock_cursor.executemany.call_args.args
         assert params[0][4] == to_dto_string(reading_time)
@@ -525,7 +525,7 @@ class TestLastUploadIsFormattedAsDtoString:
         mocker.patch("shared.pole_daylight_flags_loader.is_daylight", return_value=True)
         mock_cursor.executemany.side_effect = RuntimeError("batch write failed")
 
-        pole_daylight_flags_loader.load_pole_daylight_flags()
+        pole_daylight_flags_loader.load_leadsun_pole_daylight_flags()
 
         update_calls = [
             c
@@ -556,7 +556,7 @@ class TestZeroRowsAffectedWarning:
         mock_cursor.rowcount = 0
 
         with caplog.at_level("WARNING"):
-            pole_daylight_flags_loader.load_pole_daylight_flags()
+            pole_daylight_flags_loader.load_leadsun_pole_daylight_flags()
 
         assert any(
             "batch update reported 0 rows affected" in rec.message for rec in caplog.records
@@ -573,7 +573,7 @@ class TestZeroRowsAffectedWarning:
         mock_cursor.rowcount = 1
 
         with caplog.at_level("WARNING"):
-            pole_daylight_flags_loader.load_pole_daylight_flags()
+            pole_daylight_flags_loader.load_leadsun_pole_daylight_flags()
 
         assert not any(
             "batch update reported 0 rows affected" in rec.message for rec in caplog.records
@@ -596,7 +596,7 @@ class TestLoadPoleDaylightFlagsPartialFailure:
             side_effect=[ValueError("boom"), True, True, True],
         )
 
-        pole_daylight_flags_loader.load_pole_daylight_flags()  # must not raise
+        pole_daylight_flags_loader.load_leadsun_pole_daylight_flags()  # must not raise
 
         final_update_args = mock_cursor.execute.call_args_list[-1].args
         success, errors = final_update_args[2], final_update_args[3]
@@ -618,7 +618,7 @@ class TestLoadPoleDaylightFlagsPartialFailure:
         )
         mock_cursor.executemany.side_effect = RuntimeError("batch write failed")
 
-        pole_daylight_flags_loader.load_pole_daylight_flags()  # must not raise
+        pole_daylight_flags_loader.load_leadsun_pole_daylight_flags()  # must not raise
 
         # Falls back to individual execute() calls for the UPDATE, one
         # per row, after the batch attempt failed.
@@ -641,7 +641,7 @@ class TestLoadPoleDaylightFlagsTopLevelFailure:
         mock_cursor.execute.side_effect = RuntimeError("db down")
 
         with pytest.raises(RuntimeError, match="db down"):
-            pole_daylight_flags_loader.load_pole_daylight_flags()
+            pole_daylight_flags_loader.load_leadsun_pole_daylight_flags()
 
         mock_cursor.close.assert_called_once()
         mock_conn.close.assert_called_once()
@@ -682,7 +682,7 @@ class TestFailureRecordingUsesAFreshConnection:
         )
 
         with pytest.raises(RuntimeError, match="communication link failure"):
-            pole_daylight_flags_loader.load_pole_daylight_flags()
+            pole_daylight_flags_loader.load_leadsun_pole_daylight_flags()
 
         # The failure was recorded via the SEPARATE, second connection --
         # not the original, broken one.
@@ -720,7 +720,7 @@ class TestFailureRecordingUsesAFreshConnection:
             # The ORIGINAL exception must be what's raised, not the
             # recovery attempt's own exception.
             with pytest.raises(RuntimeError, match="original communication failure"):
-                pole_daylight_flags_loader.load_pole_daylight_flags()
+                pole_daylight_flags_loader.load_leadsun_pole_daylight_flags()
 
         # Both failures are logged, so nothing is silently lost.
         error_messages = [rec.message for rec in caplog.records if rec.levelname == "ERROR"]
@@ -744,8 +744,180 @@ class TestFailureRecordingUsesAFreshConnection:
         )
 
         with pytest.raises(RuntimeError, match="boom"):
-            pole_daylight_flags_loader.load_pole_daylight_flags()
+            pole_daylight_flags_loader.load_leadsun_pole_daylight_flags()
 
         recovery_cursor.close.assert_called_once()
         recovery_conn.close.assert_called_once()
 
+
+# ---------------------------------------------------------------------------
+# Tests for provisioned-pole daylight flag computation
+# ---------------------------------------------------------------------------
+
+class TestFindProvisionedUnflaggedSql:
+    def test_joins_pole_time_zones_on_provisioned_pole_id(self):
+        """The key difference from _FIND_UNFLAGGED_SQL: provisioned telemetry
+        stores ProvisionedPoleId as LocationId, so the join must cross to
+        PoleTimeZones.ProvisionedPoleId, not PoleTimeZones.LocationId."""
+        sql = pole_daylight_flags_loader._FIND_PROVISIONED_UNFLAGGED_SQL
+        assert "ptz.ProvisionedPoleId" in sql
+        assert "t.LocationId = ptz.ProvisionedPoleId" in sql
+
+    def test_does_not_join_on_location_id(self):
+        """Regression guard: must not accidentally use the Leadsun join
+        (LocationId = ptz.LocationId), which would find no rows for
+        provisioned poles since PoleTimeZones.LocationId is NULL for them."""
+        sql = pole_daylight_flags_loader._FIND_PROVISIONED_UNFLAGGED_SQL
+        assert "t.LocationId = ptz.LocationId" not in sql
+
+    def test_uses_inner_join_not_left(self):
+        sql = pole_daylight_flags_loader._FIND_PROVISIONED_UNFLAGGED_SQL
+        assert "JOIN PoleTimeZones" in sql
+        assert "LEFT JOIN PoleTimeZones" not in sql
+
+    def test_excludes_sentinel_rows(self):
+        sql = pole_daylight_flags_loader._FIND_PROVISIONED_UNFLAGGED_SQL
+        assert "9999-12-31" in sql
+
+    def test_filters_null_windows_timezone(self):
+        sql = pole_daylight_flags_loader._FIND_PROVISIONED_UNFLAGGED_SQL
+        assert "WindowsTimeZone IS NOT NULL" in sql
+
+    def test_covers_all_three_daylight_columns(self):
+        sql = pole_daylight_flags_loader._FIND_PROVISIONED_UNFLAGGED_SQL
+        assert "IsDaylight IS NULL" in sql
+        assert "IsDaylightForLedFault IS NULL" in sql
+        assert "IsDaylightForPanelFault IS NULL" in sql
+
+    def test_orders_newest_first(self):
+        sql = pole_daylight_flags_loader._FIND_PROVISIONED_UNFLAGGED_SQL
+        assert "ORDER BY t.LastUpload DESC" in sql
+
+
+class TestLoadProvisionedPoleDaylightFlags:
+    def _make_conn(self):
+        conn = MagicMock(name="conn")
+        cursor = MagicMock(name="cursor")
+        conn.cursor.return_value = cursor
+        return conn, cursor
+
+    def _sp_exec_row(self, sp_id):
+        return (sp_id,)
+
+    def test_uses_provisioned_source_name_not_leadsun(self, mocker):
+        """SP_Execution.Source must be 'Provisioned', not 'Leadsun'."""
+        conn, cursor = self._make_conn()
+        cursor.fetchone.return_value = self._sp_exec_row(77)
+        cursor.fetchall.return_value = []
+        mocker.patch("shared.pole_daylight_flags_loader.get_connection", return_value=conn)
+
+        pole_daylight_flags_loader.load_provisioned_pole_daylight_flags()
+
+        insert_args = cursor.execute.call_args_list[0].args
+        assert insert_args[4] == pole_daylight_flags_loader.PROVISIONED_SOURCE_NAME
+        assert insert_args[4] != pole_daylight_flags_loader.SOURCE_NAME
+
+    def test_sp_execution_name_is_load_provisioned_pole_daylight_flags(self, mocker):
+        conn, cursor = self._make_conn()
+        cursor.fetchone.return_value = self._sp_exec_row(77)
+        cursor.fetchall.return_value = []
+        mocker.patch("shared.pole_daylight_flags_loader.get_connection", return_value=conn)
+
+        pole_daylight_flags_loader.load_provisioned_pole_daylight_flags()
+
+        insert_args = cursor.execute.call_args_list[0].args
+        assert insert_args[1] == "loadProvisionedPoleDaylightFlags"
+
+    def test_queries_with_provisioned_unflagged_sql(self, mocker):
+        conn, cursor = self._make_conn()
+        cursor.fetchone.return_value = self._sp_exec_row(77)
+        cursor.fetchall.return_value = []
+        mocker.patch("shared.pole_daylight_flags_loader.get_connection", return_value=conn)
+
+        pole_daylight_flags_loader.load_provisioned_pole_daylight_flags()
+
+        executed_sqls = [call.args[0] for call in cursor.execute.call_args_list]
+        assert any("ptz.ProvisionedPoleId" in sql for sql in executed_sqls)
+
+    def test_does_not_query_with_leadsun_unflagged_sql(self, mocker):
+        """Regression: must not accidentally use the Leadsun SQL path."""
+        conn, cursor = self._make_conn()
+        cursor.fetchone.return_value = self._sp_exec_row(77)
+        cursor.fetchall.return_value = []
+        mocker.patch("shared.pole_daylight_flags_loader.get_connection", return_value=conn)
+
+        pole_daylight_flags_loader.load_provisioned_pole_daylight_flags()
+
+        executed_sqls = [call.args[0] for call in cursor.execute.call_args_list]
+        assert not any(
+            "t.LocationId = ptz.LocationId" in sql for sql in executed_sqls
+        )
+
+    def test_exits_immediately_when_no_unflagged_rows(self, mocker):
+        conn, cursor = self._make_conn()
+        cursor.fetchone.return_value = self._sp_exec_row(77)
+        cursor.fetchall.return_value = []
+        mocker.patch("shared.pole_daylight_flags_loader.get_connection", return_value=conn)
+
+        pole_daylight_flags_loader.load_provisioned_pole_daylight_flags()
+
+        # Only SP_Execution INSERT + SELECT + final UPDATE should run -- no UPDATE PoleTelemetry
+        executed_sqls = [call.args[0] for call in cursor.execute.call_args_list]
+        assert not any("UPDATE PoleTelemetry" in sql for sql in executed_sqls)
+
+    def test_computes_and_updates_daylight_flags(self, mocker):
+        ts = datetime(2026, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
+        conn, cursor = self._make_conn()
+        cursor.fetchone.return_value = self._sp_exec_row(77)
+        cursor.fetchall.side_effect = [
+            [("prov-001", ts, 27.78, -82.34)],
+            [],  # second fetch → empty → stop
+        ]
+        mocker.patch("shared.pole_daylight_flags_loader.get_connection", return_value=conn)
+        mocker.patch("shared.pole_daylight_flags_loader.is_daylight", return_value=True)
+
+        pole_daylight_flags_loader.load_provisioned_pole_daylight_flags()
+
+        update_calls = [
+            call for call in cursor.execute.call_args_list
+            if "UPDATE PoleTelemetry" in call.args[0]
+        ]
+        assert len(update_calls) == 0  # used executemany for the chunk
+
+        many_calls = cursor.executemany.call_args_list
+        assert len(many_calls) >= 1
+        args = many_calls[0].args[1][0]  # first row in first chunk
+        assert args[3] == "prov-001"  # LocationId passed through
+
+    def test_marks_sp_execution_complete_on_success(self, mocker):
+        conn, cursor = self._make_conn()
+        cursor.fetchone.return_value = self._sp_exec_row(77)
+        cursor.fetchall.return_value = []
+        mocker.patch("shared.pole_daylight_flags_loader.get_connection", return_value=conn)
+
+        pole_daylight_flags_loader.load_provisioned_pole_daylight_flags()
+
+        final_update = [
+            call for call in cursor.execute.call_args_list
+            if "IsFinalBatch = 1" in call.args[0]
+        ]
+        assert len(final_update) == 1
+
+    def test_records_failure_on_fresh_connection(self, mocker):
+        main_conn, main_cursor = self._make_conn()
+        main_cursor.fetchone.return_value = self._sp_exec_row(77)
+        main_cursor.fetchall.side_effect = RuntimeError("db exploded")
+
+        recovery_conn, recovery_cursor = self._make_conn()
+        mocker.patch(
+            "shared.pole_daylight_flags_loader.get_connection",
+            side_effect=[main_conn, recovery_conn],
+        )
+
+        with pytest.raises(RuntimeError, match="db exploded"):
+            pole_daylight_flags_loader.load_provisioned_pole_daylight_flags()
+
+        assert recovery_cursor.execute.called
+        update_sql = recovery_cursor.execute.call_args.args[0]
+        assert "UPDATE SP_Execution" in update_sql
+        assert "ErrorMessage" in update_sql

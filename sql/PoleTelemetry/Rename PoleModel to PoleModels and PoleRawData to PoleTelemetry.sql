@@ -52,4 +52,4 @@ BEGIN
         WHERE name = 'IX_PoleRawData_SP_ExecId' AND object_id = OBJECT_ID('PoleTelemetry')
     )
         EXEC sp_rename 'PoleTelemetry.IX_PoleRawData_SP_ExecId', 'IX_PoleTelemetry_SP_ExecId', 'INDEX';
-END
+END;

@@ -60,4 +60,4 @@ BEGIN
 
     CREATE NONCLUSTERED INDEX IX_Projects_Name
         ON Projects (Name);
-END
+END;

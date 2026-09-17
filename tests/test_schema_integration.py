@@ -480,10 +480,10 @@ class TestLeadsunLiveIntegration:
         importlib.reload(pole_daylight_flags_loader)
         importlib.reload(pole_vitals_loader)
 
-        # Same order as function_app.py's loadLeadsunData:
+        # Same order as function_app.py's loadDeviceData:
         # Models -> Telemetry -> TimeZones -> DaylightFlags -> Vitals.
-        pole_models_loader.load_pole_models()  # will raise on failure -- that's the assertion
-        pole_telemetry_loader.load_pole_telemetry()
-        pole_timezones_loader.load_pole_timezones()
-        pole_daylight_flags_loader.load_pole_daylight_flags()
-        pole_vitals_loader.load_pole_vitals()
+        pole_models_loader.load_leadsun_pole_models()  # will raise on failure -- that's the assertion
+        pole_telemetry_loader.load_leadsun_pole_telemetry()
+        pole_timezones_loader.load_leadsun_pole_timezones()
+        pole_daylight_flags_loader.load_leadsun_pole_daylight_flags()
+        pole_vitals_loader.load_leadsun_pole_vitals()
