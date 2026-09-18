@@ -66,9 +66,9 @@ class TestIsAzureMonitorDiagnosticsEnvelope:
 
 
 class TestMapEventToTelemetryRow:
-    def test_maps_pole_id_to_location_id(self):
+    def test_maps_pole_id_to_pole_id(self):
         result = m._map_event_to_telemetry_row(_REAL_EVENT)
-        assert result["LocationId"] == "0a10aced202194944a071358"
+        assert result["PoleId"] == "0a10aced202194944a071358"
 
     def test_maps_timestamp_to_last_upload(self):
         result = m._map_event_to_telemetry_row(_REAL_EVENT)
@@ -193,11 +193,11 @@ class TestBuildRow:
         row = m._build_row(mapped, sp_exec_id=99, open_issue_provisioned_pole_ids=set(), provisioned_pole_timezones={})
         assert len(row) == len(m._ALL_COLUMNS)
 
-    def test_location_id_lands_at_the_expected_position(self):
+    def test_pole_id_lands_at_the_expected_position(self):
         mapped = m._map_event_to_telemetry_row(_REAL_EVENT)
         row = m._build_row(mapped, sp_exec_id=99, open_issue_provisioned_pole_ids=set(), provisioned_pole_timezones={})
-        location_id_index = m._ALL_COLUMNS.index("LocationId")
-        assert row[location_id_index] == "0a10aced202194944a071358"
+        pole_id_index = m._ALL_COLUMNS.index("PoleId")
+        assert row[pole_id_index] == "0a10aced202194944a071358"
 
     def test_is_online_true_lands_at_the_expected_position(self):
         mapped = m._map_event_to_telemetry_row(_REAL_EVENT)
@@ -348,7 +348,7 @@ class TestProcessProvisionedTelemetryEvents:
         """Regression guard for a real production incident: an event
         with no usable PoleID must be validated and skipped BEFORE
         attempting a staging insert -- not allowed to hit the database's
-        own NOT NULL constraint on LocationId, which previously produced
+        own NOT NULL constraint on PoleId, which previously produced
         a much less informative SQL-level error with no visibility into
         what the actual bad payload looked like."""
         mock_cursor.fetchone.return_value = (42,)

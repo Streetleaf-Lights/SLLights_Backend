@@ -1,7 +1,7 @@
 """
 One-off script to run a full RE-resolution of PoleTimeZones -- i.e.
 pole_timezones_loader.load_leadsun_pole_timezones(backfill=True) -- outside of
-the normal loadDeviceData timer cycle, which only resolves LocationIds
+the normal loadDeviceData timer cycle, which only resolves PoleIds
 that don't already have a PoleTimeZones row.
 
 Why this is needed at all: this project's poles were resolved via the

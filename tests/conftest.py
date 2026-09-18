@@ -379,9 +379,9 @@ def make_pole_record():
         record_id="rec_pole_0000001",
         created_time="2026-07-02T18:00:00.000Z",
         pole_number="P-1001",
-        location_id="LOC-42",
+        pole_id="LOC-42",
         county_fips="12057",  # Hillsborough County, FL -- matches this
-        # project's own real LocationId prefix convention (e.g.
+        # project's own real PoleId prefix convention (e.g.
         # "12057-4255") for poles in that county. Wrapped in a list below
         # (or an empty list if explicitly None) -- confirmed in practice
         # that Airtable's real "CountyFips" field returns its value this
@@ -396,7 +396,7 @@ def make_pole_record():
     ):
         fields = {
             "Pole Number": pole_number,
-            "Location ID": location_id,
+            "Location ID": pole_id,
             "CountyFips": [county_fips] if county_fips is not None else [],
             "Contracting Entity": project_ids if project_ids is not None else ["recProject123"],
             "Customer ID": customer_ids if customer_ids is not None else ["recCustomer456"],

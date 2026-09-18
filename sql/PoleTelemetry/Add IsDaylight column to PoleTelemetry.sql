@@ -5,7 +5,7 @@
 -- After running this, pole_daylight_flags_loader.py will treat every
 -- existing row as unflagged (IsDaylight IS NULL) and backfill them
 -- incrementally over subsequent runs, the same way PoleTimeZones
--- backfills newly-discovered LocationIds.
+-- backfills newly-discovered PoleIds.
 --
 -- The GO between the two blocks below is required, not stylistic: SQL
 -- Server compiles a whole batch before executing any of it, and a column

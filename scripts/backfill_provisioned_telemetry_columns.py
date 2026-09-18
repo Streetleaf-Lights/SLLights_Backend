@@ -49,7 +49,7 @@ def refuse_if_prod(environment: str) -> None:
 
 
 _FETCH_SQL = """
-SELECT LocationId, LastUpload, ExtraFieldsJson
+SELECT PoleId, LastUpload, ExtraFieldsJson
 FROM PoleTelemetry
 WHERE Source = 'Provisioned'
   AND ExtraFieldsJson IS NOT NULL
@@ -72,7 +72,7 @@ SET
     BatteryFault    = ?,
     LEDFault        = ?,
     ControllerFault = ?
-WHERE LocationId = ?
+WHERE PoleId = ?
   AND LastUpload  = ?
   AND Source      = 'Provisioned'
 """
@@ -93,7 +93,7 @@ def run():
 
     updates = []
     skipped = 0
-    for location_id, last_upload, extra_json in rows:
+    for pole_id, last_upload, extra_json in rows:
         try:
             extra = json.loads(extra_json)
         except Exception:
@@ -118,7 +118,7 @@ def run():
             bool(bat_fault) if bat_fault is not None else None,
             bool(led_fault) if led_fault is not None else None,
             bool(ctrl_fault) if ctrl_fault is not None else None,
-            location_id,
+            pole_id,
             last_upload,
         ))
 

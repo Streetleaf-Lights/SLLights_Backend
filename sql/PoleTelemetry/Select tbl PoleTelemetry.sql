@@ -3,51 +3,45 @@
 -- than hand-editing, to avoid drift.
 --
 -- PERFORMANCE: resolved via a PoleContext CTE that looks up the pole's
--- LocationId/ProvisionedPoleId BEFORE touching PoleTelemetry. This lets
--- SQL Server seek on PoleTelemetry's composite PK (LocationId, LastUpload)
+-- PoleId/ProvisionedPoleId BEFORE touching PoleTelemetry. This lets
+-- SQL Server seek on PoleTelemetry's composite PK (PoleId, LastUpload)
 -- rather than scanning the whole table and joining afterwards.
---
--- The OR join pattern caused a full scan on multi-million-row tables.
--- Resolving the telemetry key(s) upfront from the small Poles table, then
--- using UNION ALL to pull Leadsun and provisioned rows separately, gives
--- SQL Server a seek on each branch independently.
 --
 -- ► To change the filter: edit the WHERE clause inside PoleContext.
 -- ► To change the row limit: edit the TOP value in the final SELECT.
 --
 -- PoleTimeZones join is split by source:
---   Leadsun rows  → ptz.LocationId
+--   Leadsun rows  → ptz.VendorPoleId
 --   Provisioned   → ptz.ProvisionedPoleId
--- so both sources get the correct timezone.
 
 WITH PoleContext AS (
     SELECT
-        Id           AS PoleId,
+        Id                AS PoleId,
         PoleNumber,
-        LocationId          AS LeadsunLocationId,
-        ProvisionedPoleId   AS ProvisionedPoleId
+        VendorPoleId      AS LeadsunVendorPoleId,
+        ProvisionedPoleId AS ProvisionedPoleId
     FROM Poles
-    WHERE PoleNumber = 'TESTSL1-1002'  -- ← change filter here
-    -- WHERE LocationId = 'DRH-Orl'
+    -- WHERE PoleNumber = 'TESTSL1-1002'  -- ← change filter here
+    WHERE VendorPoleId = 'DRH-Orl'
     -- WHERE ProvisionedPoleId = '0a10aced202194944a071358'
 ),
 TelemetryForPole AS (
-    -- Leadsun branch: seeks on Poles.LocationId
+    -- Leadsun branch: seeks on Poles.VendorPoleId
     SELECT t.*
     FROM PoleContext pc
-    JOIN PoleTelemetry t ON t.LocationId = pc.LeadsunLocationId
-    WHERE pc.LeadsunLocationId IS NOT NULL
+    JOIN PoleTelemetry t ON t.PoleId = pc.LeadsunVendorPoleId
+    WHERE pc.LeadsunVendorPoleId IS NOT NULL
 
     UNION ALL
 
     -- Provisioned branch: seeks on Poles.ProvisionedPoleId
     SELECT t.*
     FROM PoleContext pc
-    JOIN PoleTelemetry t ON t.LocationId = pc.ProvisionedPoleId
+    JOIN PoleTelemetry t ON t.PoleId = pc.ProvisionedPoleId
     WHERE pc.ProvisionedPoleId IS NOT NULL
 )
 SELECT TOP 1000  -- ← change row limit here
-    t.LocationId,
+    t.PoleId,
     pc.PoleNumber,
     t.LastUpload AT TIME ZONE ISNULL(
         COALESCE(ptz_l.WindowsTimeZone, ptz_p.WindowsTimeZone),
@@ -67,20 +61,20 @@ SELECT TOP 1000  -- ← change row limit here
     BatteryVoltage2,
     BatteryElecCurrent1,
     BatteryElecCurrent2,
-    DcInVoltage,
-    BatteryOutElecCurrent,
-    BatteryTemperature1,
-    BatteryTemperature2,
-    McuTemperature,
-    EnvTemperature,
-    LightingState,
-    DcInState,
-    DcOutState,
-    SolarBoardState,
-    Battery1State,
-    Battery2State,
-    Lamp1State,
-    Lamp2State,
+    -- DcInVoltage,
+    -- BatteryOutElecCurrent,
+    -- BatteryTemperature1,
+    -- BatteryTemperature2,
+    -- McuTemperature,
+    -- EnvTemperature,
+    -- LightingState,
+    -- DcInState,
+    -- DcOutState,
+    -- SolarBoardState,
+    -- Battery1State,
+    -- Battery2State,
+    -- Lamp1State,
+    -- Lamp2State,
     ControllerCode,
     ProductId,
     UserName,
@@ -91,11 +85,12 @@ SELECT TOP 1000  -- ← change row limit here
     LeadsunProjectId,
     LeadsunProjectName,
     ModelId,
-    TimeoutFlag,
+    -- TimeoutFlag,
     t.Latitude,
     t.Longitude,
-    ControlModelCode,
-    ControlModelName,
+    -- ControlModelCode,
+    -- ControlModelName,
+    -- Provisioned-pole device-reported values (NULL for Leadsun rows)
     BatterySoC,
     LightRatio,
     PanelPercentage,
@@ -105,8 +100,8 @@ SELECT TOP 1000  -- ← change row limit here
     ExtraFieldsJson
 FROM TelemetryForPole t
 JOIN PoleContext pc ON 1 = 1
-LEFT JOIN PoleTimeZones ptz_l ON t.Source = 'Leadsun'     AND t.LocationId = ptz_l.LocationId
-LEFT JOIN PoleTimeZones ptz_p ON t.Source = 'Provisioned' AND t.LocationId = ptz_p.ProvisionedPoleId
+LEFT JOIN PoleTimeZones ptz_l ON t.Source = 'Leadsun'     AND t.PoleId = ptz_l.VendorPoleId
+LEFT JOIN PoleTimeZones ptz_p ON t.Source = 'Provisioned' AND t.PoleId = ptz_p.ProvisionedPoleId
 WHERE 1 = 1
     -- AND t.IsDaylight IS NULL
     -- AND t.IsDaylight = 1

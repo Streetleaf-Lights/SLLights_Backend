@@ -64,7 +64,7 @@ class PoleNotFoundError(Exception):
 
 class PoleTelemetryNotFoundError(Exception):
     """The pole exists, but has no PoleTelemetry row yet (never reported,
-    or its LocationId doesn't match any telemetry) -- there's nothing to
+    or its PoleId doesn't match any telemetry) -- there's nothing to
     read GroupId/GatewayCode/ControllerCode/UserName from."""
 
 
@@ -119,14 +119,14 @@ _REMOTE_CONTROL_LOOKBACK = timedelta(hours=3)
 _FETCH_LATEST_TELEMETRY_FOR_POLE_NUMBER_SQL = """
 SELECT TOP 1 pt.UserName, pt.GroupId, pt.GatewayCode, pt.ControllerCode
 FROM Poles p
-JOIN PoleTelemetry pt ON pt.LocationId = p.LocationId
+JOIN PoleTelemetry pt ON pt.PoleId = p.VendorPoleId
 WHERE p.PoleNumber = ?
 ORDER BY pt.LastUpload DESC
 """
 
 # Shared by gateway and project scope -- the {where_clause} placeholder
 # is filled in with "GatewayCode = ?" or "LeadsunProjectId = ?". Same
-# ROW_NUMBER-per-LocationId dedup pattern as
+# ROW_NUMBER-per-PoleId dedup pattern as
 # pole_telemetry_loader.py's own
 # _FETCH_TELEMETRY_FOR_PROJECT_AGGREGATION_SQL, for the same reason: a
 # pole can have multiple readings within the lookback window, and only
@@ -134,8 +134,8 @@ ORDER BY pt.LastUpload DESC
 _FETCH_TELEMETRY_FOR_SCOPE_SQL_TEMPLATE = """
 WITH RecentTelemetry AS (
     SELECT
-        UserName, GroupId, GatewayCode, ControllerCode, LocationId,
-        ROW_NUMBER() OVER (PARTITION BY LocationId ORDER BY LastUpload DESC) AS rn
+        UserName, GroupId, GatewayCode, ControllerCode, PoleId,
+        ROW_NUMBER() OVER (PARTITION BY PoleId ORDER BY LastUpload DESC) AS rn
     FROM PoleTelemetry
     WHERE {where_clause}
       AND LastUpload >= ?
@@ -255,7 +255,7 @@ WITH RecentTelemetry AS (
                     p.PoleNumber, pt.UserName, pt.GroupId, pt.GatewayCode, pt.ControllerCode,
                     ROW_NUMBER() OVER (PARTITION BY p.PoleNumber ORDER BY pt.LastUpload DESC) AS rn
                 FROM Poles p
-                JOIN PoleTelemetry pt ON pt.LocationId = p.LocationId
+                JOIN PoleTelemetry pt ON pt.PoleId = p.VendorPoleId
                 WHERE p.PoleNumber IN ({placeholders})
             )
             SELECT PoleNumber, UserName, GroupId, GatewayCode, ControllerCode

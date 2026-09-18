@@ -13,7 +13,7 @@ ENVIRONMENT = os.environ.get("ENVIRONMENT", "Dev")
 SOURCE_NAME = "Leadsun"
 RETENTION_MONTHS = 6
 
-# LastUpload is half of PoleTelemetry's composite PRIMARY KEY (LocationId,
+# LastUpload is half of PoleTelemetry's composite PRIMARY KEY (PoleId,
 # LastUpload), so it can never be NULL -- but a handful of real records
 # come back from Leadsun with lastUpload genuinely null (a device that
 # hasn't reported an upload time yet). Rather than drop those records,
@@ -58,7 +58,7 @@ def _capitalize_key(key: str) -> str:
 
 
 # Renames applied after generic capitalization:
-#   - "productName" -> LocationId is the explicit rename this table was
+#   - "productName" -> PoleId is the explicit rename this table was
 #     built around.
 #   - "id"/"projectId"/"projectName" are Leadsun's OWN internal ids, not
 #     ours. Left as-is they'd read as "ProjectId"/"Id" -- which in every
@@ -66,7 +66,7 @@ def _capitalize_key(key: str) -> str:
 #     key" / "a link to our Projects table". Neither is true here, so
 #     they're prefixed to avoid that exact confusion.
 _KEY_RENAMES = {
-    "ProductName": "LocationId",
+    "ProductName": "PoleId",
     "Id": "LeadsunId",
     "ProjectId": "LeadsunProjectId",
     "ProjectName": "LeadsunProjectName",
@@ -82,7 +82,7 @@ _KEY_RENAMES = {
 # in a future firmware/API update) gets captured there instead of silently
 # dropped.
 _ALL_COLUMNS = [
-    "LocationId",  # PK part 1 -- from productName
+    "PoleId",  # PK part 1 -- from productName
     "LastUpload",  # PK part 2
     "Source",
     "SP_ExecId",
@@ -94,25 +94,8 @@ _ALL_COLUMNS = [
     "LampPower2",
     "SolarBoardVoltage",
     "SolarBoardElecCurrent",
-    "DcInVoltage",
-    "BatteryOutElecCurrent",
-    "BatteryTemperature1",
-    "BatteryTemperature2",
-    "McuTemperature",
-    "EnvTemperature",
-    "LightingState",
-    "DcInState",
-    "DcOutState",
-    "SolarBoardState",
-    "Battery1State",
-    "Battery2State",
-    "Lamp1State",
-    "Lamp2State",
     "ControllerCode",
     "ProductId",
-    "CreateTime",
-    "SolarBoardDcStatus",
-    "LampBatteryStatus",
     "UserName",
     "LeadsunId",
     "GroupId",
@@ -122,12 +105,9 @@ _ALL_COLUMNS = [
     "LeadsunProjectName",
     "ModelId",
     "IsOnline",
-    "IsOpenIssueFault",  # NOT from Leadsun -- see _fetch_location_ids_with_open_issues()
-    "TimeoutFlag",
+    "IsOpenIssueFault",  # NOT from Leadsun -- see _fetch_pole_ids_with_open_issues()
     "Longitude",
     "Latitude",
-    "ControlModelCode",
-    "ControlModelName",
     "ExtraFieldsJson",
     # Provisioned-pole device-reported values, extracted from ExtraFieldsJson
     # at ingestion time by provisioned_telemetry_loader.py. NULL for all
@@ -141,7 +121,7 @@ _ALL_COLUMNS = [
     "ControllerFault",  # device controller fault (BIT)     → IsPanelFault
 ]
 
-_PK_COLUMNS = ["LocationId", "LastUpload"]
+_PK_COLUMNS = ["PoleId", "LastUpload"]
 _NON_KEY_COLUMNS = [c for c in _ALL_COLUMNS if c not in _PK_COLUMNS]
 # SP_ExecId is always refreshed regardless of whether anything else
 # changed (same convention as Customers/Projects/Poles), so it's excluded
@@ -231,10 +211,10 @@ def _build_row(mapped: dict, sp_exec_id, is_open_issue_fault: bool) -> tuple:
     return tuple(values.get(col) for col in _ALL_COLUMNS)
 
 
-def _fetch_location_ids_with_open_issues(cursor) -> set:
+def _fetch_pole_ids_with_open_issues(cursor) -> set:
     """
-    Every LocationId whose pole has at least one row in PoleOpenIssues --
-    PoleOpenIssues.PoleId matches Poles.Id, not LocationId directly, so
+    Every PoleId whose pole has at least one row in PoleOpenIssues --
+    PoleOpenIssues.PoleId matches Poles.Id, not PoleId directly, so
     this needs the join through Poles. Fetched once per
     load_leadsun_pole_telemetry() run (a single, cheap query -- PoleOpenIssues
     only ever holds currently-open issues, not the full issue history,
@@ -243,10 +223,10 @@ def _fetch_location_ids_with_open_issues(cursor) -> set:
     """
     cursor.execute(
         """
-        SELECT DISTINCT p.LocationId
+        SELECT DISTINCT p.VendorPoleId
         FROM Poles p
         JOIN PoleOpenIssues poi ON poi.PoleId = p.Id
-        WHERE p.LocationId IS NOT NULL
+        WHERE p.VendorPoleId IS NOT NULL
         """
     )
     return {row[0] for row in cursor.fetchall()}
@@ -290,7 +270,7 @@ def _sql_diff_select_list(columns: list, prefix: str) -> str:
 _STAGING_TABLE_SQL = f"""
 IF OBJECT_ID('tempdb..#PoleTelemetryStaging') IS NOT NULL DROP TABLE #PoleTelemetryStaging;
 CREATE TABLE #PoleTelemetryStaging (
-    LocationId  NVARCHAR(100)     NULL,
+    PoleId  NVARCHAR(100)     NULL,
     LastUpload  DATETIMEOFFSET(3) NULL,
     Source      VARCHAR(50)       NULL,
     SP_ExecId   INT               NULL,
@@ -302,25 +282,8 @@ CREATE TABLE #PoleTelemetryStaging (
     LampPower2             FLOAT NULL,
     SolarBoardVoltage      FLOAT NULL,
     SolarBoardElecCurrent  FLOAT NULL,
-    DcInVoltage            FLOAT NULL,
-    BatteryOutElecCurrent  FLOAT NULL,
-    BatteryTemperature1    FLOAT NULL,
-    BatteryTemperature2    FLOAT NULL,
-    McuTemperature         FLOAT NULL,
-    EnvTemperature         FLOAT NULL,
-    LightingState          NVARCHAR(50) NULL,
-    DcInState              INT NULL,
-    DcOutState             INT NULL,
-    SolarBoardState        INT NULL,
-    Battery1State          INT NULL,
-    Battery2State          INT NULL,
-    Lamp1State             INT NULL,
-    Lamp2State             INT NULL,
     ControllerCode         NVARCHAR(50) NULL,
     ProductId              NVARCHAR(50) NULL,
-    CreateTime             DATETIMEOFFSET(3) NULL,
-    SolarBoardDcStatus     VARCHAR(20) NULL,
-    LampBatteryStatus      VARCHAR(20) NULL,
     UserName               NVARCHAR(100) NULL,
     LeadsunId              INT NULL,
     GroupId                INT NULL,
@@ -331,11 +294,8 @@ CREATE TABLE #PoleTelemetryStaging (
     ModelId                INT NULL,
     IsOnline               BIT NULL,
     IsOpenIssueFault       BIT NULL,
-    TimeoutFlag            INT NULL,
     Longitude              FLOAT NULL,
     Latitude               FLOAT NULL,
-    ControlModelCode       VARCHAR(50) NULL,
-    ControlModelName       NVARCHAR(100) NULL,
     ExtraFieldsJson        NVARCHAR(MAX) NULL,
     BatterySoC             FLOAT NULL,
     LightRatio             FLOAT NULL,
@@ -356,7 +316,7 @@ _STAGING_INSERT_SQL = (
 _MERGE_FROM_STAGING_SQL = f"""
 MERGE PoleTelemetry AS target
 USING #PoleTelemetryStaging AS source
-ON target.LocationId = source.LocationId AND target.LastUpload = source.LastUpload
+ON target.PoleId = source.PoleId AND target.LastUpload = source.LastUpload
 WHEN MATCHED AND NOT EXISTS (
     SELECT {_sql_diff_select_list(_DIFF_CHECK_COLUMNS, 'target')}
     INTERSECT
@@ -377,7 +337,7 @@ MERGE PoleTelemetry AS target
 USING (
     SELECT {_sql_source_select_list(_ALL_COLUMNS)}
 ) AS source
-ON target.LocationId = source.LocationId AND target.LastUpload = source.LastUpload
+ON target.PoleId = source.PoleId AND target.LastUpload = source.LastUpload
 WHEN MATCHED AND NOT EXISTS (
     SELECT {_sql_diff_select_list(_DIFF_CHECK_COLUMNS, 'target')}
     INTERSECT
@@ -435,22 +395,22 @@ def load_leadsun_pole_telemetry() -> None:
         )
 
         # 3. Map + upsert in chunks (stage a chunk, one set-based MERGE,
-        # truncate, repeat). Records missing LocationId or a parseable
+        # truncate, repeat). Records missing PoleId or a parseable
         # LastUpload are counted as row-level errors and skipped -- both
         # are part of PoleTelemetry's primary key, so neither can be NULL.
         upsert_start = time.perf_counter()
-        open_issue_location_ids = _fetch_location_ids_with_open_issues(cursor)
+        open_issue_pole_ids = _fetch_pole_ids_with_open_issues(cursor)
         param_rows = []
         for lamp in lamps:
             mapped = _map_lamp_record(lamp)
-            if mapped["LocationId"] is None or mapped["LastUpload"] is None:
+            if mapped["PoleId"] is None or mapped["LastUpload"] is None:
                 total_errors += 1
                 logging.error(
-                    "loadPoleTelemetry: skipping record with missing LocationId/LastUpload: %s",
+                    "loadPoleTelemetry: skipping record with missing PoleId/LastUpload: %s",
                     mapped,
                 )
                 continue
-            is_open_issue_fault = mapped["LocationId"] in open_issue_location_ids
+            is_open_issue_fault = mapped["PoleId"] in open_issue_pole_ids
             param_rows.append(_build_row(mapped, sp_exec_id, is_open_issue_fault))
 
         if param_rows:
@@ -477,7 +437,7 @@ def load_leadsun_pole_telemetry() -> None:
                         total_errors += 1
                         logging.error(
                             "loadPoleTelemetry: failed to upsert %s: %s",
-                            row[0],  # LocationId is the first positional param
+                            row[0],  # PoleId is the first positional param
                             row_error,
                         )
 
@@ -548,12 +508,12 @@ def load_leadsun_pole_telemetry() -> None:
 # pole_open_issues_loader.py's own comments on _map_record_to_issue for
 # the full history) -- "PoleId" links to a synced/mirror table, not the
 # real Poles table, so the JOIN this value depends on
-# (_fetch_location_ids_with_open_issues() above) never matched
+# (_fetch_pole_ids_with_open_issues() above) never matched
 # correctly, meaning IsOpenIssueFault has likely been 0/False for
 # essentially every pole regardless of whether it actually had an open
 # issue, since this loader was first built.
 #
-# load_leadsun_pole_telemetry() itself needs NO fix -- _fetch_location_ids_with_
+# load_leadsun_pole_telemetry() itself needs NO fix -- _fetch_pole_ids_with_
 # open_issues() already re-queries PoleOpenIssues/Poles fresh on every
 # single run, so any NEW telemetry ingested after PoleOpenIssues.PoleId
 # is corrected (i.e. after loadPoleOpenIssues runs again with that fix
@@ -583,30 +543,30 @@ def load_leadsun_pole_telemetry() -> None:
 # accepted limitation of PoleOpenIssues' own data model, not an
 # oversight here.
 _BACKFILL_IS_OPEN_ISSUE_FAULT_PER_POLE_SQL = """
-WITH LocationIdsWithOpenIssues AS (
-    SELECT DISTINCT p.LocationId
+WITH PoleIdsWithOpenIssues AS (
+    SELECT DISTINCT p.VendorPoleId
     FROM Poles p
     JOIN PoleOpenIssues poi ON poi.PoleId = p.Id
-    WHERE p.LocationId IS NOT NULL
+    WHERE p.VendorPoleId IS NOT NULL
 ),
 MaxReadingPerPole AS (
     SELECT
-        t.LocationId,
+        t.PoleId,
         MAX(t.LastUpload) AS MaxLastUpload
     FROM PoleTelemetry t
     WHERE t.LastUpload <> ?  -- exclude the missing-LastUpload sentinel (see _MISSING_LAST_UPLOAD_SENTINEL above)
-    GROUP BY t.LocationId
+    GROUP BY t.PoleId
 )
 UPDATE t
-SET t.IsOpenIssueFault = CASE WHEN loi.LocationId IS NOT NULL THEN 1 ELSE 0 END
+SET t.IsOpenIssueFault = CASE WHEN loi.PoleId IS NOT NULL THEN 1 ELSE 0 END
 FROM PoleTelemetry t
-JOIN MaxReadingPerPole mr ON t.LocationId = mr.LocationId
-LEFT JOIN LocationIdsWithOpenIssues loi ON t.LocationId = loi.LocationId
+JOIN MaxReadingPerPole mr ON t.PoleId = mr.PoleId
+LEFT JOIN PoleIdsWithOpenIssues loi ON t.PoleId = loi.PoleId
 WHERE t.LastUpload > DATEADD(HOUR, -48, mr.MaxLastUpload)
   AND t.LastUpload <= mr.MaxLastUpload
   AND (
       t.IsOpenIssueFault IS NULL  -- NULL rows always need to be set explicitly
-      OR t.IsOpenIssueFault <> CASE WHEN loi.LocationId IS NOT NULL THEN 1 ELSE 0 END
+      OR t.IsOpenIssueFault <> CASE WHEN loi.PoleId IS NOT NULL THEN 1 ELSE 0 END
   );
 """
 
@@ -757,7 +717,7 @@ def _aggregate_telemetry_by_leadsun_project(telemetry_rows) -> dict:
     identifiers that are easy to confuse with each other:
       ProductId        <- PoleTelemetry.LeadsunId (Leadsun's own raw "id"
                            field -- a plain integer, e.g. 10358)
-      ProductName      <- PoleTelemetry.LocationId (Leadsun's own raw
+      ProductName      <- PoleTelemetry.PoleId (Leadsun's own raw
                            "productName" field -- e.g. "12009-1000")
       ControllerCode   <- PoleTelemetry.ControllerCode (unchanged name)
       ProvidedProductId <- PoleTelemetry.ProductId (Leadsun's own raw
@@ -768,11 +728,11 @@ def _aggregate_telemetry_by_leadsun_project(telemetry_rows) -> dict:
                            despite the similar name)
       PoleNumber       <- Poles.PoleNumber, via a LEFT JOIN in
                            _FETCH_TELEMETRY_FOR_PROJECT_AGGREGATION_SQL
-                           on Poles.LocationId = PoleTelemetry.LocationId
+                           on Poles.PoleId = PoleTelemetry.PoleId
                            -- NOT a PoleTelemetry column at all, so this
                            is the one product field that can legitimately
                            come back None: a Leadsun device reporting
-                           telemetry with a LocationId that doesn't (yet)
+                           telemetry with a PoleId that doesn't (yet)
                            match any row in Poles (e.g. not yet entered
                            in Airtable) still gets a product entry here,
                            just with PoleNumber left as None rather than
@@ -794,7 +754,7 @@ def _aggregate_telemetry_by_leadsun_project(telemetry_rows) -> dict:
     different rows for the very same pole, differing only in a field
     this function doesn't read, would still only contribute ONE product
     entry here, since GroupId/GatewayCode/ProductId/ControllerCode/
-    LeadsunId/LocationId together are expected to already be that pole's
+    LeadsunId/PoleId together are expected to already be that pole's
     own stable identity; if a genuinely different reading arrived for
     the exact same pole later in this same batch, the SECOND one's own
     values would silently replace the first's, since products are keyed
@@ -828,7 +788,7 @@ def _aggregate_telemetry_by_leadsun_project(telemetry_rows) -> dict:
             group_name,
             gateway_code,
             leadsun_id,
-            location_id,
+            pole_id,
             controller_code,
             product_id,
             pole_number,
@@ -860,7 +820,7 @@ def _aggregate_telemetry_by_leadsun_project(telemetry_rows) -> dict:
 
         group_entry["products"][leadsun_id] = {
             "ProductId": leadsun_id,
-            "ProductName": location_id,
+            "ProductName": pole_id,
             "ControllerCode": controller_code,
             "ProvidedProductId": product_id,
             "PoleNumber": pole_number,
@@ -907,17 +867,17 @@ _FETCH_TELEMETRY_FOR_PROJECT_AGGREGATION_SQL = """
 WITH RecentTelemetry AS (
     SELECT
         LeadsunProjectId, LeadsunProjectName, GroupId, GroupName,
-        GatewayCode, LeadsunId, LocationId, ControllerCode, ProductId,
-        ROW_NUMBER() OVER (PARTITION BY LocationId ORDER BY LastUpload DESC) AS rn
+        GatewayCode, LeadsunId, PoleId, ControllerCode, ProductId,
+        ROW_NUMBER() OVER (PARTITION BY PoleId ORDER BY LastUpload DESC) AS rn
     FROM PoleTelemetry
     WHERE LeadsunProjectId IS NOT NULL
       AND LastUpload >= ?
 )
 SELECT rt.LeadsunProjectId, rt.LeadsunProjectName, rt.GroupId, rt.GroupName,
-       rt.GatewayCode, rt.LeadsunId, rt.LocationId, rt.ControllerCode, rt.ProductId,
+       rt.GatewayCode, rt.LeadsunId, rt.PoleId, rt.ControllerCode, rt.ProductId,
        p.PoleNumber
 FROM RecentTelemetry rt
-LEFT JOIN Poles p ON p.LocationId = rt.LocationId
+LEFT JOIN Poles p ON p.VendorPoleId = rt.PoleId
 WHERE rt.rn = 1
 """
 

@@ -10,14 +10,14 @@
 --     project's existing conventions:
 --       - Leadsun's own "id"        -> LeadsunId          (a bare "Id"
 --         column would look like this table's primary key; it isn't --
---         (LocationId, LastUpload) is)
+--         (PoleId, LastUpload) is)
 --       - Leadsun's own "projectId" -> LeadsunProjectId    (would otherwise
 --       - Leadsun's own "projectName" -> LeadsunProjectName look like a
 --         reference to *our* Airtable-sourced Projects table; it's not --
 --         it's Leadsun's own internal project grouping)
---     "productName" -> LocationId is the one rename that WAS explicitly
+--     "productName" -> PoleId is the one rename that WAS explicitly
 --     requested, not a judgment call.
---   * PRIMARY KEY is the composite (LocationId, LastUpload), matching
+--   * PRIMARY KEY is the composite (PoleId, LastUpload), matching
 --     "upsert is based on the productName and lastUpload" directly.
 --   * No FK anywhere -- PoleTelemetry is a separate ingestion pipeline from
 --     the Airtable-sourced tables (Poles/Projects/Customers) and isn't
@@ -35,7 +35,7 @@
 IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'PoleTelemetry')
 BEGIN
     CREATE TABLE PoleTelemetry (
-        LocationId             NVARCHAR(100)     NOT NULL,  -- from productName
+        PoleId             NVARCHAR(100)     NOT NULL,  -- from productName
         LastUpload             DATETIMEOFFSET(3) NOT NULL,
         Source                 VARCHAR(50)       NOT NULL,
         SP_ExecId              INT               NULL,
@@ -62,7 +62,7 @@ BEGIN
         Lamp1State             INT               NULL,
         Lamp2State             INT               NULL,
         ControllerCode         NVARCHAR(50)      NULL,
-        ProductId              NVARCHAR(50)      NULL,  -- Leadsun's own product id (distinct from productName/LocationId)
+        ProductId              NVARCHAR(50)      NULL,  -- Leadsun's own product id (distinct from productName/PoleId)
         CreateTime             DATETIMEOFFSET(3) NULL,
         SolarBoardDcStatus     VARCHAR(20)       NULL,  -- binary-flag string, e.g. "00000111" -- kept as text, not converted to int
         LampBatteryStatus      VARCHAR(20)       NULL,
@@ -85,7 +85,7 @@ BEGIN
                                                           -- from PoleTimeZones' Lat/Long (NOT this table's
                                                           -- own Longitude/Latitude) -- see that loader's
                                                           -- module docstring for why
-        PRIMARY KEY (LocationId, LastUpload)
+        PRIMARY KEY (PoleId, LastUpload)
     );
 
     CREATE NONCLUSTERED INDEX IX_PoleTelemetry_LastUpload

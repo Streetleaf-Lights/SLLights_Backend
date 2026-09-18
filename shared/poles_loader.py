@@ -67,20 +67,20 @@ _POLE_UPSERT_SQL = """
 MERGE Poles AS target
 USING (
     SELECT
-        ? AS Id, ? AS PoleNumber, ? AS LocationId, ? AS CountyFips, ? AS ProjectId, ? AS CustomerId,
+        ? AS Id, ? AS PoleNumber, ? AS VendorPoleId, ? AS CountyFips, ? AS ProjectId, ? AS CustomerId,
         ? AS InstallDate, ? AS Lat, ? AS Long, ? AS ControllerId, ? AS SP_ExecId, ? AS AirTableCreatedDateTime
 ) AS source
 ON target.Id = source.Id
 WHEN MATCHED AND NOT EXISTS (
-    SELECT target.PoleNumber, target.LocationId, target.CountyFips, target.ProjectId, target.CustomerId,
+    SELECT target.PoleNumber, target.VendorPoleId, target.CountyFips, target.ProjectId, target.CustomerId,
            target.InstallDate, target.Lat, target.Long, target.ControllerId
     INTERSECT
-    SELECT source.PoleNumber, source.LocationId, source.CountyFips, source.ProjectId, source.CustomerId,
+    SELECT source.PoleNumber, source.VendorPoleId, source.CountyFips, source.ProjectId, source.CustomerId,
            source.InstallDate, source.Lat, source.Long, source.ControllerId
 )
 THEN UPDATE SET
     PoleNumber   = source.PoleNumber,
-    LocationId   = source.LocationId,
+    VendorPoleId = source.VendorPoleId,
     CountyFips   = source.CountyFips,
     ProjectId    = source.ProjectId,
     CustomerId   = source.CustomerId,
@@ -90,8 +90,8 @@ THEN UPDATE SET
     ControllerId = source.ControllerId,
     SP_ExecId    = source.SP_ExecId
 WHEN NOT MATCHED THEN
-    INSERT (Id, PoleNumber, LocationId, CountyFips, ProjectId, CustomerId, InstallDate, Lat, Long, ControllerId, SP_ExecId, AirTableCreatedDateTime)
-    VALUES (source.Id, source.PoleNumber, source.LocationId, source.CountyFips, source.ProjectId, source.CustomerId,
+    INSERT (Id, PoleNumber, VendorPoleId, CountyFips, ProjectId, CustomerId, InstallDate, Lat, Long, ControllerId, SP_ExecId, AirTableCreatedDateTime)
+    VALUES (source.Id, source.PoleNumber, source.VendorPoleId, source.CountyFips, source.ProjectId, source.CustomerId,
             source.InstallDate, source.Lat, source.Long, source.ControllerId, source.SP_ExecId, source.AirTableCreatedDateTime);
 """
 
@@ -118,7 +118,7 @@ IF OBJECT_ID('tempdb..#PolesStaging') IS NOT NULL DROP TABLE #PolesStaging;
 CREATE TABLE #PolesStaging (
     Id                      VARCHAR(50)       NULL,
     PoleNumber              NVARCHAR(100)     NULL,
-    LocationId              VARCHAR(50)       NULL,
+    VendorPoleId            VARCHAR(50)       NULL,
     CountyFips              VARCHAR(5)        NULL,
     ProjectId               VARCHAR(50)       NULL,
     CustomerId              VARCHAR(50)       NULL,
@@ -132,7 +132,7 @@ CREATE TABLE #PolesStaging (
 """
 
 _STAGING_INSERT_SQL = """
-INSERT INTO #PolesStaging (Id, PoleNumber, LocationId, CountyFips, ProjectId, CustomerId, InstallDate, Lat, Long, ControllerId, SP_ExecId, AirTableCreatedDateTime)
+INSERT INTO #PolesStaging (Id, PoleNumber, VendorPoleId, CountyFips, ProjectId, CustomerId, InstallDate, Lat, Long, ControllerId, SP_ExecId, AirTableCreatedDateTime)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
@@ -141,15 +141,15 @@ MERGE Poles AS target
 USING #PolesStaging AS source
 ON target.Id = source.Id
 WHEN MATCHED AND NOT EXISTS (
-    SELECT target.PoleNumber, target.LocationId, target.CountyFips, target.ProjectId, target.CustomerId,
+    SELECT target.PoleNumber, target.VendorPoleId, target.CountyFips, target.ProjectId, target.CustomerId,
            target.InstallDate, target.Lat, target.Long, target.ControllerId
     INTERSECT
-    SELECT source.PoleNumber, source.LocationId, source.CountyFips, source.ProjectId, source.CustomerId,
+    SELECT source.PoleNumber, source.VendorPoleId, source.CountyFips, source.ProjectId, source.CustomerId,
            source.InstallDate, source.Lat, source.Long, source.ControllerId
 )
 THEN UPDATE SET
     PoleNumber   = source.PoleNumber,
-    LocationId   = source.LocationId,
+    VendorPoleId = source.VendorPoleId,
     CountyFips   = source.CountyFips,
     ProjectId    = source.ProjectId,
     CustomerId   = source.CustomerId,
@@ -159,8 +159,8 @@ THEN UPDATE SET
     ControllerId = source.ControllerId,
     SP_ExecId    = source.SP_ExecId
 WHEN NOT MATCHED THEN
-    INSERT (Id, PoleNumber, LocationId, CountyFips, ProjectId, CustomerId, InstallDate, Lat, Long, ControllerId, SP_ExecId, AirTableCreatedDateTime)
-    VALUES (source.Id, source.PoleNumber, source.LocationId, source.CountyFips, source.ProjectId, source.CustomerId,
+    INSERT (Id, PoleNumber, VendorPoleId, CountyFips, ProjectId, CustomerId, InstallDate, Lat, Long, ControllerId, SP_ExecId, AirTableCreatedDateTime)
+    VALUES (source.Id, source.PoleNumber, source.VendorPoleId, source.CountyFips, source.ProjectId, source.CustomerId,
             source.InstallDate, source.Lat, source.Long, source.ControllerId, source.SP_ExecId, source.AirTableCreatedDateTime);
 """
 
@@ -251,7 +251,7 @@ def _map_record_to_pole(record: dict) -> dict:
     return {
         "Id": record["id"],  # Airtable's own record id, e.g. "recAbCdEfGh12345"
         "PoleNumber": fields.get("Pole Number"),
-        "LocationId": fields.get("Location ID"),  # plain scalar, confirmed
+        "VendorPoleId": fields.get("Location ID"),  # plain scalar, confirmed
         "CountyFips": _clean_county_fips(fields.get("CountyFips")),
         "ProjectId": (
             project_ids[0]
@@ -351,7 +351,7 @@ def load_poles() -> None:
             (
                 pole["Id"],
                 pole["PoleNumber"],
-                pole["LocationId"],
+                pole["VendorPoleId"],
                 pole["CountyFips"],
                 pole["ProjectId"],
                 pole["CustomerId"],

@@ -10,7 +10,7 @@
 -- picked up on the next batch automatically.
 
 SELECT
-    t.LocationId,
+    t.PoleId,
     t.LastUpload,
     t.IsDaylight,
     t.IsDaylightForLedFault,
@@ -20,7 +20,7 @@ SELECT
     ptz.Latitude,
     ptz.Longitude
 FROM PoleTelemetry t
-JOIN PoleTimeZones ptz ON t.LocationId = ptz.ProvisionedPoleId
+JOIN PoleTimeZones ptz ON t.PoleId = ptz.ProvisionedPoleId
 WHERE (t.IsDaylight IS NULL OR t.IsDaylightForLedFault IS NULL OR t.IsDaylightForPanelFault IS NULL)
   AND t.LastUpload <> '9999-12-31 23:59:59.999 +00:00'
 ORDER BY t.LastUpload DESC;
@@ -32,18 +32,18 @@ ORDER BY t.LastUpload DESC;
 -- because Poles.CountyFips is NULL or doesn't match CountyTimeZones.
 -- The INNER JOIN in _FIND_PROVISIONED_UNFLAGGED_SQL silently excludes
 -- these poles, so they will never get flagged until the timezone is resolved.
--- Fix: populate Poles.CountyFips for these LocationIds, then re-run
+-- Fix: populate Poles.CountyFips for these PoleIds, then re-run
 -- loadProvisionedPoleTimeZones followed by loadProvisionedPoleDaylightFlags.
 
 SELECT DISTINCT
-    t.LocationId,
+    t.PoleId,
     p.PoleNumber,
     p.CountyFips,
     p.ProvisionedPoleId
 FROM PoleTelemetry t
-LEFT JOIN PoleTimeZones ptz ON t.LocationId = ptz.ProvisionedPoleId
-LEFT JOIN Poles p ON t.LocationId = p.ProvisionedPoleId
+LEFT JOIN PoleTimeZones ptz ON t.PoleId = ptz.ProvisionedPoleId
+LEFT JOIN Poles p ON t.PoleId = p.ProvisionedPoleId
 WHERE (t.IsDaylight IS NULL OR t.IsDaylightForLedFault IS NULL OR t.IsDaylightForPanelFault IS NULL)
   AND t.LastUpload <> '9999-12-31 23:59:59.999 +00:00'
   AND ptz.ProvisionedPoleId IS NULL
-ORDER BY t.LocationId;
+ORDER BY t.PoleId;

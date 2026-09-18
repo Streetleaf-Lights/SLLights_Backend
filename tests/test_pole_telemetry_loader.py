@@ -73,10 +73,10 @@ class TestParseIsoDatetime:
 
 
 class TestMapLampRecord:
-    def test_product_name_renamed_to_location_id(self, make_lamp_record):
+    def test_product_name_renamed_to_pole_id(self, make_lamp_record):
         record = make_lamp_record(product_name="12009-1000")
         result = pole_telemetry_loader._map_lamp_record(record)
-        assert result["LocationId"] == "12009-1000"
+        assert result["PoleId"] == "12009-1000"
         assert "ProductName" not in result
 
     def test_last_upload_parsed(self, make_lamp_record):
@@ -109,17 +109,21 @@ class TestMapLampRecord:
 
     def test_product_id_is_kept_distinct_from_product_name(self, make_lamp_record):
         """productId (Leadsun's own product identifier string) is a
-        different field from productName (-> LocationId) and should not be
+        different field from productName (-> PoleId) and should not be
         confused with it."""
         record = make_lamp_record()
         result = pole_telemetry_loader._map_lamp_record(record)
         assert result["ProductId"] == "AE3SAP7323113143"
-        assert result["LocationId"] == "12009-1000"
+        assert result["PoleId"] == "12009-1000"
 
-    def test_lighting_state_trailing_space_is_trimmed(self, make_lamp_record):
+    def test_lighting_state_trailing_space_is_trimmed_into_extra_json(self, make_lamp_record):
+        """LightingState is no longer a dedicated column -- it lands in ExtraFieldsJson."""
+        import json
         record = make_lamp_record()
         result = pole_telemetry_loader._map_lamp_record(record)
-        assert result["LightingState"] == "lighting-off"
+        assert "LightingState" not in result or result.get("LightingState") is None
+        extra = json.loads(result["ExtraFieldsJson"]) if result.get("ExtraFieldsJson") else {}
+        assert extra.get("LightingState") == "lighting-off"
 
     def test_all_string_fields_are_trimmed(self, make_lamp_record):
         record = make_lamp_record(extra_fields={"userName": "  spacey-user  "})
@@ -133,21 +137,31 @@ class TestMapLampRecord:
         assert result["Longitude"] == -80.7236
         assert result["Latitude"] == 27.99507
         assert result["IsOnline"] is True
-        assert result["DcInState"] == 3
+        # DcInState now in ExtraFieldsJson, not a dedicated column
 
-    def test_null_create_time_stays_none(self, make_lamp_record):
-        record = make_lamp_record()  # createTime is None in the confirmed sample
-        result = pole_telemetry_loader._map_lamp_record(record)
-        assert result["CreateTime"] is None
-
-    def test_all_known_fields_from_real_sample_produce_empty_extra_json(self, make_lamp_record):
-        """
-        The confirmed sample record has no fields outside _ALL_COLUMNS, so
-        ExtraFieldsJson should be empty/None for it.
-        """
+    def test_null_create_time_goes_to_extra_json(self, make_lamp_record):
+        """CreateTime is no longer a dedicated column -- goes to ExtraFieldsJson."""
+        import json
         record = make_lamp_record()
         result = pole_telemetry_loader._map_lamp_record(record)
-        assert result["ExtraFieldsJson"] is None
+        assert "CreateTime" not in result or result.get("CreateTime") is None
+        extra = json.loads(result["ExtraFieldsJson"]) if result.get("ExtraFieldsJson") else {}
+        # createTime is None in the sample -- appears in ExtraFieldsJson as null
+        assert "CreateTime" in extra and extra["CreateTime"] is None
+
+    def test_all_known_fields_from_real_sample_produce_only_dropped_columns_in_extra_json(self, make_lamp_record):
+        """
+        Fields that were previously dedicated columns but are now dropped
+        (e.g. LightingState, DcInState) land in ExtraFieldsJson instead.
+        Truly unknown fields from the Leadsun API also land there.
+        """
+        import json
+        record = make_lamp_record()
+        result = pole_telemetry_loader._map_lamp_record(record)
+        # ExtraFieldsJson now holds the dropped columns that had real values
+        extra = json.loads(result["ExtraFieldsJson"]) if result.get("ExtraFieldsJson") else {}
+        assert "LightingState" in extra  # dropped column now in ExtraFieldsJson
+        assert "DcInState" in extra
 
     def test_unexpected_field_is_captured_in_extra_fields_json(self, make_lamp_record):
         record = make_lamp_record(extra_fields={"brandNewSensorField": 42})
@@ -155,10 +169,10 @@ class TestMapLampRecord:
         extra = json.loads(result["ExtraFieldsJson"])
         assert extra["BrandNewSensorField"] == 42
 
-    def test_missing_product_name_becomes_none_location_id(self):
+    def test_missing_product_name_becomes_none_pole_id(self):
         record = {"lastUpload": "2026-01-01T00:00:00Z"}
         result = pole_telemetry_loader._map_lamp_record(record)
-        assert result["LocationId"] is None
+        assert result["PoleId"] is None
 
     def test_missing_last_upload_gets_sentinel_not_none(self, make_lamp_record):
         """
@@ -215,7 +229,7 @@ class TestBuildRow:
         row = pole_telemetry_loader._build_row(mapped, sp_exec_id=99, is_open_issue_fault=True)
 
         as_dict = dict(zip(pole_telemetry_loader._ALL_COLUMNS, row))
-        assert as_dict["LocationId"] == "LOC-X"
+        assert as_dict["PoleId"] == "LOC-X"
         assert as_dict["Source"] == "Leadsun"
         assert as_dict["SP_ExecId"] == 99
         assert as_dict["IsOpenIssueFault"] is True
@@ -243,7 +257,7 @@ class TestStagingMergeSqlStructure:
 
     def test_merge_from_staging_match_key_is_location_and_last_upload(self):
         sql = pole_telemetry_loader._MERGE_FROM_STAGING_SQL
-        assert "target.LocationId = source.LocationId" in sql
+        assert "target.PoleId = source.PoleId" in sql
         assert "target.LastUpload = source.LastUpload" in sql
 
     def test_merge_from_staging_uses_intersect(self):
@@ -349,7 +363,7 @@ class TestLoadPoleTelemetrySuccessFlow:
         self, patch_get_connection_pole_telemetry, patch_fetch_lamps, mock_cursor
     ):
         patch_fetch_lamps.return_value = []
-        mock_cursor.fetchall.return_value = []  # no LocationIds with open issues
+        mock_cursor.fetchall.return_value = []  # no PoleIds with open issues
 
         pole_telemetry_loader.load_leadsun_pole_telemetry()
 
@@ -363,7 +377,7 @@ class TestLoadPoleTelemetrySuccessFlow:
         assert (success, errors, batch_count) == (0, 0, 1)
         mock_cursor.executemany.assert_not_called()
 
-    def test_records_missing_location_id_or_last_upload_are_counted_as_errors(
+    def test_records_missing_pole_id_or_last_upload_are_counted_as_errors(
         self, patch_get_connection_pole_telemetry, patch_fetch_lamps, mock_cursor, make_lamp_record
     ):
         good_record = make_lamp_record(product_name="POLE-1")
@@ -380,7 +394,7 @@ class TestLoadPoleTelemetrySuccessFlow:
         self, patch_get_connection_pole_telemetry, patch_fetch_lamps, mock_cursor, make_lamp_record
     ):
         """
-        A record with a genuinely-missing lastUpload (LocationId still
+        A record with a genuinely-missing lastUpload (PoleId still
         present) must be upserted using the sentinel, not counted as an
         error -- this is the whole point of the sentinel.
         """
@@ -484,11 +498,11 @@ class TestBackfillIsOpenIssueFaultPerPoleSqlStructure:
         sql = pole_telemetry_loader._BACKFILL_IS_OPEN_ISSUE_FAULT_PER_POLE_SQL
         max_reading_cte = sql.split("MaxReadingPerPole AS (")[1].split(")\nUPDATE")[0]
         assert "MAX(t.LastUpload) AS MaxLastUpload" in max_reading_cte
-        assert "GROUP BY t.LocationId" in max_reading_cte
+        assert "GROUP BY t.PoleId" in max_reading_cte
 
     def test_scopes_each_poles_correction_to_a_48_hour_range_ending_at_its_own_max(self):
         sql = pole_telemetry_loader._BACKFILL_IS_OPEN_ISSUE_FAULT_PER_POLE_SQL
-        assert "JOIN MaxReadingPerPole mr ON t.LocationId = mr.LocationId" in sql
+        assert "JOIN MaxReadingPerPole mr ON t.PoleId = mr.PoleId" in sql
         assert "WHERE t.LastUpload > DATEADD(HOUR, -48, mr.MaxLastUpload)" in sql
         assert "AND t.LastUpload <= mr.MaxLastUpload" in sql
 
@@ -496,7 +510,7 @@ class TestBackfillIsOpenIssueFaultPerPoleSqlStructure:
         """This is exactly the join that was broken -- confirms the
         backfill uses the SAME (now-corrected) column
         pole_telemetry_loader.py's own
-        _fetch_location_ids_with_open_issues() does, not some
+        _fetch_pole_ids_with_open_issues() does, not some
         independently-written path that could disagree with it."""
         sql = pole_telemetry_loader._BACKFILL_IS_OPEN_ISSUE_FAULT_PER_POLE_SQL
         assert "JOIN PoleOpenIssues poi ON poi.PoleId = p.Id" in sql
@@ -509,14 +523,14 @@ class TestBackfillIsOpenIssueFaultPerPoleSqlStructure:
         sql = pole_telemetry_loader._BACKFILL_IS_OPEN_ISSUE_FAULT_PER_POLE_SQL
         assert "t.IsOpenIssueFault IS NULL" in sql
         assert (
-            "OR t.IsOpenIssueFault <> CASE WHEN loi.LocationId IS NOT NULL THEN 1 ELSE 0 END"
+            "OR t.IsOpenIssueFault <> CASE WHEN loi.PoleId IS NOT NULL THEN 1 ELSE 0 END"
             in sql
         )
 
     def test_sets_one_when_matched_zero_when_not(self):
         sql = pole_telemetry_loader._BACKFILL_IS_OPEN_ISSUE_FAULT_PER_POLE_SQL
         assert (
-            "SET t.IsOpenIssueFault = CASE WHEN loi.LocationId IS NOT NULL THEN 1 ELSE 0 END" in sql
+            "SET t.IsOpenIssueFault = CASE WHEN loi.PoleId IS NOT NULL THEN 1 ELSE 0 END" in sql
         )
 
 
@@ -656,7 +670,7 @@ def _telemetry_row(
     group_name="Chaparral Ph3",
     gateway_code="GT18L94A25082883",
     leadsun_id=10358,
-    location_id="12009-1000",
+    pole_id="12009-1000",
     controller_code="A3P70LA323110598",
     product_id="AE3SAP7323113143",
     pole_number="12009-1000-A",
@@ -671,7 +685,7 @@ def _telemetry_row(
         group_name,
         gateway_code,
         leadsun_id,
-        location_id,
+        pole_id,
         controller_code,
         product_id,
         pole_number,
@@ -733,8 +747,8 @@ class TestAggregateTelemetryByLeadsunProject:
 
     def test_multiple_products_in_the_same_group_are_both_kept(self):
         rows = [
-            _telemetry_row(leadsun_id=1, location_id="LOC-1", product_id="PROD-1"),
-            _telemetry_row(leadsun_id=2, location_id="LOC-2", product_id="PROD-2"),
+            _telemetry_row(leadsun_id=1, pole_id="LOC-1", product_id="PROD-1"),
+            _telemetry_row(leadsun_id=2, pole_id="LOC-2", product_id="PROD-2"),
         ]
         result = pole_telemetry_loader._aggregate_telemetry_by_leadsun_project(rows)
         products = result["482"]["groups"][0]["products"]
@@ -837,8 +851,8 @@ class TestAggregateTelemetryByLeadsunProject:
         second one -- totalPoles must reflect that same deduplication,
         not the raw row count."""
         rows = [
-            _telemetry_row(group_id=100, leadsun_id=1, location_id="LOC-A"),
-            _telemetry_row(group_id=100, leadsun_id=1, location_id="LOC-A-updated"),
+            _telemetry_row(group_id=100, leadsun_id=1, pole_id="LOC-A"),
+            _telemetry_row(group_id=100, leadsun_id=1, pole_id="LOC-A-updated"),
         ]
         result = pole_telemetry_loader._aggregate_telemetry_by_leadsun_project(rows)
         group = result["482"]["groups"][0]
@@ -1052,10 +1066,10 @@ class TestFetchTelemetryForProjectAggregationSqlIsBounded:
 
     def test_sql_takes_only_the_latest_row_per_pole_within_the_window(self):
         """Not just time-bounded -- also deduplicated to ONE row per
-        LocationId (via ROW_NUMBER), since a pole can still have
+        PoleId (via ROW_NUMBER), since a pole can still have
         multiple readings within the lookback window."""
         sql = pole_telemetry_loader._FETCH_TELEMETRY_FOR_PROJECT_AGGREGATION_SQL
-        assert "ROW_NUMBER() OVER (PARTITION BY LocationId ORDER BY LastUpload DESC)" in sql
+        assert "ROW_NUMBER() OVER (PARTITION BY PoleId ORDER BY LastUpload DESC)" in sql
         assert "WHERE rt.rn = 1" in sql
 
     def test_lookback_constant_is_a_small_bounded_window_not_the_full_retention(self):

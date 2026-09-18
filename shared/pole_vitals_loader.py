@@ -12,13 +12,13 @@ SOURCE_NAME = "Leadsun"
 
 PERIOD_TYPES = ("Hour", "Last48Hours")
 
-# How many rows to KEEP per LocationId for each period type -- this table
+# How many rows to KEEP per PoleId for each period type -- this table
 # had no retention/pruning at all before this; it grew one row per pole
 # per Hour forever. Hour is a genuinely historical, discrete bucket
 # sequence, so pruning means "delete anything beyond the newest N,
 # ORDER BY PeriodStart DESC" (see _RETENTION_PRUNE_SQL below).
 # Last48Hours isn't in this dict at all -- it's a single, continuously
-# upserted row per pole (its own MERGE matches on LocationId+PeriodType
+# upserted row per pole (its own MERGE matches on PoleId+PeriodType
 # alone, not PeriodStart -- see _LAST_48_HOURS_MERGE_SQL's own comment),
 # so there's structurally never more than one row per pole to prune.
 _RETENTION_LIMITS = {
@@ -222,16 +222,16 @@ _BACKFILL_LATEST_HOUR_PER_POLE_MERGE_SQL = """
 SET ANSI_WARNINGS OFF;
 ;WITH MaxReadingPerPole AS (
     SELECT
-        t.LocationId,
+        t.PoleId,
         MAX(t.LastUpload) AS MaxLastUpload
     FROM PoleTelemetry t
     WHERE t.Source = 'Leadsun'
       AND t.LastUpload <> ?  -- exclude the missing-LastUpload sentinel (see pole_telemetry_loader.py)
-    GROUP BY t.LocationId
+    GROUP BY t.PoleId
 ),
 LatestBucketPerPole AS (
     SELECT
-        mr.LocationId,
+        mr.PoleId,
         ISNULL(ptz.WindowsTimeZone, 'Eastern Standard Time') AS TimeZoneName,
         DATEADD(
             HOUR,
@@ -242,11 +242,11 @@ LatestBucketPerPole AS (
             '19000101'
         ) AS BucketStart
     FROM MaxReadingPerPole mr
-    LEFT JOIN PoleTimeZones ptz ON mr.LocationId = ptz.LocationId
+    LEFT JOIN PoleTimeZones ptz ON mr.PoleId = ptz.VendorPoleId
 ),
 TelemetryWithVitals AS (
     SELECT
-        t.LocationId,
+        t.PoleId,
         lb.TimeZoneName,
         lb.BucketStart,
         CASE WHEN t.BatteryElecCurrent2 IS NULL
@@ -293,7 +293,7 @@ TelemetryWithVitals AS (
         t.IsOpenIssueFault,
         t.LastUpload
     FROM PoleTelemetry t
-    JOIN LatestBucketPerPole lb ON t.LocationId = lb.LocationId
+    JOIN LatestBucketPerPole lb ON t.PoleId = lb.PoleId
     LEFT JOIN PoleModels pm ON t.ModelId = pm.ModelId
     WHERE t.Source = 'Leadsun'
       AND t.LastUpload <> ?  -- exclude the missing-LastUpload sentinel (see pole_telemetry_loader.py)
@@ -302,20 +302,20 @@ TelemetryWithVitals AS (
 ),
 Bucketed AS (
     SELECT
-        LocationId,
+        PoleId,
         TimeZoneName,
         BucketStart,
         BatteryPercentage, PanelPercentage, LightPercentage,
         IsOnlineFlag, IsLedFaultFlag, IsBatteryFaultFlag, IsPanelFaultFlag, IsOpenIssueFault,
         ROW_NUMBER() OVER (
-            PARTITION BY LocationId, BucketStart
+            PARTITION BY PoleId, BucketStart
             ORDER BY LastUpload DESC
         ) AS LatestInBucket
     FROM TelemetryWithVitals
 ),
 Aggregated AS (
     SELECT
-        LocationId,
+        PoleId,
         TimeZoneName,
         BucketStart,
         AVG(BatteryPercentage) AS AvgBatteryPercentage,
@@ -328,12 +328,12 @@ Aggregated AS (
         MAX(CASE WHEN LatestInBucket = 1 THEN CAST(IsOpenIssueFault AS TINYINT) END) AS IsOpenIssueFaultAgg,
         COUNT(*)                AS RecordCount
     FROM Bucketed
-    GROUP BY LocationId, TimeZoneName, BucketStart
+    GROUP BY PoleId, TimeZoneName, BucketStart
 )
 MERGE PoleVitals AS target
 USING (
     SELECT
-        LocationId,
+        PoleId,
         'Hour' AS PeriodType,
         BucketStart AT TIME ZONE TimeZoneName AS PeriodStart,
         DATEADD(HOUR, 1, BucketStart) AT TIME ZONE TimeZoneName AS PeriodEnd,
@@ -353,7 +353,7 @@ USING (
         ? AS SP_ExecId
     FROM Aggregated
 ) AS source
-ON target.LocationId = source.LocationId
+ON target.PoleId = source.PoleId
    AND target.PeriodType = source.PeriodType
    AND target.PeriodStart = source.PeriodStart
 WHEN MATCHED THEN UPDATE SET
@@ -371,8 +371,8 @@ WHEN MATCHED THEN UPDATE SET
     Source                = source.Source,
     SP_ExecId             = source.SP_ExecId
 WHEN NOT MATCHED THEN
-    INSERT (LocationId, PeriodType, PeriodStart, PeriodEnd, AvgBatteryPercentage, AvgPanelPercentage, AvgLightPercentage, IsOnline, IsLedFault, IsBatteryFault, IsPanelFault, IsOpenIssueFault, IsPoleFault, RecordCount, Source, SP_ExecId)
-    VALUES (source.LocationId, source.PeriodType, source.PeriodStart, source.PeriodEnd, source.AvgBatteryPercentage, source.AvgPanelPercentage, source.AvgLightPercentage, source.IsOnline, source.IsLedFault, source.IsBatteryFault, source.IsPanelFault, source.IsOpenIssueFault, source.IsPoleFault, source.RecordCount, source.Source, source.SP_ExecId);
+    INSERT (PoleId, PeriodType, PeriodStart, PeriodEnd, AvgBatteryPercentage, AvgPanelPercentage, AvgLightPercentage, IsOnline, IsLedFault, IsBatteryFault, IsPanelFault, IsOpenIssueFault, IsPoleFault, RecordCount, Source, SP_ExecId)
+    VALUES (source.PoleId, source.PeriodType, source.PeriodStart, source.PeriodEnd, source.AvgBatteryPercentage, source.AvgPanelPercentage, source.AvgLightPercentage, source.IsOnline, source.IsLedFault, source.IsBatteryFault, source.IsPanelFault, source.IsOpenIssueFault, source.IsPoleFault, source.RecordCount, source.Source, source.SP_ExecId);
 SET ANSI_WARNINGS ON;
 """
 
@@ -403,15 +403,15 @@ _BACKFILL_LAST_48_HOURS_OF_HOUR_PER_POLE_MERGE_SQL = """
 SET ANSI_WARNINGS OFF;
 ;WITH MaxReadingPerPole AS (
     SELECT
-        t.LocationId,
+        t.PoleId,
         MAX(t.LastUpload) AS MaxLastUpload
     FROM PoleTelemetry t
     WHERE t.LastUpload <> ?  -- exclude the missing-LastUpload sentinel (see pole_telemetry_loader.py)
-    GROUP BY t.LocationId
+    GROUP BY t.PoleId
 ),
 TelemetryWithVitals AS (
     SELECT
-        t.LocationId,
+        t.PoleId,
         CAST(t.LastUpload AT TIME ZONE ISNULL(ptz.WindowsTimeZone, 'Eastern Standard Time') AS DATETIME2(3)) AS LocalTime,
         ISNULL(ptz.WindowsTimeZone, 'Eastern Standard Time') AS TimeZoneName,
         CASE WHEN t.BatteryElecCurrent2 IS NULL
@@ -542,9 +542,9 @@ TelemetryWithVitals AS (
         t.IsOpenIssueFault,
         t.LastUpload
     FROM PoleTelemetry t
-    JOIN MaxReadingPerPole mr ON t.LocationId = mr.LocationId
+    JOIN MaxReadingPerPole mr ON t.PoleId = mr.PoleId
     LEFT JOIN PoleModels pm ON t.ModelId = pm.ModelId
-    LEFT JOIN PoleTimeZones ptz ON t.LocationId = ptz.LocationId
+    LEFT JOIN PoleTimeZones ptz ON t.PoleId = ptz.VendorPoleId
     -- Bounded to THIS POLE'S OWN last 48 hours of real activity,
     -- ending at its own most recent reading -- NOT a global cutoff
     -- relative to "now" like _HOUR_MERGE_SQL's own WHERE clause
@@ -560,7 +560,7 @@ TelemetryWithVitals AS (
 ),
 Bucketed AS (
     SELECT
-        LocationId,
+        PoleId,
         TimeZoneName,
         DATEADD(HOUR, DATEDIFF(HOUR, '19000101', LocalTime), '19000101') AS BucketStart,
         BatteryPercentage, PanelPercentage, LightPercentage,
@@ -570,14 +570,14 @@ Bucketed AS (
         -- NOT used for anything else (the other three fault flags and
         -- IsOnline are ANY-in-window, not last-in-window).
         ROW_NUMBER() OVER (
-            PARTITION BY LocationId, DATEADD(HOUR, DATEDIFF(HOUR, '19000101', LocalTime), '19000101')
+            PARTITION BY PoleId, DATEADD(HOUR, DATEDIFF(HOUR, '19000101', LocalTime), '19000101')
             ORDER BY LastUpload DESC
         ) AS LatestInBucket
     FROM TelemetryWithVitals
 ),
 Aggregated AS (
     SELECT
-        LocationId,
+        PoleId,
         TimeZoneName,
         BucketStart,
         AVG(BatteryPercentage) AS AvgBatteryPercentage,
@@ -590,12 +590,12 @@ Aggregated AS (
         MAX(CASE WHEN LatestInBucket = 1 THEN CAST(IsOpenIssueFault AS TINYINT) END) AS IsOpenIssueFaultAgg,
         COUNT(*)                AS RecordCount
     FROM Bucketed
-    GROUP BY LocationId, TimeZoneName, BucketStart
+    GROUP BY PoleId, TimeZoneName, BucketStart
 )
 MERGE PoleVitals AS target
 USING (
     SELECT
-        LocationId,
+        PoleId,
         'Hour' AS PeriodType,
         BucketStart AT TIME ZONE TimeZoneName AS PeriodStart,
         DATEADD(HOUR, 1, BucketStart) AT TIME ZONE TimeZoneName AS PeriodEnd,
@@ -615,7 +615,7 @@ USING (
         ? AS SP_ExecId
     FROM Aggregated
 ) AS source
-ON target.LocationId = source.LocationId
+ON target.PoleId = source.PoleId
    AND target.PeriodType = source.PeriodType
    AND target.PeriodStart = source.PeriodStart
 WHEN MATCHED THEN UPDATE SET
@@ -633,8 +633,8 @@ WHEN MATCHED THEN UPDATE SET
     Source                = source.Source,
     SP_ExecId             = source.SP_ExecId
 WHEN NOT MATCHED THEN
-    INSERT (LocationId, PeriodType, PeriodStart, PeriodEnd, AvgBatteryPercentage, AvgPanelPercentage, AvgLightPercentage, IsOnline, IsLedFault, IsBatteryFault, IsPanelFault, IsOpenIssueFault, IsPoleFault, RecordCount, Source, SP_ExecId)
-    VALUES (source.LocationId, source.PeriodType, source.PeriodStart, source.PeriodEnd, source.AvgBatteryPercentage, source.AvgPanelPercentage, source.AvgLightPercentage, source.IsOnline, source.IsLedFault, source.IsBatteryFault, source.IsPanelFault, source.IsOpenIssueFault, source.IsPoleFault, source.RecordCount, source.Source, source.SP_ExecId);
+    INSERT (PoleId, PeriodType, PeriodStart, PeriodEnd, AvgBatteryPercentage, AvgPanelPercentage, AvgLightPercentage, IsOnline, IsLedFault, IsBatteryFault, IsPanelFault, IsOpenIssueFault, IsPoleFault, RecordCount, Source, SP_ExecId)
+    VALUES (source.PoleId, source.PeriodType, source.PeriodStart, source.PeriodEnd, source.AvgBatteryPercentage, source.AvgPanelPercentage, source.AvgLightPercentage, source.IsOnline, source.IsLedFault, source.IsBatteryFault, source.IsPanelFault, source.IsOpenIssueFault, source.IsPoleFault, source.RecordCount, source.Source, source.SP_ExecId);
 SET ANSI_WARNINGS ON;
 """
 
@@ -642,7 +642,7 @@ _HOUR_MERGE_SQL = """
 SET ANSI_WARNINGS OFF;
 ;WITH TelemetryWithVitals AS (
     SELECT
-        t.LocationId,
+        t.PoleId,
         CAST(t.LastUpload AT TIME ZONE ISNULL(ptz.WindowsTimeZone, 'Eastern Standard Time') AS DATETIME2(3)) AS LocalTime,
         ISNULL(ptz.WindowsTimeZone, 'Eastern Standard Time') AS TimeZoneName,
         CASE WHEN t.BatteryElecCurrent2 IS NULL
@@ -774,14 +774,14 @@ SET ANSI_WARNINGS OFF;
         t.LastUpload
     FROM PoleTelemetry t
     LEFT JOIN PoleModels pm ON t.ModelId = pm.ModelId
-    LEFT JOIN PoleTimeZones ptz ON t.LocationId = ptz.LocationId
+    LEFT JOIN PoleTimeZones ptz ON t.PoleId = ptz.VendorPoleId
     WHERE t.Source = 'Leadsun'
       AND t.LastUpload >= ?
       AND t.LastUpload <> ?  -- exclude the missing-LastUpload sentinel (see pole_telemetry_loader.py)
 ),
 Bucketed AS (
     SELECT
-        LocationId,
+        PoleId,
         TimeZoneName,
         DATEADD(HOUR, DATEDIFF(HOUR, '19000101', LocalTime), '19000101') AS BucketStart,
         BatteryPercentage, PanelPercentage, LightPercentage,
@@ -791,14 +791,14 @@ Bucketed AS (
         -- NOT used for anything else (the other three fault flags and
         -- IsOnline are ANY-in-window, not last-in-window).
         ROW_NUMBER() OVER (
-            PARTITION BY LocationId, DATEADD(HOUR, DATEDIFF(HOUR, '19000101', LocalTime), '19000101')
+            PARTITION BY PoleId, DATEADD(HOUR, DATEDIFF(HOUR, '19000101', LocalTime), '19000101')
             ORDER BY LastUpload DESC
         ) AS LatestInBucket
     FROM TelemetryWithVitals
 ),
 Aggregated AS (
     SELECT
-        LocationId,
+        PoleId,
         TimeZoneName,
         BucketStart,
         AVG(BatteryPercentage) AS AvgBatteryPercentage,
@@ -811,12 +811,12 @@ Aggregated AS (
         MAX(CASE WHEN LatestInBucket = 1 THEN CAST(IsOpenIssueFault AS TINYINT) END) AS IsOpenIssueFaultAgg,
         COUNT(*)                AS RecordCount
     FROM Bucketed
-    GROUP BY LocationId, TimeZoneName, BucketStart
+    GROUP BY PoleId, TimeZoneName, BucketStart
 )
 MERGE PoleVitals AS target
 USING (
     SELECT
-        LocationId,
+        PoleId,
         'Hour' AS PeriodType,
         BucketStart AT TIME ZONE TimeZoneName AS PeriodStart,
         DATEADD(HOUR, 1, BucketStart) AT TIME ZONE TimeZoneName AS PeriodEnd,
@@ -836,7 +836,7 @@ USING (
         ? AS SP_ExecId
     FROM Aggregated
 ) AS source
-ON target.LocationId = source.LocationId
+ON target.PoleId = source.PoleId
    AND target.PeriodType = source.PeriodType
    AND target.PeriodStart = source.PeriodStart
 WHEN MATCHED THEN UPDATE SET
@@ -854,8 +854,8 @@ WHEN MATCHED THEN UPDATE SET
     Source                = source.Source,
     SP_ExecId             = source.SP_ExecId
 WHEN NOT MATCHED THEN
-    INSERT (LocationId, PeriodType, PeriodStart, PeriodEnd, AvgBatteryPercentage, AvgPanelPercentage, AvgLightPercentage, IsOnline, IsLedFault, IsBatteryFault, IsPanelFault, IsOpenIssueFault, IsPoleFault, RecordCount, Source, SP_ExecId)
-    VALUES (source.LocationId, source.PeriodType, source.PeriodStart, source.PeriodEnd, source.AvgBatteryPercentage, source.AvgPanelPercentage, source.AvgLightPercentage, source.IsOnline, source.IsLedFault, source.IsBatteryFault, source.IsPanelFault, source.IsOpenIssueFault, source.IsPoleFault, source.RecordCount, source.Source, source.SP_ExecId);
+    INSERT (PoleId, PeriodType, PeriodStart, PeriodEnd, AvgBatteryPercentage, AvgPanelPercentage, AvgLightPercentage, IsOnline, IsLedFault, IsBatteryFault, IsPanelFault, IsOpenIssueFault, IsPoleFault, RecordCount, Source, SP_ExecId)
+    VALUES (source.PoleId, source.PeriodType, source.PeriodStart, source.PeriodEnd, source.AvgBatteryPercentage, source.AvgPanelPercentage, source.AvgLightPercentage, source.IsOnline, source.IsLedFault, source.IsBatteryFault, source.IsPanelFault, source.IsOpenIssueFault, source.IsPoleFault, source.RecordCount, source.Source, source.SP_ExecId);
 SET ANSI_WARNINGS ON;
 """
 
@@ -873,21 +873,21 @@ SET ANSI_WARNINGS ON;
 # DATETIMEOFFSET comparisons are already timezone-aware (comparing actual
 # UTC instants), so there's nothing for a timezone conversion to add here.
 #
-# The MERGE's ON clause matches on LocationId + PeriodType alone --
+# The MERGE's ON clause matches on PoleId + PeriodType alone --
 # deliberately NOT including PeriodStart, unlike Hour. PeriodStart
 # shifts forward by definition on every run (it's always "now - 48h"),
 # so matching on it would mean this could only ever INSERT a new row,
 # never UPDATE the existing one -- exactly the "only 1 row" guarantee
 # this needs would be violated without the retention-pruning step Hour
 # relies on (which doesn't apply here -- see _RETENTION_LIMITS' own
-# comment). Matching on LocationId+PeriodType alone means PeriodStart/
+# comment). Matching on PoleId+PeriodType alone means PeriodStart/
 # PeriodEnd are simply overwritten to the fresh window's bounds on every
 # run, keeping exactly one row per pole updated in place.
 _LAST_48_HOURS_MERGE_SQL = """
 SET ANSI_WARNINGS OFF;
 ;WITH TelemetryWithVitals AS (
     SELECT
-        t.LocationId,
+        t.PoleId,
         CASE WHEN t.BatteryElecCurrent2 IS NULL
              THEN t.BatteryElecCurrent1
              ELSE (t.BatteryElecCurrent1 + t.BatteryElecCurrent2) / 2.0
@@ -1037,7 +1037,7 @@ SET ANSI_WARNINGS OFF;
         t.IsOpenIssueFault,
         -- Identifies each pole's own single most-recent reading in the
         -- window, for IsOpenIssueFault's "take the last telemetry" rule.
-        ROW_NUMBER() OVER (PARTITION BY t.LocationId ORDER BY t.LastUpload DESC) AS LatestOverall
+        ROW_NUMBER() OVER (PARTITION BY t.PoleId ORDER BY t.LastUpload DESC) AS LatestOverall
     FROM PoleTelemetry t
     LEFT JOIN PoleModels pm ON t.ModelId = pm.ModelId
     WHERE t.Source = 'Leadsun'
@@ -1046,7 +1046,7 @@ SET ANSI_WARNINGS OFF;
 ),
 Aggregated AS (
     SELECT
-        LocationId,
+        PoleId,
         AVG(BatteryPercentage) AS AvgBatteryPercentage,
         -- CHANGED by explicit request: only readings taken (a) during
         -- daylight (ISNULL(IsDaylightForPanelFault, 1) = 1 -- NULL
@@ -1080,12 +1080,12 @@ Aggregated AS (
         MAX(CASE WHEN LatestOverall = 1 THEN CAST(IsOpenIssueFault AS TINYINT) END) AS IsOpenIssueFaultAgg,
         COUNT(*)                AS RecordCount
     FROM TelemetryWithVitals
-    GROUP BY LocationId
+    GROUP BY PoleId
 )
 MERGE PoleVitals AS target
 USING (
     SELECT
-        LocationId,
+        PoleId,
         'Last48Hours' AS PeriodType,
         -- Converted to Eastern -- SYSDATETIMEOFFSET() alone reflects the
         -- SERVER's own time zone (Azure SQL Database runs in UTC
@@ -1118,7 +1118,7 @@ USING (
         ? AS SP_ExecId
     FROM Aggregated
 ) AS source
-ON target.LocationId = source.LocationId
+ON target.PoleId = source.PoleId
    AND target.PeriodType = source.PeriodType
 WHEN MATCHED THEN UPDATE SET
     PeriodStart           = source.PeriodStart,
@@ -1136,8 +1136,8 @@ WHEN MATCHED THEN UPDATE SET
     Source                = source.Source,
     SP_ExecId             = source.SP_ExecId
 WHEN NOT MATCHED THEN
-    INSERT (LocationId, PeriodType, PeriodStart, PeriodEnd, AvgBatteryPercentage, AvgPanelPercentage, AvgLightPercentage, IsOnline, IsLedFault, IsBatteryFault, IsPanelFault, IsOpenIssueFault, IsPoleFault, RecordCount, Source, SP_ExecId)
-    VALUES (source.LocationId, source.PeriodType, source.PeriodStart, source.PeriodEnd, source.AvgBatteryPercentage, source.AvgPanelPercentage, source.AvgLightPercentage, source.IsOnline, source.IsLedFault, source.IsBatteryFault, source.IsPanelFault, source.IsOpenIssueFault, source.IsPoleFault, source.RecordCount, source.Source, source.SP_ExecId);
+    INSERT (PoleId, PeriodType, PeriodStart, PeriodEnd, AvgBatteryPercentage, AvgPanelPercentage, AvgLightPercentage, IsOnline, IsLedFault, IsBatteryFault, IsPanelFault, IsOpenIssueFault, IsPoleFault, RecordCount, Source, SP_ExecId)
+    VALUES (source.PoleId, source.PeriodType, source.PeriodStart, source.PeriodEnd, source.AvgBatteryPercentage, source.AvgPanelPercentage, source.AvgLightPercentage, source.IsOnline, source.IsLedFault, source.IsBatteryFault, source.IsPanelFault, source.IsOpenIssueFault, source.IsPoleFault, source.RecordCount, source.Source, source.SP_ExecId);
 SET ANSI_WARNINGS ON;
 """
 
@@ -1146,7 +1146,7 @@ _MERGE_SQL_BY_PERIOD_TYPE = {
     "Last48Hours": _LAST_48_HOURS_MERGE_SQL,
 }
 
-# Deletes anything beyond the newest N rows per LocationId, ordered by
+# Deletes anything beyond the newest N rows per PoleId, ordered by
 # PeriodStart DESC -- run once per period type, right after that period
 # type's own MERGE commits. Only Hour is in _RETENTION_LIMITS --
 # count-based retention doesn't apply to Last48Hours, which is always
@@ -1155,14 +1155,14 @@ _MERGE_SQL_BY_PERIOD_TYPE = {
 # _LAST_48_HOURS_STALE_ROW_PRUNE_SQL below.
 _RETENTION_PRUNE_SQL = """
 ;WITH Ranked AS (
-    SELECT LocationId, PeriodStart,
-           ROW_NUMBER() OVER (PARTITION BY LocationId ORDER BY PeriodStart DESC) AS rn
+    SELECT PoleId, PeriodStart,
+           ROW_NUMBER() OVER (PARTITION BY PoleId ORDER BY PeriodStart DESC) AS rn
     FROM PoleVitals
     WHERE PeriodType = ?
 )
 DELETE pv
 FROM PoleVitals pv
-JOIN Ranked r ON pv.LocationId = r.LocationId AND pv.PeriodStart = r.PeriodStart
+JOIN Ranked r ON pv.PoleId = r.PoleId AND pv.PeriodStart = r.PeriodStart
 WHERE pv.PeriodType = ? AND r.rn > ?
 """
 
@@ -1191,7 +1191,7 @@ FROM PoleVitals pv
 WHERE pv.PeriodType = 'Last48Hours'
   AND NOT EXISTS (
       SELECT 1 FROM PoleTelemetry t
-      WHERE t.LocationId = pv.LocationId
+      WHERE t.PoleId = pv.PoleId
         AND t.LastUpload >= ?
         AND t.LastUpload <> ?
   )
@@ -1296,7 +1296,7 @@ def load_leadsun_pole_vitals(backfill: bool = False) -> None:
     prune immediately after) -- no per-row Python loop or staging table
     needed here, unlike the other loaders, since the SQL aggregation
     itself produces a modest number of output rows (bounded by distinct
-    LocationIds x a couple of buckets), not thousands of individually-
+    PoleIds x a couple of buckets), not thousands of individually-
     bound parameter rows.
 
     Two period types: Hour, Last48Hours. ('Day', 'Week', and 'Month' were
@@ -1852,15 +1852,15 @@ def backfill_last_48_hours_of_hour_for_all_poles() -> None:
 # ---------------------------------------------------------------------------
 #
 # Mirrors load_leadsun_pole_vitals() exactly, with one difference:
-# the Hour MERGE joins PoleTimeZones on t.LocationId = ptz.ProvisionedPoleId
-# rather than ptz.LocationId. Provisioned telemetry stores ProvisionedPoleId
-# as its PoleTelemetry.LocationId (see provisioned_telemetry_loader.py),
+# the Hour MERGE joins PoleTimeZones on t.PoleId = ptz.ProvisionedPoleId
+# rather than ptz.VendorPoleId. Provisioned telemetry stores ProvisionedPoleId
+# as its PoleTelemetry.PoleId (see provisioned_telemetry_loader.py),
 # and PoleTimeZones rows for provisioned poles are keyed on ProvisionedPoleId
-# (LocationId is NULL for those rows -- see pole_timezones_loader.py's
+# (PoleId is NULL for those rows -- see pole_timezones_loader.py's
 # load_provisioned_pole_timezones()). The Last48Hours MERGE and all cleanup
 # SQL are reused directly from the Leadsun path -- Last48Hours has no
 # PoleTimeZones join at all (no timezone bucketing needed), and the stale-
-# row prune matches on PoleTelemetry.LocationId = PoleVitals.LocationId,
+# row prune matches on PoleTelemetry.PoleId = PoleVitals.PoleId,
 # which is correct for both sources.
 
 PROVISIONED_SOURCE_NAME = "Provisioned"
@@ -1869,7 +1869,7 @@ _PROVISIONED_HOUR_MERGE_SQL = """
 SET ANSI_WARNINGS OFF;
 ;WITH TelemetryWithVitals AS (
     SELECT
-        t.LocationId,
+        t.PoleId,
         CAST(t.LastUpload AT TIME ZONE ISNULL(ptz.WindowsTimeZone, 'Eastern Standard Time') AS DATETIME2(3)) AS LocalTime,
         ISNULL(ptz.WindowsTimeZone, 'Eastern Standard Time') AS TimeZoneName,
         -- Use device-reported percentages and fault flags directly from the
@@ -1914,31 +1914,31 @@ SET ANSI_WARNINGS OFF;
     -- kept commented out for reference.
     -- LEFT JOIN PoleModels pm ON t.ModelId = pm.ModelId
     -- KEY DIFFERENCE from _HOUR_MERGE_SQL: join on ProvisionedPoleId, not
-    -- LocationId -- provisioned telemetry stores ProvisionedPoleId as its
-    -- LocationId, and PoleTimeZones rows for provisioned poles are keyed on
-    -- ProvisionedPoleId (ptz.LocationId is NULL for those rows).
-    LEFT JOIN PoleTimeZones ptz ON t.LocationId = ptz.ProvisionedPoleId
+    -- PoleId -- provisioned telemetry stores ProvisionedPoleId as its
+    -- PoleId, and PoleTimeZones rows for provisioned poles are keyed on
+    -- ProvisionedPoleId (ptz.VendorPoleId is NULL for those rows).
+    LEFT JOIN PoleTimeZones ptz ON t.PoleId = ptz.ProvisionedPoleId
     WHERE t.Source = 'Provisioned'
       AND t.LastUpload >= ?
       AND t.LastUpload <> ?
 ),
 Bucketed AS (
     SELECT
-        LocationId,
+        PoleId,
         TimeZoneName,
         DATEADD(HOUR, DATEDIFF(HOUR, '19000101', LocalTime), '19000101') AS BucketStart,
         BatteryPercentage, PanelPercentage, LightPercentage,
         IsOnlineFlag, IsLedFaultFlag, IsBatteryFaultFlag, IsPanelFaultFlag, IsOpenIssueFault,
         IsDaylightForPanelFault, IsDaylightForLedFault,
         ROW_NUMBER() OVER (
-            PARTITION BY LocationId, DATEADD(HOUR, DATEDIFF(HOUR, '19000101', LocalTime), '19000101')
+            PARTITION BY PoleId, DATEADD(HOUR, DATEDIFF(HOUR, '19000101', LocalTime), '19000101')
             ORDER BY LastUpload DESC
         ) AS LatestInBucket
     FROM TelemetryWithVitals
 ),
 Aggregated AS (
     SELECT
-        LocationId,
+        PoleId,
         TimeZoneName,
         BucketStart,
         AVG(BatteryPercentage) AS AvgBatteryPercentage,
@@ -1953,12 +1953,12 @@ Aggregated AS (
         MAX(CASE WHEN LatestInBucket = 1 THEN CAST(IsOpenIssueFault AS TINYINT) END) AS IsOpenIssueFaultAgg,
         COUNT(*)                AS RecordCount
     FROM Bucketed
-    GROUP BY LocationId, TimeZoneName, BucketStart
+    GROUP BY PoleId, TimeZoneName, BucketStart
 )
 MERGE PoleVitals AS target
 USING (
     SELECT
-        LocationId,
+        PoleId,
         'Hour' AS PeriodType,
         BucketStart AT TIME ZONE TimeZoneName AS PeriodStart,
         DATEADD(HOUR, 1, BucketStart) AT TIME ZONE TimeZoneName AS PeriodEnd,
@@ -1978,7 +1978,7 @@ USING (
         ? AS SP_ExecId
     FROM Aggregated
 ) AS source
-ON target.LocationId = source.LocationId
+ON target.PoleId = source.PoleId
    AND target.PeriodType = source.PeriodType
    AND target.PeriodStart = source.PeriodStart
 WHEN MATCHED AND NOT EXISTS (
@@ -2004,8 +2004,8 @@ THEN UPDATE SET
     Source                = source.Source,
     SP_ExecId             = source.SP_ExecId
 WHEN NOT MATCHED THEN
-    INSERT (LocationId, PeriodType, PeriodStart, PeriodEnd, AvgBatteryPercentage, AvgPanelPercentage, AvgLightPercentage, IsOnline, IsLedFault, IsBatteryFault, IsPanelFault, IsOpenIssueFault, IsPoleFault, RecordCount, Source, SP_ExecId)
-    VALUES (source.LocationId, source.PeriodType, source.PeriodStart, source.PeriodEnd, source.AvgBatteryPercentage, source.AvgPanelPercentage, source.AvgLightPercentage, source.IsOnline, source.IsLedFault, source.IsBatteryFault, source.IsPanelFault, source.IsOpenIssueFault, source.IsPoleFault, source.RecordCount, source.Source, source.SP_ExecId);
+    INSERT (PoleId, PeriodType, PeriodStart, PeriodEnd, AvgBatteryPercentage, AvgPanelPercentage, AvgLightPercentage, IsOnline, IsLedFault, IsBatteryFault, IsPanelFault, IsOpenIssueFault, IsPoleFault, RecordCount, Source, SP_ExecId)
+    VALUES (source.PoleId, source.PeriodType, source.PeriodStart, source.PeriodEnd, source.AvgBatteryPercentage, source.AvgPanelPercentage, source.AvgLightPercentage, source.IsOnline, source.IsLedFault, source.IsBatteryFault, source.IsPanelFault, source.IsOpenIssueFault, source.IsPoleFault, source.RecordCount, source.Source, source.SP_ExecId);
 SET ANSI_WARNINGS ON;
 """
 
@@ -2098,9 +2098,9 @@ def load_provisioned_pole_vitals(backfill: bool = False) -> None:
 
     Identical to load_leadsun_pole_vitals() in all respects except:
     - SP_Execution.Source = 'Provisioned' (not 'Leadsun')
-    - The Hour MERGE joins PoleTimeZones on t.LocationId = ptz.ProvisionedPoleId
-      (not ptz.LocationId) -- provisioned telemetry stores ProvisionedPoleId
-      as its LocationId, and PoleTimeZones keys provisioned rows on
+    - The Hour MERGE joins PoleTimeZones on t.PoleId = ptz.ProvisionedPoleId
+      (not ptz.VendorPoleId) -- provisioned telemetry stores ProvisionedPoleId
+      as its PoleId, and PoleTimeZones keys provisioned rows on
       ProvisionedPoleId.
     - The Last48Hours MERGE is shared directly (no PoleTimeZones join at all).
 

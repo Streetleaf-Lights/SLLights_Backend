@@ -1,6 +1,6 @@
 -- PoleVitals: rolling health metrics (battery, solar panel, light
 -- output, and per-reading fault flags) derived FROM PoleTelemetry +
--- PoleModels + PoleTimeZones, bucketed by LocationId + PeriodType.
+-- PoleModels + PoleTimeZones, bucketed by PoleId + PeriodType.
 --
 -- This is the CONSOLIDATED, up-to-date schema -- it supersedes the
 -- separate "Create tbl PoleVitals.sql" / "Add IsOnline and LightStatus
@@ -98,7 +98,7 @@
 IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'PoleVitals')
 BEGIN
     CREATE TABLE PoleVitals (
-        LocationId           NVARCHAR(100)     NOT NULL,
+        PoleId           NVARCHAR(100)     NOT NULL,
         PeriodType           VARCHAR(20)       NOT NULL,  -- 'Hour' or 'Last48Hours' -- see the
                                                             -- header comment above for the
                                                             -- full history of what this
@@ -117,7 +117,7 @@ BEGIN
         RecordCount          INT               NOT NULL,  -- how many telemetry readings fed this average
         Source               VARCHAR(50)       NOT NULL,
         SP_ExecId            INT               NULL,
-        CONSTRAINT PK_PoleVitals PRIMARY KEY (LocationId, PeriodType, PeriodStart),
+        CONSTRAINT PK_PoleVitals PRIMARY KEY (PoleId, PeriodType, PeriodStart),
         CONSTRAINT CK_PoleVitals_PeriodType CHECK (PeriodType IN ('Hour', 'Last48Hours'))
     );
 

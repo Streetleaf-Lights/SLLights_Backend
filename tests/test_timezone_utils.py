@@ -27,7 +27,7 @@ class TestResolveIanaTimezone:
         micro-degrees without converting back to decimal degrees.
         timezonefinder itself raises ValueError for this; must be caught
         and turned into a clean None, not propagate as an unhandled
-        exception (which would otherwise mean this LocationId never gets
+        exception (which would otherwise mean this PoleId never gets
         a PoleTimeZones row at all, and gets retried -- and re-fails,
         and re-logs -- every single cycle forever).
         """

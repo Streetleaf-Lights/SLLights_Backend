@@ -2,7 +2,7 @@
 -- whose own Id is no longer present in loadPoles' own Airtable fetch,
 -- without actually deleting that row (deleting it outright would break
 -- PoleTelemetry/PoleVitals/PoleTimeZones' own references to that same
--- LocationId, and would permanently lose that pole's own telemetry
+-- VendorPoleId, and would permanently lose that pole's own telemetry
 -- history -- flagging it in place preserves both).
 --
 -- Set by shared/airtable_removal_utils.flag_records_removed_from_airtable(),

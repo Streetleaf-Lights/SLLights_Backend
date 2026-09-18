@@ -13,7 +13,7 @@
 --     Projects.InstallDates, which is plural/JSON-encoded. Confirm
 --     Airtable's "Field Installed" is really a single date and not
 --     something else (e.g. a checkbox).
---   * PoleNumber/LocationId are plain scalar columns; ProjectId and
+--   * PoleNumber/VendorPoleId are plain scalar columns; ProjectId and
 --     CustomerId are both linked-record references (list of ids, first one
 --     taken) -- see projects_loader.py's comments on "Contracting Entity"
 --     for background on that field-naming quirk.
@@ -31,7 +31,7 @@
 --   * Active -- per explicit request, flags whether a Pole's own Id is
 --     still present in loadPoles' own Airtable fetch, without deleting
 --     the row when it isn't (PoleTelemetry/PoleVitals/PoleTimeZones all
---     reference this same LocationId, and deleting outright would lose
+--     reference this same VendorPoleId, and deleting outright would lose
 --     that history). Named generically (not e.g. "IsRemovedFromAirtable")
 --     so it reads sensibly if a future source OTHER than Airtable ever
 --     needs to reconcile against this same table. Set by shared/
@@ -58,7 +58,7 @@ BEGIN
     CREATE TABLE Poles (
         Id                      VARCHAR(50)         NOT NULL PRIMARY KEY,
         PoleNumber              NVARCHAR(100)       NULL,
-        LocationId              VARCHAR(50)          NULL,
+        VendorPoleId              VARCHAR(50)          NULL,
         CountyFips              VARCHAR(5)           NULL,
         ProjectId               VARCHAR(50)          NULL,
         CustomerId              VARCHAR(50)          NULL,
@@ -83,8 +83,8 @@ BEGIN
     CREATE NONCLUSTERED INDEX IX_Poles_CustomerId
         ON Poles (CustomerId);
 
-    CREATE NONCLUSTERED INDEX IX_Poles_LocationId
-        ON Poles (LocationId);
+    CREATE NONCLUSTERED INDEX IX_Poles_VendorPoleId
+        ON Poles (VendorPoleId);
 
     CREATE NONCLUSTERED INDEX IX_Poles_CountyFips
         ON Poles (CountyFips);

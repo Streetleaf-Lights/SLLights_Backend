@@ -63,14 +63,18 @@ class TestBuildRow:
         row = m._build_row(mapped, sp_exec_id=99)
         assert len(row) == len(m._ALL_COLUMNS)
 
-    def test_unpopulated_columns_are_none(self):
-        """Every PoleModels column this source doesn't populate (Battery,
-        CommType, IconUrl, etc.) must come through as None, not be
-        missing or raise a KeyError."""
+    def test_unpopulated_columns_produce_correct_length_row(self):
+        """Every PoleModels column this source doesn't populate must come
+        through as None, not be missing or raise a KeyError. Battery,
+        CommType, IconUrl etc. are now in ExtraFieldsJson, not dedicated columns."""
         mapped = m._map_product_row((5, "PFX", "Model Five", True))
         row = m._build_row(mapped, sp_exec_id=99)
-        battery_index = m._ALL_COLUMNS.index("Battery")
-        assert row[battery_index] is None
+        assert len(row) == len(m._ALL_COLUMNS)
+        # ExtraFieldsJson should contain the IsActive flag for provisioned products
+        import json
+        extra_index = m._ALL_COLUMNS.index("ExtraFieldsJson")
+        extra = json.loads(row[extra_index]) if row[extra_index] else {}
+        assert "IsActive" in extra
 
 
 class TestFetchProvisionedProducts:

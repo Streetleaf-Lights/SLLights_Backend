@@ -3,8 +3,8 @@
 -- (Leadsun's own numeric project identifier, confirmed INT in a real
 -- /lamps response, e.g. 442, 314). Lets a Project be joined directly to
 -- its own PoleTelemetry rows via this shared identifier, rather than
--- only indirectly through Poles.ProjectId -> Poles.LocationId ->
--- PoleTelemetry.LocationId.
+-- only indirectly through Poles.ProjectId -> Poles.VendorPoleId ->
+-- PoleTelemetry.VendorPoleId.
 --
 -- INT, matching PoleTelemetry.LeadsunProjectId's own type -- if it ever
 -- turns out Airtable's own value doesn't fit (e.g. arrives as a

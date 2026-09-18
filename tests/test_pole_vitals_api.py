@@ -97,8 +97,8 @@ class TestFetchSqlStructure:
         assert "FROM PoleVitals" in sql
         assert "WHERE PeriodType = ?" in sql
 
-    def test_no_group_by_location_id_no_aggregation_cte(self):
-        """Last48Hours is structurally 0-or-1 rows per LocationId, so
+    def test_no_group_by_pole_id_no_aggregation_cte(self):
+        """Last48Hours is structurally 0-or-1 rows per PoleId, so
         RecentPoleStats here is a plain SELECT, not a GROUP BY
         aggregation the way the old Hour-window design needed."""
         sql = m._FETCH_SQL_TEMPLATE
@@ -148,7 +148,7 @@ class TestFetchSqlStructure:
 
     def test_left_joins_poles_to_recent_pole_stats(self):
         sql = m._FETCH_SQL_TEMPLATE
-        assert "COALESCE(p.LocationId, p.ProvisionedPoleId) = rps.LocationId" in sql
+        assert "COALESCE(p.VendorPoleId, p.ProvisionedPoleId) = rps.PoleId" in sql
 
     def test_left_joins_projects_and_project_agg_for_phantom_rows(self):
         sql = m._FETCH_SQL_TEMPLATE
@@ -173,7 +173,7 @@ class TestPoleDetailsSqlStructure:
         """Last48Hours is a single row per pole -- no aggregation CTE
         needed at all, unlike the old Hour-window design."""
         sql = m._POLE_DETAILS_SQL_TEMPLATE
-        assert "COALESCE(p.LocationId, p.ProvisionedPoleId) = rps.LocationId AND rps.PeriodType = ?" in sql
+        assert "COALESCE(p.VendorPoleId, p.ProvisionedPoleId) = rps.PoleId AND rps.PeriodType = ?" in sql
         assert "RecentPoleStats" not in sql
 
     def test_all_five_fault_flags_present(self):
@@ -272,9 +272,9 @@ class TestPoleDetailsIsOpenIssueFaultIndependence:
         assert "PoleOpenIssues" in sql
 
     def test_uses_exists_check_against_poles_own_id(self):
-        """PoleOpenIssues.PoleId matches Poles.Id, not LocationId --
+        """PoleOpenIssues.PoleId matches Poles.Id, not PoleId --
         same join key pole_telemetry_loader.py's own
-        _fetch_location_ids_with_open_issues() uses."""
+        _fetch_pole_ids_with_open_issues() uses."""
         sql = m._POLE_DETAILS_SQL_TEMPLATE
         assert "EXISTS (" in sql
         assert "SELECT 1 FROM PoleOpenIssues poi WHERE poi.PoleId = p.Id" in sql
@@ -355,7 +355,7 @@ class TestPoleRowToDict:
         project_id="proj1",
         pole_id="pole1",
         pole_number="PN-001",
-        location_id="LOC-001",
+        vendor_pole_id="LOC-001",
         install_date="2025-01-01",
         lat=28.0,
         long_=-82.0,
@@ -389,7 +389,7 @@ class TestPoleRowToDict:
         customer_id="cust1",
     ):
         return (
-            project_id, pole_id, pole_number, location_id, install_date, lat, long_,
+            project_id, pole_id, pole_number, vendor_pole_id, install_date, lat, long_,
             active,
             last_update, controller_code, group_id, product_id, user_name,
             battery_voltage_1, battery_voltage_2,

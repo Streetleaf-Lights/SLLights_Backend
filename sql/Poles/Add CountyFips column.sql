@@ -1,6 +1,6 @@
 -- Adds Poles.CountyFips -- sourced from Airtable's "CountyFips" field
 -- (distinct from "Location ID", the pole's own identifier, which
--- already maps to Poles.LocationId). See shared/poles_loader.py's own
+-- already maps to Poles.VendorPoleId). See shared/poles_loader.py's own
 -- comments on AIRTABLE_POLES_FIELDS and _clean_county_fips() for the
 -- full reasoning.
 --

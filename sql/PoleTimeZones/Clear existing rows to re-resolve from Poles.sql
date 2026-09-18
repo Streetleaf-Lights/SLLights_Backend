@@ -9,7 +9,7 @@
 --
 -- Without this, existing rows would silently keep whatever timezone was
 -- resolved from the old (potentially bad) PoleTelemetry coordinates
--- forever -- load_pole_timezones() only ever resolves LocationIds NOT
+-- forever -- load_pole_timezones() only ever resolves VendorPoleIds NOT
 -- YET in PoleTimeZones, so simply changing the loader's source query
 -- has no effect on rows that already exist.
 --
@@ -22,7 +22,7 @@
 -- After this runs, the next loadLeadsunData cycle (or a manual trigger)
 -- will naturally re-resolve every pole's timezone from Poles.Lat/Long --
 -- no separate backfill script needed, since that's exactly what
--- load_pole_timezones() already does for any LocationId it doesn't
+-- load_pole_timezones() already does for any VendorPoleId it doesn't
 -- currently have a row for.
 
 DELETE FROM PoleTimeZones;

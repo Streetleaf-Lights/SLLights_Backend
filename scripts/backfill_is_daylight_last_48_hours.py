@@ -82,7 +82,7 @@ _RETRY_BACKOFF_SECONDS = 10
 _COUNT_REMAINING_SQL = """
 SELECT COUNT(*)
 FROM PoleTelemetry t
-JOIN PoleTimeZones ptz ON t.LocationId = ptz.LocationId
+JOIN PoleTimeZones ptz ON t.PoleId = ptz.VendorPoleId
 WHERE (t.IsDaylight IS NULL OR t.IsDaylightForLedFault IS NULL)
   AND ptz.WindowsTimeZone IS NOT NULL
   AND t.LastUpload >= ?

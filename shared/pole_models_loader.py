@@ -48,12 +48,6 @@ def _capitalize_key(key: str) -> str:
 _NUMERIC_STRING_FIELDS = {
     "SunboardPower",
     "LightPower",
-    "Battery",
-    "SystemVoltage",
-    "BatteryVoltage",
-    "BatteryCapacity1",
-    "BatteryCapacity2",
-    "SolarBoardVoltage",
 }
 
 
@@ -96,19 +90,6 @@ _ALL_COLUMNS = [
     "ModelName",
     "SunboardPower",
     "LightPower",
-    "Battery",
-    "SystemVoltage",
-    "CommType",
-    "LightDisType",
-    "IconUrl",
-    "LampsUsing",
-    "BatteryVoltage",
-    "IsAc",
-    "IsDcOut",
-    "ModelSeries",
-    "BatteryCapacity1",
-    "BatteryCapacity2",
-    "SolarBoardVoltage",
     "ExtraFieldsJson",
 ]
 
@@ -207,19 +188,6 @@ CREATE TABLE #PoleModelsStaging (
     ModelName         NVARCHAR(100) NULL,
     SunboardPower     FLOAT         NULL,
     LightPower        FLOAT         NULL,
-    Battery           FLOAT         NULL,
-    SystemVoltage     FLOAT         NULL,
-    CommType          NVARCHAR(50)  NULL,
-    LightDisType      NVARCHAR(50)  NULL,
-    IconUrl           NVARCHAR(500) NULL,
-    LampsUsing        VARCHAR(20)   NULL,
-    BatteryVoltage    FLOAT         NULL,
-    IsAc              BIT           NULL,
-    IsDcOut           BIT           NULL,
-    ModelSeries       NVARCHAR(100) NULL,
-    BatteryCapacity1  FLOAT         NULL,
-    BatteryCapacity2  FLOAT         NULL,
-    SolarBoardVoltage FLOAT         NULL,
     ExtraFieldsJson   NVARCHAR(MAX) NULL
 );
 """

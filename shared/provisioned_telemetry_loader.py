@@ -36,13 +36,13 @@ Real, confirmed message shape (one event):
     }
 
 Mapping, per explicit instruction:
-    PoleID            -> LocationId (also the join key against
+    PoleID            -> PoleId (also the join key against
                          Poles.ProvisionedPoleId, for the Lat/Long
                          update below -- NOT looked up into that pole's
-                         own separate LocationId first; PoleID itself
-                         becomes PoleTelemetry.LocationId directly, the
+                         own separate PoleId first; PoleID itself
+                         becomes PoleTelemetry.PoleId directly, the
                          same way Leadsun's own "productName" becomes
-                         LocationId directly for its own rows)
+                         PoleId directly for its own rows)
     Timestamp         -> LastUpload, converted from Unix epoch seconds
                          to a UTC DATETIMEOFFSET string (same
                          to_dto_string()-based, UTC-offset convention
@@ -107,7 +107,7 @@ battery-full detection matters for these poles.
 
 IsOpenIssueFault is computed via a PoleOpenIssues join through
 Poles.ProvisionedPoleId (same pattern as load_leadsun_pole_telemetry()
-uses via Poles.LocationId) -- fetched once per invocation and checked
+uses via Poles.PoleId) -- fetched once per invocation and checked
 via set membership when building each row.
 """
 
@@ -224,7 +224,7 @@ def _map_event_to_telemetry_row(event: dict) -> dict:
     pole_telemetry_loader._map_lamp_record()'s own contract), plus two
     extra keys this function's own caller needs afterward and pops back
     out before building the final row tuple: "PoleID" (the raw,
-    unmapped join key, kept alongside "LocationId" even though they're
+    unmapped join key, kept alongside "PoleId" even though they're
     currently the same value, so callers never have to assume that
     equivalence holds) and "_Latitude"/"_Longitude" (the SAME values
     already placed into this dict's own "Latitude"/"Longitude" keys,
@@ -242,7 +242,7 @@ def _map_event_to_telemetry_row(event: dict) -> dict:
     timestamp = event.get("Timestamp")
 
     return {
-        "LocationId": event.get("PoleID"),
+        "PoleId": event.get("PoleID"),
         "LastUpload": _epoch_seconds_to_dto_string(timestamp) if timestamp is not None else None,
         "IsOnline": True,  # assumed, per explicit request -- the event
                            # itself carries no online/offline signal of
@@ -279,8 +279,8 @@ def _fetch_provisioned_pole_ids_with_open_issues(cursor) -> set:
     """
     Every ProvisionedPoleId whose pole has at least one row in
     PoleOpenIssues -- mirrors pole_telemetry_loader's own
-    _fetch_location_ids_with_open_issues() but joins via ProvisionedPoleId
-    rather than LocationId, since that's the identifier provisioned poles
+    _fetch_pole_ids_with_open_issues() but joins via ProvisionedPoleId
+    rather than PoleId, since that's the identifier provisioned poles
     use. Fetched once per process_provisioned_telemetry_events() invocation
     (cheap -- PoleOpenIssues only holds currently-open issues) and checked
     via set membership when building each row.
@@ -458,7 +458,7 @@ def process_provisioned_telemetry_events(events: list) -> None:
 
         for event in events:
             mapped = _map_event_to_telemetry_row(event)
-            if mapped["LocationId"] is None or mapped["LastUpload"] is None:
+            if mapped["PoleId"] is None or mapped["LastUpload"] is None:
                 if _is_azure_monitor_diagnostics_envelope(event):
                     # Known, harmless noise -- see
                     # _is_azure_monitor_diagnostics_envelope()'s own
@@ -477,7 +477,7 @@ def process_provisioned_telemetry_events(events: list) -> None:
                 total_errors += 1
                 logging.error(
                     "loadProvisionedPoleTelemetry: skipping event -- would produce a "
-                    "NULL LocationId and/or LastUpload (missing/unusable PoleID or "
+                    "NULL PoleId and/or LastUpload (missing/unusable PoleID or "
                     "Timestamp). Raw event: %s",
                     event,
                 )
@@ -502,7 +502,7 @@ def process_provisioned_telemetry_events(events: list) -> None:
                 logging.info(
                     "loadProvisionedPoleTelemetry: upserted %d row(s): %s",
                     len(batch),
-                    [(row[0], row[1]) for row in batch],  # (LocationId, LastUpload) pairs
+                    [(row[0], row[1]) for row in batch],  # (PoleId, LastUpload) pairs
                 )
             except Exception as batch_error:
                 logging.warning(
@@ -517,7 +517,7 @@ def process_provisioned_telemetry_events(events: list) -> None:
                         cursor.execute(_ROW_UPSERT_SQL, row)
                         total_success += 1
                         logging.info(
-                            "loadProvisionedPoleTelemetry: upserted row: LocationId=%s, "
+                            "loadProvisionedPoleTelemetry: upserted row: PoleId=%s, "
                             "LastUpload=%s",
                             row[0],
                             row[1],
@@ -526,7 +526,7 @@ def process_provisioned_telemetry_events(events: list) -> None:
                         total_errors += 1
                         logging.error(
                             "loadProvisionedPoleTelemetry: failed to upsert %s: %s",
-                            row[0],  # LocationId is the first positional column
+                            row[0],  # PoleId is the first positional column
                             row_error,
                         )
 
@@ -578,7 +578,7 @@ def process_provisioned_telemetry_events(events: list) -> None:
             is_day, is_day_led, is_day_panel = _compute_daylight_flags(last_upload, lat, lon)
             if is_day is None:
                 continue  # compute error already logged inside _compute_daylight_flags
-            daylight_updates.append((is_day, is_day_led, is_day_panel, mapped["LocationId"], last_upload_str))
+            daylight_updates.append((is_day, is_day_led, is_day_panel, mapped["PoleId"], last_upload_str))
 
         if daylight_updates:
             try:
@@ -599,7 +599,7 @@ def process_provisioned_telemetry_events(events: list) -> None:
                     except Exception as row_err:
                         logging.warning(
                             "loadProvisionedPoleTelemetry: failed to set daylight flags "
-                            "for LocationId=%s LastUpload=%s: %s -- will be backfilled "
+                            "for PoleId=%s LastUpload=%s: %s -- will be backfilled "
                             "by loadProvisionedPoleDaylightFlags.",
                             update_args[3], update_args[4], row_err,
                         )

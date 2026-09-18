@@ -7,13 +7,13 @@
 -- same AT TIME ZONE conversion used throughout pole_vitals_loader.py/
 -- pole_vitals_api.py, not the raw UTC value PoleTelemetry itself stores.
 --
--- PoleTimeZones has its own LocationId/Longitude/Latitude/Source/
+-- PoleTimeZones has its own PoleId/Longitude/Latitude/Source/
 -- SP_ExecId columns too, so every reference to any of those five names
 -- is qualified with "PoleTelemetry." below, even where only one table
 -- was in scope before this join was added -- otherwise SQL Server can't
 -- tell which table's column you mean ("Ambiguous column name").
 SELECT TOP 1000
-    t.LocationId,
+    t.PoleId,
     p.PoleNumber,
     LastUpload AT TIME ZONE ISNULL(ptz.WindowsTimeZone, 'Eastern Standard Time') AS LastUpload,
     IsOnline,
@@ -65,11 +65,11 @@ SELECT TOP 1000
     ControlModelName,
     ExtraFieldsJson
 FROM PoleTelemetry t
-LEFT JOIN Poles p ON t.LocationId = p.LocationId
-LEFT JOIN PoleTimeZones ptz ON t.LocationId = ptz.LocationId
+LEFT JOIN Poles p ON t.PoleId = p.VendorPoleId
+LEFT JOIN PoleTimeZones ptz ON t.PoleId = ptz.VendorPoleId
 WHERE 1 = 1
--- AND t.LocationId = 'DRH-Orl'
--- AND t.LocationId LIKE '%TESTSL1-100%'
+-- AND t.PoleId = 'DRH-Orl'
+-- AND t.PoleId LIKE '%TESTSL1-100%'
 -- AND p.PoleNumber LIKE '%HIL-4509%'
 -- AND t.SP_ExecId = 442
 -- AND t.IsDaylight IS NULL
@@ -88,7 +88,7 @@ ORDER BY t.LastUpload DESC;
 --     LeadsunProjectId AS ProjectId,
 --     MAX(LeadsunProjectName) AS ProjectName,
 --     GroupId,
---     LocationId,                        -- Leadsun's raw "productName" ends up here, not a separate ProductName column
+--     PoleId,                        -- Leadsun's raw "productName" ends up here, not a separate ProductName column
 --     MAX(UserName) AS UserName,
 --     MAX(GroupName) AS GroupName,
 --     MAX(GatewayCode) AS GatewayCode,
@@ -97,8 +97,8 @@ ORDER BY t.LastUpload DESC;
 --     COUNT(*) AS ReadingCount,
 --     MAX(LastUpload) AS MostRecentReading
 -- FROM PoleTelemetry
--- GROUP BY LeadsunProjectId, GroupId, LocationId
--- ORDER BY ProjectName, GroupId, LocationId;
+-- GROUP BY LeadsunProjectId, GroupId, PoleId
+-- ORDER BY ProjectName, GroupId, PoleId;
 
 -- WITH TelemetryWithFaultFlags AS (
 --     SELECT
@@ -127,10 +127,10 @@ ORDER BY t.LastUpload DESC;
 --         (t.BatteryVoltage1 + t.BatteryVoltage2) / 2.0 AS AvgBatteryVoltage,
 --         pm.BatteryChargingMin
 --     FROM PoleTelemetry t
---     LEFT JOIN Poles p ON t.LocationId = p.LocationId
+--     LEFT JOIN Poles p ON t.PoleId = p.VendorPoleId
 --     LEFT JOIN PoleModels pm ON t.ModelId = pm.ModelId
---     LEFT JOIN PoleTimeZones ptz ON t.LocationId = ptz.LocationId
---     WHERE t.LocationId = '12057-1335'
+--     LEFT JOIN PoleTimeZones ptz ON t.PoleId = ptz.VendorPoleId
+--     WHERE t.PoleId = '12057-1335'
 --         AND t.LastUpload >= DATEADD(HOUR, -48, SYSDATETIMEOFFSET())
 --       AND t.LastUpload <> '9999-12-31 23:59:59.999 +00:00'
 -- )
@@ -148,7 +148,7 @@ ORDER BY t.LastUpload DESC;
 -- WITH TelemetryWithFaultFlags AS (
 --     SELECT
 --         p.PoleNumber,
---         t.LocationId,
+--         t.PoleId,
 --         t.LastUpload AT TIME ZONE ISNULL(ptz.WindowsTimeZone, 'Eastern Standard Time') AS LastUpload,
 --         t.IsOnline,
 --         t.IsDaylight,
@@ -176,14 +176,14 @@ ORDER BY t.LastUpload DESC;
 --         t.BatteryElecCurrent1,
 --         t.BatteryElecCurrent2
 --     FROM PoleTelemetry t
---     LEFT JOIN Poles p ON t.LocationId = p.LocationId
+--     LEFT JOIN Poles p ON t.PoleId = p.VendorPoleId
 --     LEFT JOIN PoleModels pm ON t.ModelId = pm.ModelId
---     LEFT JOIN PoleTimeZones ptz ON t.LocationId = ptz.LocationId
---     WHERE t.LocationId IN (
---         SELECT p.LocationId
+--     LEFT JOIN PoleTimeZones ptz ON t.PoleId = ptz.VendorPoleId
+--     WHERE t.PoleId IN (
+--         SELECT p.VendorPoleId
 --         FROM Poles p
 --         WHERE p.ProjectId = 'rec2i59akR8bVf93v'
---           AND p.LocationId IS NOT NULL
+--           AND p.VendorPoleId IS NOT NULL
 --     )
 --     -- AND t.LastUpload >= DATEADD(HOUR, -48, SYSDATETIMEOFFSET())
 --     AND t.LastUpload <> '9999-12-31 23:59:59.999 +00:00'
@@ -197,42 +197,42 @@ ORDER BY t.LastUpload DESC;
 --     END AS FaultType
 -- FROM TelemetryWithFaultFlags
 -- -- WHERE IsLedFaultFlag = 1 OR IsPanelFaultFlag = 1
--- ORDER BY LocationId, LastUpload DESC;
+-- ORDER BY PoleId, LastUpload DESC;
 
 -- SELECT
 --     COUNT(*) AS TotalRowsLast48Hours,
 --     SUM(CASE WHEN t.IsDaylightForLedFault IS NOT NULL THEN 1 ELSE 0 END) AS FlaggedCount,
 --     SUM(CASE WHEN t.IsDaylightForLedFault IS NULL AND ptz.WindowsTimeZone IS NOT NULL THEN 1 ELSE 0 END) AS StillPendingCount,
---     SUM(CASE WHEN t.IsDaylightForLedFault IS NULL AND (ptz.LocationId IS NULL OR ptz.WindowsTimeZone IS NULL) THEN 1 ELSE 0 END) AS UnresolvableTimezoneCount,
+--     SUM(CASE WHEN t.IsDaylightForLedFault IS NULL AND (ptz.VendorPoleId IS NULL OR ptz.WindowsTimeZone IS NULL) THEN 1 ELSE 0 END) AS UnresolvableTimezoneCount,
 --     SUM(CASE WHEN t.IsDaylightForPanelFault IS NOT NULL THEN 1 ELSE 0 END) AS FlaggedCount2,
 --     SUM(CASE WHEN t.IsDaylightForPanelFault IS NULL AND ptz.WindowsTimeZone IS NOT NULL THEN 1 ELSE 0 END) AS StillPendingCount2,
---     SUM(CASE WHEN t.IsDaylightForPanelFault IS NULL AND (ptz.LocationId IS NULL OR ptz.WindowsTimeZone IS NULL) THEN 1 ELSE 0 END) AS UnresolvableTimezoneCount2
+--     SUM(CASE WHEN t.IsDaylightForPanelFault IS NULL AND (ptz.VendorPoleId IS NULL OR ptz.WindowsTimeZone IS NULL) THEN 1 ELSE 0 END) AS UnresolvableTimezoneCount2
 -- FROM PoleTelemetry t
--- LEFT JOIN PoleTimeZones ptz ON t.LocationId = ptz.LocationId
+-- LEFT JOIN PoleTimeZones ptz ON t.PoleId = ptz.VendorPoleId
 -- WHERE t.LastUpload >= DATEADD(HOUR, -48, SYSDATETIMEOFFSET())
 --   AND t.LastUpload <> '9999-12-31 23:59:59.999 +00:00';
 
 -- SELECT DISTINCT
---     t.LocationId,
+--     t.PoleId,
 --     t.UserName,
 --     -- t.LastUpload AT TIME ZONE ISNULL(ptz.WindowsTimeZone, 'Eastern Standard Time') AS LastUpload,
 --     p.PoleNumber,
 --     p.CountyFips,
 --     ptz.WindowsTimeZone AS ExistingWindowsTimeZone,
 --     CASE
---         WHEN p.LocationId IS NULL THEN 'No Poles record found for this LocationId at all'
+--         WHEN p.VendorPoleId IS NULL THEN 'No Poles record found for this PoleId at all'
 --         WHEN p.CountyFips IS NULL THEN 'Poles record exists but CountyFips is missing'
---         WHEN ptz.LocationId IS NULL THEN 'CountyFips present but not yet resolved (doesn''t match CountyTimeZones, or loadPoleTimeZones hasn''t run for it yet)'
+--         WHEN ptz.VendorPoleId IS NULL THEN 'CountyFips present but not yet resolved (doesn''t match CountyTimeZones, or loadPoleTimeZones hasn''t run for it yet)'
 --         ELSE 'PoleTimeZones row exists but WindowsTimeZone is NULL (likely a leftover from the old Lat/Long-based system, before the county switch)'
 --     END AS Reason
 -- FROM PoleTelemetry t
--- LEFT JOIN Poles p ON t.LocationId = p.LocationId
--- LEFT JOIN PoleTimeZones ptz ON t.LocationId = ptz.LocationId
+-- LEFT JOIN Poles p ON t.PoleId = p.VendorPoleId
+-- LEFT JOIN PoleTimeZones ptz ON t.PoleId = ptz.VendorPoleId
 -- WHERE t.IsDaylight IS NULL
---   AND (ptz.LocationId IS NULL OR ptz.WindowsTimeZone IS NULL)
+--   AND (ptz.VendorPoleId IS NULL OR ptz.WindowsTimeZone IS NULL)
 --   AND t.LastUpload >= DATEADD(HOUR, -48, SYSDATETIMEOFFSET())
 --   AND t.LastUpload <> '9999-12-31 23:59:59.999 +00:00'
--- ORDER BY Reason, t.LocationId;--, LastUpload DESC;
+-- ORDER BY Reason, t.PoleId;--, LastUpload DESC;
 
 -- UPDATE PoleTelemetry
 -- SET IsDaylightForLedFault = NULL
@@ -244,4 +244,4 @@ ORDER BY t.LastUpload DESC;
 -- WHERE LastUpload >= DATEADD(HOUR, -48, SYSDATETIMEOFFSET())
 --   AND LastUpload <> '9999-12-31 23:59:59.999 +00:00';
 
--- DELETE FROM PoleTelemetry WHERE LocationId = 'JAX-DEMO';
+-- DELETE FROM PoleTelemetry WHERE PoleId = 'JAX-DEMO';

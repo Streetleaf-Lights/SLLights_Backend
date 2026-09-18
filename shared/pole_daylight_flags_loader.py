@@ -59,7 +59,7 @@ _PANEL_FAULT_SUNRISE_WARMUP_PERIOD = timedelta(hours=1)
 # the window where zero panel output is EXPECTED to produce one.
 _PANEL_FAULT_SUNSET_WINDDOWN_PERIOD = timedelta(hours=1)
 
-# INNER JOIN (not LEFT): a row whose LocationId has no PoleTimeZones
+# INNER JOIN (not LEFT): a row whose PoleId has no PoleTimeZones
 # entry yet can't have its daylight status computed at all -- it's left
 # for a later cycle once load_leadsun_pole_timezones() has caught up, matching
 # the load-order dependency (TimeZones runs before this loader).
@@ -110,9 +110,9 @@ _PANEL_FAULT_SUNSET_WINDDOWN_PERIOD = timedelta(hours=1)
 # value out of range" failure for this exact sentinel value once the
 # grace period's "+1 hour" (forward-looking) arithmetic was introduced.
 _FIND_UNFLAGGED_SQL = """
-SELECT TOP (?) t.LocationId, t.LastUpload, ptz.Latitude, ptz.Longitude
+SELECT TOP (?) t.PoleId, t.LastUpload, ptz.Latitude, ptz.Longitude
 FROM PoleTelemetry t
-JOIN PoleTimeZones ptz ON t.LocationId = ptz.LocationId
+JOIN PoleTimeZones ptz ON t.PoleId = ptz.VendorPoleId
 WHERE (t.IsDaylight IS NULL OR t.IsDaylightForLedFault IS NULL OR t.IsDaylightForPanelFault IS NULL)
   AND ptz.WindowsTimeZone IS NOT NULL
   AND t.LastUpload <> '9999-12-31 23:59:59.999 +00:00'
@@ -159,7 +159,7 @@ ORDER BY t.LastUpload DESC
 _UPDATE_IS_DAYLIGHT_SQL = """
 UPDATE PoleTelemetry
 SET IsDaylight = ?, IsDaylightForLedFault = ?, IsDaylightForPanelFault = ?
-WHERE LocationId = ? AND LastUpload = ?
+WHERE PoleId = ? AND LastUpload = ?
 """
 
 
@@ -167,7 +167,7 @@ def load_leadsun_pole_daylight_flags() -> None:
     """
     Computes and caches IsDaylight, IsDaylightForLedFault, AND
     IsDaylightForPanelFault on PoleTelemetry rows missing any one of
-    them, using PoleTimeZones' Latitude/Longitude for each LocationId --
+    them, using PoleTimeZones' Latitude/Longitude for each PoleId --
     deliberately NOT PoleTelemetry's own Longitude/Latitude columns --
     and each row's own LastUpload timestamp.
 
@@ -239,7 +239,7 @@ def load_leadsun_pole_daylight_flags() -> None:
         # silent stretch here is never ambiguous with one again.
         updates = []
         total_unflagged = len(unflagged)
-        for index, (location_id, last_upload, latitude, longitude) in enumerate(
+        for index, (pole_id, last_upload, latitude, longitude) in enumerate(
             unflagged, start=1
         ):
             if index % _PROGRESS_LOG_INTERVAL == 0:
@@ -320,7 +320,7 @@ def load_leadsun_pole_daylight_flags() -> None:
                         daylight,
                         daylight_for_led_fault,
                         daylight_for_panel_fault,
-                        location_id,
+                        pole_id,
                         _to_dto_string(last_upload),
                     )
                 )
@@ -328,7 +328,7 @@ def load_leadsun_pole_daylight_flags() -> None:
                 total_errors += 1
                 logging.error(
                     "loadPoleDaylightFlags: failed to compute IsDaylight for %s @ %s: %s",
-                    location_id,
+                    pole_id,
                     last_upload,
                     row_error,
                 )
@@ -341,8 +341,8 @@ def load_leadsun_pole_daylight_flags() -> None:
         # despite the real performance cost of that choice (this loader
         # can process tens of thousands of rows per run). fast_executemany
         # infers a fixed buffer size for variable-length string parameters
-        # from the batch -- LocationId varies in length across poles --
-        # and depending on pyodbc version, a row whose LocationId doesn't
+        # from the batch -- PoleId varies in length across poles --
+        # and depending on pyodbc version, a row whose PoleId doesn't
         # fit the inferred size can get silently mis-bound: executemany()
         # raises no exception (so this still looks like success, and
         # total_success still gets incremented), but the WHERE clause
@@ -391,7 +391,7 @@ def load_leadsun_pole_daylight_flags() -> None:
                     daylight,
                     daylight_for_led_fault,
                     daylight_for_panel_fault,
-                    location_id,
+                    pole_id,
                     last_upload,
                 ) in updates:
                     try:
@@ -400,7 +400,7 @@ def load_leadsun_pole_daylight_flags() -> None:
                             daylight,
                             daylight_for_led_fault,
                             daylight_for_panel_fault,
-                            location_id,
+                            pole_id,
                             last_upload,
                         )
                         total_success += 1
@@ -408,7 +408,7 @@ def load_leadsun_pole_daylight_flags() -> None:
                         total_errors += 1
                         logging.error(
                             "loadPoleDaylightFlags: failed to store IsDaylight for %s @ %s: %s",
-                            location_id,
+                            pole_id,
                             last_upload,
                             row_error,
                         )
@@ -495,13 +495,13 @@ def load_leadsun_pole_daylight_flags() -> None:
 # ---------------------------------------------------------------------------
 #
 # Mirrors _FIND_UNFLAGGED_SQL above but joins PoleTimeZones on
-# ProvisionedPoleId instead of LocationId. Provisioned telemetry is stored
-# in PoleTelemetry with LocationId = Poles.ProvisionedPoleId (the device
+# ProvisionedPoleId instead of PoleId. Provisioned telemetry is stored
+# in PoleTelemetry with PoleId = Poles.ProvisionedPoleId (the device
 # UID from the Event Hub message -- see provisioned_telemetry_loader.py's
 # own comments). PoleTimeZones rows for provisioned poles are keyed on
 # ProvisionedPoleId (populated by load_provisioned_pole_timezones()), not
-# LocationId (which is NULL for those rows), so the join must cross from
-# PoleTelemetry.LocationId to PoleTimeZones.ProvisionedPoleId.
+# PoleId (which is NULL for those rows), so the join must cross from
+# PoleTelemetry.PoleId to PoleTimeZones.ProvisionedPoleId.
 #
 # All other logic (INNER JOIN so unresolved poles wait, WindowsTimeZone IS
 # NOT NULL guard, sentinel-row exclusion, newest-first ORDER BY, same
@@ -510,9 +510,9 @@ def load_leadsun_pole_daylight_flags() -> None:
 # characteristics, same fault-detection logic, same load-order dependency
 # (load_provisioned_pole_timezones() must have run first).
 _FIND_PROVISIONED_UNFLAGGED_SQL = """
-SELECT TOP (?) t.LocationId, t.LastUpload, ptz.Latitude, ptz.Longitude
+SELECT TOP (?) t.PoleId, t.LastUpload, ptz.Latitude, ptz.Longitude
 FROM PoleTelemetry t
-JOIN PoleTimeZones ptz ON t.LocationId = ptz.ProvisionedPoleId
+JOIN PoleTimeZones ptz ON t.PoleId = ptz.ProvisionedPoleId
 WHERE (t.IsDaylight IS NULL OR t.IsDaylightForLedFault IS NULL OR t.IsDaylightForPanelFault IS NULL)
   AND ptz.WindowsTimeZone IS NOT NULL
   AND t.LastUpload <> '9999-12-31 23:59:59.999 +00:00'
@@ -528,8 +528,8 @@ def load_provisioned_pole_daylight_flags() -> None:
 
     Identical to load_leadsun_pole_daylight_flags() in all respects except
     the PoleTimeZones join: provisioned telemetry rows store ProvisionedPoleId
-    as their LocationId, so the join crosses PoleTelemetry.LocationId to
-    PoleTimeZones.ProvisionedPoleId rather than PoleTimeZones.LocationId.
+    as their PoleId, so the join crosses PoleTelemetry.PoleId to
+    PoleTimeZones.ProvisionedPoleId rather than PoleTimeZones.PoleId.
 
     Must run after load_provisioned_pole_timezones() -- same load-order
     dependency as the Leadsun pair.
@@ -566,7 +566,7 @@ def load_provisioned_pole_daylight_flags() -> None:
 
             batch_count += 1
             updates = []
-            for i, (location_id, last_upload, latitude, longitude) in enumerate(rows):
+            for i, (pole_id, last_upload, latitude, longitude) in enumerate(rows):
                 if i > 0 and i % _PROGRESS_LOG_INTERVAL == 0:
                     logging.info(
                         "loadProvisionedPoleDaylightFlags: computed %d/%d rows in batch %d.",
@@ -584,13 +584,13 @@ def load_provisioned_pole_daylight_flags() -> None:
                         and is_daylight(last_upload - _PANEL_FAULT_SUNRISE_WARMUP_PERIOD, latitude, longitude)
                         and is_daylight(last_upload + _PANEL_FAULT_SUNSET_WINDDOWN_PERIOD, latitude, longitude)
                     )
-                    updates.append((is_day, is_day_led, is_day_panel, location_id, last_upload))
+                    updates.append((is_day, is_day_led, is_day_panel, pole_id, last_upload))
                 except Exception as row_ex:
                     total_errors += 1
                     logging.warning(
                         "loadProvisionedPoleDaylightFlags: failed to compute IsDaylight "
                         "for %s @ %s: %s",
-                        location_id, last_upload, row_ex,
+                        pole_id, last_upload, row_ex,
                     )
 
             if not updates:
@@ -610,11 +610,11 @@ def load_provisioned_pole_daylight_flags() -> None:
                         "falling back to row-by-row.",
                         len(chunk), chunk_ex,
                     )
-                    for is_day, is_day_led, is_day_panel, location_id, last_upload in chunk:
+                    for is_day, is_day_led, is_day_panel, pole_id, last_upload in chunk:
                         try:
                             cursor.execute(
                                 _UPDATE_IS_DAYLIGHT_SQL,
-                                is_day, is_day_led, is_day_panel, location_id, last_upload,
+                                is_day, is_day_led, is_day_panel, pole_id, last_upload,
                             )
                             conn.commit()
                             total_success += 1
@@ -624,7 +624,7 @@ def load_provisioned_pole_daylight_flags() -> None:
                             logging.warning(
                                 "loadProvisionedPoleDaylightFlags: failed to store "
                                 "IsDaylight for %s @ %s: %s",
-                                location_id, last_upload, row_ex,
+                                pole_id, last_upload, row_ex,
                             )
 
             cursor.execute(

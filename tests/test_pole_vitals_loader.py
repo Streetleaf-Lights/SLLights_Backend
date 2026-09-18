@@ -219,7 +219,7 @@ class TestMergeSqlStructureCommon:
         part of its identity, unlike Last48Hours (see
         TestLast48HoursMergeSqlStructure for why that one differs)."""
         sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE["Hour"]
-        assert "ON target.LocationId = source.LocationId" in sql
+        assert "ON target.PoleId = source.PoleId" in sql
         assert "AND target.PeriodType = source.PeriodType" in sql
         assert "AND target.PeriodStart = source.PeriodStart" in sql
 
@@ -248,7 +248,7 @@ class TestLast48HoursMergeSqlStructure:
         only ever INSERT, never UPDATE the same row -- violating the
         "only 1 row per pole" guarantee."""
         sql = pole_vitals_loader._LAST_48_HOURS_MERGE_SQL
-        assert "ON target.LocationId = source.LocationId" in sql
+        assert "ON target.PoleId = source.PoleId" in sql
         assert "AND target.PeriodType = source.PeriodType" in sql
         assert "PeriodStart = source.PeriodStart" not in sql
 
@@ -299,14 +299,14 @@ class TestLast48HoursMergeSqlStructure:
 
     def test_no_bucketed_cte_groups_directly_from_telemetry(self):
         """Unlike Hour/Day, there's only ever one 'bucket' per
-        LocationId (the whole window), so there's no separate Bucketed
+        PoleId (the whole window), so there's no separate Bucketed
         CTE -- TelemetryWithVitals feeds Aggregated directly."""
         sql = pole_vitals_loader._LAST_48_HOURS_MERGE_SQL
         assert "Bucketed AS (" not in sql
 
-    def test_groups_by_location_id_alone(self):
+    def test_groups_by_pole_id_alone(self):
         sql = pole_vitals_loader._LAST_48_HOURS_MERGE_SQL
-        assert "GROUP BY LocationId" in sql
+        assert "GROUP BY PoleId" in sql
 
 
 # --------------------------------------------------------------------------
@@ -582,7 +582,7 @@ class TestTakeLastTelemetryForOpenIssueFault:
         """No bucket dimension to partition by -- the whole window IS
         the one bucket per pole."""
         sql = pole_vitals_loader._LAST_48_HOURS_MERGE_SQL
-        assert "PARTITION BY t.LocationId ORDER BY t.LastUpload DESC" in sql
+        assert "PARTITION BY t.PoleId ORDER BY t.LastUpload DESC" in sql
         assert "AS LatestOverall" in sql
 
     def test_hour_extracts_via_max_case_when_rn_equals_1(self):
@@ -628,7 +628,7 @@ class TestPerPoleTimeZonePropagation:
 
     def test_aggregated_cte_groups_by_time_zone_name(self):
         sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE["Hour"]
-        assert "GROUP BY LocationId, TimeZoneName" in sql
+        assert "GROUP BY PoleId, TimeZoneName" in sql
 
     def test_time_zone_name_defined_before_bucketed_cte_uses_it(self):
         sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE["Hour"]
@@ -638,7 +638,7 @@ class TestPerPoleTimeZonePropagation:
 
     def test_uses_per_pole_timezone_with_eastern_fallback(self):
         sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE["Hour"]
-        assert "LEFT JOIN PoleTimeZones ptz ON t.LocationId = ptz.LocationId" in sql
+        assert "LEFT JOIN PoleTimeZones ptz ON t.PoleId = ptz.VendorPoleId" in sql
         assert "ISNULL(ptz.WindowsTimeZone, 'Eastern Standard Time')" in sql
         assert "AT TIME ZONE TimeZoneName" in sql
 
@@ -652,7 +652,7 @@ class TestPerPoleTimeZonePropagation:
 class TestRetentionPruneSql:
     def test_ranks_by_period_start_descending_per_location(self):
         sql = pole_vitals_loader._RETENTION_PRUNE_SQL
-        assert "ROW_NUMBER() OVER (PARTITION BY LocationId ORDER BY PeriodStart DESC)" in sql
+        assert "ROW_NUMBER() OVER (PARTITION BY PoleId ORDER BY PeriodStart DESC)" in sql
 
     def test_deletes_rows_beyond_the_limit(self):
         sql = pole_vitals_loader._RETENTION_PRUNE_SQL
@@ -661,7 +661,7 @@ class TestRetentionPruneSql:
 
     def test_retention_limits_only_defined_for_hour(self):
         """Last48Hours needs no pruning -- it's structurally always
-        exactly one row per pole (matched on LocationId+PeriodType alone,
+        exactly one row per pole (matched on PoleId+PeriodType alone,
         not PeriodStart -- see _LAST_48_HOURS_MERGE_SQL)."""
         assert pole_vitals_loader._RETENTION_LIMITS == {"Hour": 720}
         assert "Last48Hours" not in pole_vitals_loader._RETENTION_LIMITS
@@ -1001,7 +1001,7 @@ class TestLast48HoursStaleRowCleanup:
         sql = pole_vitals_loader._LAST_48_HOURS_STALE_ROW_PRUNE_SQL
         assert "NOT EXISTS" in sql
         assert "FROM PoleTelemetry t" in sql
-        assert "WHERE t.LocationId = pv.LocationId" in sql
+        assert "WHERE t.PoleId = pv.PoleId" in sql
         assert "AND t.LastUpload >= ?" in sql
         assert "AND t.LastUpload <> ?" in sql
 
@@ -1343,20 +1343,20 @@ class TestBackfillLatestHourPerPoleMergeSqlStructure:
         sql = pole_vitals_loader._BACKFILL_LATEST_HOUR_PER_POLE_MERGE_SQL
         max_reading_cte = sql.split("MaxReadingPerPole AS (")[1].split("LatestBucketPerPole AS (")[0]
         assert "MAX(t.LastUpload) AS MaxLastUpload" in max_reading_cte
-        assert "GROUP BY t.LocationId" in max_reading_cte
+        assert "GROUP BY t.PoleId" in max_reading_cte
 
     def test_converts_each_poles_max_reading_to_its_own_local_time_zone(self):
         sql = pole_vitals_loader._BACKFILL_LATEST_HOUR_PER_POLE_MERGE_SQL
         bucket_cte = sql.split("LatestBucketPerPole AS (")[1].split("TelemetryWithVitals AS (")[0]
         assert "AT TIME ZONE ISNULL(ptz.WindowsTimeZone, 'Eastern Standard Time')" in bucket_cte
-        assert "LEFT JOIN PoleTimeZones ptz ON mr.LocationId = ptz.LocationId" in bucket_cte
+        assert "LEFT JOIN PoleTimeZones ptz ON mr.PoleId = ptz.VendorPoleId" in bucket_cte
 
     def test_scopes_each_poles_readings_to_its_own_bucket_range(self):
         """The per-pole equivalent of a WHERE clause -- each pole's own
         readings are filtered against ITS OWN bucket boundaries (joined
         in via LatestBucketPerPole), not a single, shared range."""
         sql = pole_vitals_loader._BACKFILL_LATEST_HOUR_PER_POLE_MERGE_SQL
-        assert "JOIN LatestBucketPerPole lb ON t.LocationId = lb.LocationId" in sql
+        assert "JOIN LatestBucketPerPole lb ON t.PoleId = lb.PoleId" in sql
         assert "CAST(t.LastUpload AT TIME ZONE lb.TimeZoneName AS DATETIME2(3)) >= lb.BucketStart" in sql
         assert (
             "CAST(t.LastUpload AT TIME ZONE lb.TimeZoneName AS DATETIME2(3)) < DATEADD(HOUR, 1, lb.BucketStart)"
@@ -1402,7 +1402,7 @@ class TestBackfillLatestHourPerPoleMergeSqlStructure:
         backfill_sql = pole_vitals_loader._BACKFILL_LATEST_HOUR_PER_POLE_MERGE_SQL
         assert "MERGE PoleVitals AS target" in backfill_sql
         assert (
-            "ON target.LocationId = source.LocationId\n"
+            "ON target.PoleId = source.PoleId\n"
             "   AND target.PeriodType = source.PeriodType\n"
             "   AND target.PeriodStart = source.PeriodStart" in backfill_sql
         )
@@ -1594,14 +1594,14 @@ class TestBackfillLast48HoursOfHourPerPoleMergeSqlStructure:
         sql = pole_vitals_loader._BACKFILL_LAST_48_HOURS_OF_HOUR_PER_POLE_MERGE_SQL
         max_reading_cte = sql.split("MaxReadingPerPole AS (")[1].split("TelemetryWithVitals AS (")[0]
         assert "MAX(t.LastUpload) AS MaxLastUpload" in max_reading_cte
-        assert "GROUP BY t.LocationId" in max_reading_cte
+        assert "GROUP BY t.PoleId" in max_reading_cte
 
     def test_scopes_each_poles_readings_to_a_48_hour_range_ending_at_its_own_max(self):
         """The defining difference from the single-bucket variant: a
         RANGE of readings (up to 48 hours' worth), not just the ones
         falling into a single hour bucket."""
         sql = pole_vitals_loader._BACKFILL_LAST_48_HOURS_OF_HOUR_PER_POLE_MERGE_SQL
-        assert "JOIN MaxReadingPerPole mr ON t.LocationId = mr.LocationId" in sql
+        assert "JOIN MaxReadingPerPole mr ON t.PoleId = mr.PoleId" in sql
         assert "AND t.LastUpload > DATEADD(HOUR, -48, mr.MaxLastUpload)" in sql
         assert "AND t.LastUpload <= mr.MaxLastUpload" in sql
 
@@ -1635,7 +1635,7 @@ class TestBackfillLast48HoursOfHourPerPoleMergeSqlStructure:
         sql = pole_vitals_loader._BACKFILL_LAST_48_HOURS_OF_HOUR_PER_POLE_MERGE_SQL
         assert "MERGE PoleVitals AS target" in sql
         assert (
-            "ON target.LocationId = source.LocationId\n"
+            "ON target.PoleId = source.PoleId\n"
             "   AND target.PeriodType = source.PeriodType\n"
             "   AND target.PeriodStart = source.PeriodStart" in sql
         )
@@ -1847,22 +1847,22 @@ class TestLast48HoursConditionalPanelAndLightAverages:
 class TestProvisionedHourMergeSql:
     def test_joins_pole_time_zones_on_provisioned_pole_id(self):
         """KEY difference from the Leadsun Hour MERGE: must join PoleTimeZones
-        on ProvisionedPoleId, not LocationId -- provisioned telemetry stores
-        ProvisionedPoleId as its LocationId, and PoleTimeZones rows for
+        on ProvisionedPoleId, not PoleId -- provisioned telemetry stores
+        ProvisionedPoleId as its PoleId, and PoleTimeZones rows for
         provisioned poles are keyed on ProvisionedPoleId."""
         sql = pole_vitals_loader._PROVISIONED_HOUR_MERGE_SQL
-        assert "t.LocationId = ptz.ProvisionedPoleId" in sql
+        assert "t.PoleId = ptz.ProvisionedPoleId" in sql
 
-    def test_does_not_join_pole_time_zones_on_location_id(self):
+    def test_does_not_join_pole_time_zones_on_pole_id(self):
         """Regression guard: must not accidentally use the Leadsun join."""
         sql = pole_vitals_loader._PROVISIONED_HOUR_MERGE_SQL
-        assert "t.LocationId = ptz.LocationId" not in sql
+        assert "t.PoleId = ptz.VendorPoleId" not in sql
 
     def test_still_left_joins_pole_time_zones(self):
         """LEFT JOIN so poles with no resolved timezone still get processed,
         falling back to Eastern -- same as the Leadsun path."""
         sql = pole_vitals_loader._PROVISIONED_HOUR_MERGE_SQL
-        assert "LEFT JOIN PoleTimeZones ptz ON t.LocationId = ptz.ProvisionedPoleId" in sql
+        assert "LEFT JOIN PoleTimeZones ptz ON t.PoleId = ptz.ProvisionedPoleId" in sql
 
     def test_falls_back_to_eastern_when_no_timezone(self):
         sql = pole_vitals_loader._PROVISIONED_HOUR_MERGE_SQL
@@ -2028,7 +2028,7 @@ class TestLoadProvisionedPoleVitals:
 
     def test_does_not_execute_leadsun_hour_merge(self, mocker):
         """Regression guard: must not accidentally run the Leadsun Hour MERGE,
-        which would look for PoleTimeZones rows by LocationId and find nothing
+        which would look for PoleTimeZones rows by PoleId and find nothing
         for provisioned poles."""
         conn, cursor = self._make_conn(mocker)
         cursor.fetchone.return_value = (42,)
@@ -2039,7 +2039,7 @@ class TestLoadProvisionedPoleVitals:
 
         executed_sqls = [call.args[0] for call in cursor.execute.call_args_list]
         assert not any(
-            "t.LocationId = ptz.LocationId" in sql for sql in executed_sqls
+            "t.PoleId = ptz.VendorPoleId" in sql for sql in executed_sqls
         )
 
     def test_commits_after_each_period_type(self, mocker):

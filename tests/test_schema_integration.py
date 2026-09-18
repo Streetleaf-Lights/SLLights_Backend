@@ -86,7 +86,7 @@ EXPECTED_PROJECTS_COLUMNS = {
 EXPECTED_POLES_COLUMNS = {
     "Id",
     "PoleNumber",
-    "LocationId",
+    "VendorPoleId",
     "CountyFips",
     "ProjectId",
     "CustomerId",
@@ -280,8 +280,8 @@ class TestPoleTelemetrySchemaConsistency:
         match = re.search(r"THEN UPDATE SET\s*(.+?)\s*WHEN NOT MATCHED", sql, re.DOTALL)
         assignments = match.group(1).strip().rstrip(",").split(",")
         cols = {a.split("=")[0].strip() for a in assignments}
-        # Update path never touches the match key (LocationId/LastUpload)
-        assert cols == EXPECTED_POLE_TELEMETRY_COLUMNS - {"LocationId", "LastUpload"}
+        # Update path never touches the match key (PoleId/LastUpload)
+        assert cols == EXPECTED_POLE_TELEMETRY_COLUMNS - {"PoleId", "LastUpload"}
 
     def test_no_fk_references(self):
         """PoleTelemetry is a separate ingestion pipeline from the
@@ -328,7 +328,7 @@ class TestPoleVitalsSchemaConsistency:
     """
 
     _EXPECTED_COLUMNS = {
-        "LocationId",
+        "PoleId",
         "PeriodType",
         "PeriodStart",
         "PeriodEnd",
@@ -354,17 +354,17 @@ class TestPoleVitalsSchemaConsistency:
         assert cols == self._EXPECTED_COLUMNS
 
     def test_update_set_columns_never_touch_the_match_key(self):
-        """Hour matches on (LocationId, PeriodType, PeriodStart), so
+        """Hour matches on (PoleId, PeriodType, PeriodStart), so
         none of those three should appear in the UPDATE SET list.
         Last48Hours is different -- see the test below."""
         sql = pole_vitals_loader._MERGE_SQL_BY_PERIOD_TYPE["Hour"]
         match = re.search(r"THEN UPDATE SET\s*(.+?)\s*WHEN NOT MATCHED", sql, re.DOTALL)
         assignments = match.group(1).strip().rstrip(",").split(",")
         cols = {a.split("=")[0].strip() for a in assignments}
-        assert cols == self._EXPECTED_COLUMNS - {"LocationId", "PeriodType", "PeriodStart"}
+        assert cols == self._EXPECTED_COLUMNS - {"PoleId", "PeriodType", "PeriodStart"}
 
     def test_last_48_hours_update_set_touches_period_start_but_not_location_or_type(self):
-        """Last48Hours matches on (LocationId, PeriodType) ALONE -- so
+        """Last48Hours matches on (PoleId, PeriodType) ALONE -- so
         PeriodStart (and PeriodEnd) MUST be in the UPDATE SET list, since
         it's not part of the match key and needs refreshing every run
         (see _LAST_48_HOURS_MERGE_SQL's own comment for why)."""
@@ -372,7 +372,7 @@ class TestPoleVitalsSchemaConsistency:
         match = re.search(r"THEN UPDATE SET\s*(.+?)\s*WHEN NOT MATCHED", sql, re.DOTALL)
         assignments = match.group(1).strip().rstrip(",").split(",")
         cols = {a.split("=")[0].strip() for a in assignments}
-        assert cols == self._EXPECTED_COLUMNS - {"LocationId", "PeriodType"}
+        assert cols == self._EXPECTED_COLUMNS - {"PoleId", "PeriodType"}
         assert "PeriodStart" in cols
 
 
@@ -385,7 +385,7 @@ class TestPoleTimeZonesSchemaConsistency:
     """
 
     _EXPECTED_COLUMNS = {
-        "LocationId",
+        "VendorPoleId",
         "Longitude",
         "Latitude",
         "IanaTimeZone",
@@ -405,7 +405,7 @@ class TestPoleTimeZonesSchemaConsistency:
         match = re.search(r"THEN UPDATE SET\s*(.+?)\s*WHEN NOT MATCHED", sql, re.DOTALL)
         assignments = match.group(1).strip().rstrip(",").split(",")
         cols = {a.split("=")[0].strip() for a in assignments}
-        assert cols == self._EXPECTED_COLUMNS - {"LocationId"}
+        assert cols == self._EXPECTED_COLUMNS - {"VendorPoleId"}
 
 
 # --------------------------------------------------------------------------

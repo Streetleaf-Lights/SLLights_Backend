@@ -1,7 +1,7 @@
 SELECT --TOP (1000) 
         [Id]
       ,[PoleNumber]
-      ,[LocationId]
+      ,[VendorPoleId]
       ,[ControllerId]
       ,ProvisionedPoleId
       ,PoleModelId
@@ -18,8 +18,8 @@ SELECT --TOP (1000)
   FROM [dbo].[Poles]
   WHERE 1 = 1
     -- AND Id = 'recBlYYoOlMDMisfv' 
---   AND [LocationId] = 'WREC-1044'
-    -- AND LocationId LIKE '%jacks%'
+--   AND [VendorPoleId] = 'WREC-1044'
+    -- AND VendorPoleId LIKE '%jacks%'
     -- AND PoleNumber = 'TESTSL1-1001'
     AND PoleNumber LIKE '%TESTSL1-100%'
     -- AND (Long IS NULL OR Lat IS NULL)
@@ -27,18 +27,18 @@ SELECT --TOP (1000)
     -- AND ControllerId IS NULL
     -- AND ProjectId = 'recsfujvjjvIbycaZ'
     -- AND Active = 1
-  ORDER BY [LocationId], [PoleNumber] DESC;
+  ORDER BY [VendorPoleId], [PoleNumber] DESC;
 
--- SELECT LocationId, COUNT(*) AS PoleCount
+-- SELECT VendorPoleId, COUNT(*) AS PoleCount
 -- FROM Poles
--- WHERE LocationId IS NOT NULL
--- GROUP BY LocationId
+-- WHERE VendorPoleId IS NOT NULL
+-- GROUP BY VendorPoleId
 -- HAVING COUNT(*) > 1;
 
 -- SELECT
 --     p.Id,
 --     p.PoleNumber,
---     p.LocationId,
+--     p.VendorPoleId,
 --     p.CountyFips,
 --     CASE
 --         WHEN p.CountyFips IS NULL THEN 'Missing entirely'
@@ -46,16 +46,16 @@ SELECT --TOP (1000)
 --     END AS Reason
 -- FROM Poles p
 -- LEFT JOIN CountyTimeZones ctz ON p.CountyFips = ctz.FIPS
--- WHERE p.LocationId IS NOT NULL
+-- WHERE p.VendorPoleId IS NOT NULL
 --   AND ctz.FIPS IS NULL
--- ORDER BY p.LocationId;
+-- ORDER BY p.VendorPoleId;
 
 -- SELECT
 --     p.CountyFips,
 --     COUNT(*) AS PoleCount
 -- FROM Poles p
 -- LEFT JOIN CountyTimeZones ctz ON p.CountyFips = ctz.FIPS
--- WHERE p.LocationId IS NOT NULL
+-- WHERE p.VendorPoleId IS NOT NULL
 --   AND ctz.FIPS IS NULL
 -- GROUP BY p.CountyFips
 -- ORDER BY PoleCount DESC;

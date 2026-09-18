@@ -73,7 +73,7 @@ def _clamp_summary_limit(limit) -> int:
 #
 # That OUTER APPLY still runs once per pole (a correlated TOP-1
 # lookup) -- each individual seek is cheap (PoleTelemetry's own
-# clustered index is (LocationId, LastUpload), LocationId leading),
+# clustered index is (PoleId, LastUpload), PoleId leading),
 # and doing it ~14,000 times in one query execution is a real,
 # structural cost regardless of how many columns each seek pulls
 # back -- but a wider row is still more expensive to materialize and
@@ -96,7 +96,7 @@ SELECT
     proj.Id AS ProjectId,
     p.Id AS PoleId,
     p.PoleNumber AS PoleNumber,
-    p.LocationId AS LocationId,
+    p.VendorPoleId AS VendorPoleId,
     p.InstallDate AS InstallDate,
     p.Lat AS Lat,
     p.Long AS Long,
@@ -132,13 +132,13 @@ SELECT
 FROM Poles p
 JOIN Projects proj ON p.ProjectId = proj.Id
 JOIN Customers c ON proj.CustomerId = c.Id
-LEFT JOIN PoleVitals rps ON COALESCE(p.LocationId, p.ProvisionedPoleId) = rps.LocationId AND rps.PeriodType = ?
+LEFT JOIN PoleVitals rps ON COALESCE(p.VendorPoleId, p.ProvisionedPoleId) = rps.PoleId AND rps.PeriodType = ?
 LEFT JOIN PoleTimeZones ptz ON
-    (p.LocationId IS NOT NULL AND p.LocationId = ptz.LocationId)
-    OR (p.LocationId IS NULL AND p.ProvisionedPoleId IS NOT NULL AND p.ProvisionedPoleId = ptz.ProvisionedPoleId)
+    (p.VendorPoleId IS NOT NULL AND p.VendorPoleId = ptz.VendorPoleId)
+    OR (p.VendorPoleId IS NULL AND p.ProvisionedPoleId IS NOT NULL AND p.ProvisionedPoleId = ptz.ProvisionedPoleId)
 OUTER APPLY (
     -- TOP 1 ... ORDER BY LastUpload DESC. OUTER (not CROSS): a pole with
-    -- no LocationId, or zero matching PoleTelemetry rows at all, must
+    -- no PoleId, or zero matching PoleTelemetry rows at all, must
     -- still appear in results (with every column below NULL), not
     -- disappear from the summary entirely.
     SELECT TOP 1
@@ -146,7 +146,7 @@ OUTER APPLY (
         pt.BatteryElecCurrent1, pt.BatteryElecCurrent2,
         pt.SolarBoardVoltage, pt.SolarBoardElecCurrent, pt.IsDaylightForPanelFault
     FROM PoleTelemetry pt
-    WHERE pt.LocationId = COALESCE(p.LocationId, p.ProvisionedPoleId)
+    WHERE pt.PoleId = COALESCE(p.VendorPoleId, p.ProvisionedPoleId)
     ORDER BY pt.LastUpload DESC
 ) AS latest_pt
 {where_clause}
@@ -219,7 +219,7 @@ def _summary_row_to_dict(row) -> dict:
         project_id,
         pole_id,
         pole_number,
-        location_id,
+        vendor_pole_id,
         install_date,
         lat,
         long_,
@@ -294,7 +294,7 @@ def _summary_row_to_dict(row) -> dict:
     return {
         "id": json_safe(pole_id),
         "poleNumber": json_safe(pole_number),
-        "locationId": json_safe(location_id),
+        "locationId": json_safe(vendor_pole_id),
         "installDate": json_safe(install_date),
         "lat": json_safe(lat),
         "long": json_safe(long_),

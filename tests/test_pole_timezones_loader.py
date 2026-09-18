@@ -49,16 +49,16 @@ class TestResolveFromCountySql:
 
     def test_still_left_joins_pole_time_zones_to_find_unresolved_ones(self):
         sql = m._RESOLVE_FROM_COUNTY_SQL
-        assert "LEFT JOIN PoleTimeZones ptz ON p.LocationId = ptz.LocationId" in sql
-        assert "ptz.LocationId IS NULL" in sql
+        assert "LEFT JOIN PoleTimeZones ptz ON p.VendorPoleId = ptz.VendorPoleId" in sql
+        assert "ptz.VendorPoleId IS NULL" in sql
 
-    def test_filters_out_poles_with_no_location_id_yet(self):
+    def test_filters_out_poles_with_no_pole_id_yet(self):
         """A pole can exist in Poles before it's linked to a real Leadsun
-        device -- without this filter, a NULL LocationId would satisfy
+        device -- without this filter, a NULL PoleId would satisfy
         the LEFT JOIN's "not yet resolved" condition and attempt to
         resolve/insert a timezone row for a pole with no real location."""
         sql = m._RESOLVE_FROM_COUNTY_SQL
-        assert "p.LocationId IS NOT NULL" in sql
+        assert "p.VendorPoleId IS NOT NULL" in sql
 
     def test_no_group_by_or_aggregation_needed(self):
         """Both Poles and CountyTimeZones are reference tables (one row
@@ -96,13 +96,13 @@ class TestCountUnresolvableSql:
         specifically COUNT the poles the main query silently excludes,
         not exclude them itself."""
         sql = m._COUNT_UNRESOLVABLE_SQL
-        assert "LEFT JOIN PoleTimeZones ptz ON p.LocationId = ptz.LocationId" in sql
+        assert "LEFT JOIN PoleTimeZones ptz ON p.VendorPoleId = ptz.VendorPoleId" in sql
         assert "LEFT JOIN CountyTimeZones ctz ON p.CountyFips = ctz.FIPS" in sql
 
     def test_counts_only_poles_not_yet_resolved_and_unresolvable(self):
         sql = m._COUNT_UNRESOLVABLE_SQL
-        assert "WHERE ptz.LocationId IS NULL" in sql
-        assert "AND p.LocationId IS NOT NULL" in sql
+        assert "WHERE ptz.VendorPoleId IS NULL" in sql
+        assert "AND p.VendorPoleId IS NOT NULL" in sql
         assert "AND ctz.FIPS IS NULL" in sql
 
     def test_is_a_count_not_a_write(self):
@@ -127,20 +127,20 @@ class TestResolveFromCountyBackfillSql:
 
     def test_has_no_not_already_resolved_restriction(self):
         """The one, deliberate difference from _RESOLVE_FROM_COUNTY_SQL:
-        no LEFT JOIN PoleTimeZones / "ptz.LocationId IS NULL" check at
+        no LEFT JOIN PoleTimeZones / "ptz.VendorPoleId IS NULL" check at
         all -- every pole with a resolvable CountyFips is a candidate,
         regardless of whether it already has a PoleTimeZones row."""
         sql = m._RESOLVE_FROM_COUNTY_BACKFILL_SQL
         assert "PoleTimeZones ptz" not in sql
-        assert "ptz.LocationId IS NULL" not in sql
+        assert "ptz.VendorPoleId IS NULL" not in sql
 
     def test_still_joins_county_time_zones_via_county_fips(self):
         sql = m._RESOLVE_FROM_COUNTY_BACKFILL_SQL
         assert "JOIN CountyTimeZones ctz ON p.CountyFips = ctz.FIPS" in sql
 
-    def test_still_filters_out_poles_with_no_location_id(self):
+    def test_still_filters_out_poles_with_no_pole_id(self):
         sql = m._RESOLVE_FROM_COUNTY_BACKFILL_SQL
-        assert "p.LocationId IS NOT NULL" in sql
+        assert "p.VendorPoleId IS NOT NULL" in sql
 
     def test_is_otherwise_the_same_shape_as_the_normal_merge(self):
         """Same MERGE structure, same match key, same UPDATE/INSERT
@@ -148,7 +148,7 @@ class TestResolveFromCountyBackfillSql:
         different kind of statement."""
         sql = m._RESOLVE_FROM_COUNTY_BACKFILL_SQL
         assert "MERGE PoleTimeZones AS target" in sql
-        assert "ON target.LocationId = source.LocationId" in sql
+        assert "ON target.VendorPoleId = source.VendorPoleId" in sql
         assert "WHEN MATCHED THEN UPDATE SET" in sql
         assert "WHEN NOT MATCHED THEN" in sql
         assert sql.count("?") == 4
@@ -163,17 +163,17 @@ class TestCountUnresolvableBackfillSql:
         sql = m._COUNT_UNRESOLVABLE_BACKFILL_SQL
         assert "LEFT JOIN CountyTimeZones ctz ON p.CountyFips = ctz.FIPS" in sql
         assert "AND ctz.FIPS IS NULL" in sql
-        assert "WHERE p.LocationId IS NOT NULL" in sql
+        assert "WHERE p.VendorPoleId IS NOT NULL" in sql
 
 
-class TestMergeDeduplicatesByLocationId:
+class TestMergeDeduplicatesByPoleId:
     """
     Regression coverage for a real production bug: Poles is keyed by its
-    own Id (the Airtable record id), not LocationId -- nothing prevents
-    two different Poles rows from sharing one LocationId (a genuine
+    own Id (the Airtable record id), not PoleId -- nothing prevents
+    two different Poles rows from sharing one PoleId (a genuine
     Airtable data quality issue). Without deduplicating first, the
     MERGE's USING subquery could produce two source rows for the same
-    LocationId, which SQL Server rejects outright with "The MERGE
+    PoleId, which SQL Server rejects outright with "The MERGE
     statement attempted to UPDATE or DELETE the same row more than once"
     (error 8672) -- confirmed happening in practice, specifically via
     the backfill variant (which, unlike the normal MERGE, actually
@@ -184,13 +184,13 @@ class TestMergeDeduplicatesByLocationId:
     @pytest.mark.parametrize(
         "sql", [m._RESOLVE_FROM_COUNTY_SQL, m._RESOLVE_FROM_COUNTY_BACKFILL_SQL], ids=["normal", "backfill"]
     )
-    def test_has_row_number_partitioned_by_location_id(self, sql):
-        assert "ROW_NUMBER() OVER (PARTITION BY p.LocationId ORDER BY p.Id)" in sql
+    def test_has_row_number_partitioned_by_pole_id(self, sql):
+        assert "ROW_NUMBER() OVER (PARTITION BY p.VendorPoleId ORDER BY p.Id)" in sql
 
     @pytest.mark.parametrize(
         "sql", [m._RESOLVE_FROM_COUNTY_SQL, m._RESOLVE_FROM_COUNTY_BACKFILL_SQL], ids=["normal", "backfill"]
     )
-    def test_filters_to_exactly_one_row_per_location_id(self, sql):
+    def test_filters_to_exactly_one_row_per_pole_id(self, sql):
         assert "WHERE rn = 1" in sql
 
     @pytest.mark.parametrize(
@@ -199,21 +199,21 @@ class TestMergeDeduplicatesByLocationId:
     def test_deduplication_happens_before_the_merge_matches_target(self, sql):
         """The ROW_NUMBER()/"WHERE rn = 1" wrapper must be INSIDE the
         USING subquery (so the MERGE only ever sees one row per
-        LocationId), not applied after the fact."""
+        PoleId), not applied after the fact."""
         using_clause = sql.split("USING (")[1].split(") AS source")[0]
         assert "ROW_NUMBER()" in using_clause
         assert "WHERE rn = 1" in using_clause
 
 
-class TestCountDuplicateLocationIdsSql:
-    def test_groups_by_location_id_and_filters_to_more_than_one(self):
+class TestCountDuplicatePoleIdsSql:
+    def test_groups_by_pole_id_and_filters_to_more_than_one(self):
         sql = m._COUNT_DUPLICATE_LOCATION_IDS_SQL
-        assert "GROUP BY LocationId" in sql
+        assert "GROUP BY VendorPoleId" in sql
         assert "HAVING COUNT(*) > 1" in sql
 
-    def test_excludes_null_location_ids(self):
+    def test_excludes_null_pole_ids(self):
         sql = m._COUNT_DUPLICATE_LOCATION_IDS_SQL
-        assert "WHERE LocationId IS NOT NULL" in sql
+        assert "WHERE VendorPoleId IS NOT NULL" in sql
 
     def test_is_a_count_not_a_write(self):
         sql = m._COUNT_DUPLICATE_LOCATION_IDS_SQL
@@ -223,12 +223,12 @@ class TestCountDuplicateLocationIdsSql:
         assert "MERGE" not in sql
 
 
-class TestLoadPoleTimezonesDuplicateLocationIdWarning:
+class TestLoadPoleTimezonesDuplicatePoleIdWarning:
     def test_logs_a_warning_when_duplicates_exist(self, caplog):
         mock_cursor = MagicMock()
         mock_conn = MagicMock()
         mock_conn.cursor.return_value = mock_cursor
-        mock_cursor.fetchone.side_effect = [(1,), (0,), (3,)]  # 3 duplicate LocationIds
+        mock_cursor.fetchone.side_effect = [(1,), (0,), (3,)]  # 3 duplicate PoleIds
         mock_cursor.rowcount = 5
 
         with patch("shared.pole_timezones_loader.get_connection", return_value=mock_conn):
@@ -236,7 +236,7 @@ class TestLoadPoleTimezonesDuplicateLocationIdWarning:
                 m.load_leadsun_pole_timezones()
 
         warnings = [rec.message for rec in caplog.records if rec.levelname == "WARNING"]
-        assert any("3 LocationId(s)" in w and "claimed by more than one Poles row" in w for w in warnings)
+        assert any("3 VendorPoleId(s)" in w and "claimed by more than one Poles row" in w for w in warnings)
 
     def test_does_not_log_when_no_duplicates(self, caplog):
         mock_cursor = MagicMock()
@@ -536,17 +536,18 @@ class TestResolveProvisionedFromCountySql:
     def test_merges_into_pole_time_zones(self):
         assert "MERGE PoleTimeZones AS target" in m._RESOLVE_PROVISIONED_FROM_COUNTY_SQL
 
-    def test_keyed_on_provisioned_pole_id_not_location_id(self):
+    def test_keyed_on_provisioned_pole_id_not_pole_id(self):
         sql = m._RESOLVE_PROVISIONED_FROM_COUNTY_SQL
         assert "ProvisionedPoleId" in sql
         assert "ON target.ProvisionedPoleId = source.ProvisionedPoleId" in sql
 
-    def test_no_location_id_references_in_provisioned_merge(self):
-        """Regression guard: the provisioned MERGE must not accidentally
-        key on LocationId (which is NULL for provisioned poles and would
-        produce a spurious MERGE match on NULL = NULL in some DB modes)."""
+    def test_merges_on_provisioned_pole_id_not_vendor_pole_id(self):
+        """Regression guard: the provisioned MERGE must key on ProvisionedPoleId,
+        not VendorPoleId (which is NULL for provisioned poles and would produce
+        a spurious MERGE match on NULL = NULL in some DB modes)."""
         sql = m._RESOLVE_PROVISIONED_FROM_COUNTY_SQL
-        assert "LocationId" not in sql
+        assert "ProvisionedPoleId" in sql
+        assert "ON target.VendorPoleId" not in sql
 
     def test_joins_county_time_zones_via_county_fips(self):
         sql = m._RESOLVE_PROVISIONED_FROM_COUNTY_SQL
@@ -576,7 +577,7 @@ class TestResolveProvisionedFromCountySql:
         sql = m._RESOLVE_PROVISIONED_FROM_COUNTY_SQL
         assert sql.count("?") == 4
 
-    def test_inserts_provisioned_pole_id_not_location_id(self):
+    def test_inserts_provisioned_pole_id_not_pole_id(self):
         sql = m._RESOLVE_PROVISIONED_FROM_COUNTY_SQL
         assert "INSERT (ProvisionedPoleId," in sql
 
@@ -593,8 +594,9 @@ class TestCountUnresolvableProvisionedSql:
         assert "p.ProvisionedPoleId IS NOT NULL" in sql
         assert "ctz.FIPS IS NULL" in sql
 
-    def test_no_location_id_references(self):
-        assert "LocationId" not in m._COUNT_UNRESOLVABLE_PROVISIONED_SQL
+    def test_counts_by_provisioned_pole_id_not_vendor_pole_id(self):
+        assert "ProvisionedPoleId" in m._COUNT_UNRESOLVABLE_PROVISIONED_SQL
+        assert "VendorPoleId" not in m._COUNT_UNRESOLVABLE_PROVISIONED_SQL
 
     def test_is_a_count_not_a_write(self):
         sql = m._COUNT_UNRESOLVABLE_PROVISIONED_SQL
@@ -649,7 +651,7 @@ class TestLoadProvisionedPoleTimeZones:
         executed_sqls = [call.args[0] for call in cursor.execute.call_args_list]
         assert any("ProvisionedPoleId" in sql for sql in executed_sqls)
 
-    def test_does_not_execute_location_id_merge(self, mocker):
+    def test_does_not_execute_pole_id_merge(self, mocker):
         """Regression guard: must not accidentally run the Leadsun-keyed
         MERGE (which would silently no-op for provisioned poles but
         indicates a wrong code path)."""
@@ -660,10 +662,10 @@ class TestLoadProvisionedPoleTimeZones:
 
         m.load_provisioned_pole_timezones()
 
-        # The Leadsun resolve SQL is the only one with LocationId in the USING clause
+        # The Leadsun resolve SQL is the only one with PoleId in the USING clause
         executed_sqls = [call.args[0] for call in cursor.execute.call_args_list]
         assert not any(
-            "PARTITION BY p.LocationId" in sql for sql in executed_sqls
+            "PARTITION BY p.VendorPoleId" in sql for sql in executed_sqls
         )
 
     def test_logs_warning_when_unresolvable_provisioned_poles_exist(self, mocker, caplog):

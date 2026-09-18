@@ -9,7 +9,7 @@
 -- NULL (BatteryPercentage is unaffected either way, since it doesn't
 -- depend on PoleModels at all).
 SELECT TOP 100
-    t.LocationId,
+    t.PoleId,
     t.LastUpload,
     t.ModelId,
     pm.ModelName,
@@ -40,6 +40,6 @@ SELECT TOP 100
 FROM PoleTelemetry t
 LEFT JOIN PoleModels pm ON t.ModelId = pm.ModelId
 WHERE 1 = 1
--- AND t.LocationId = '12101-5540'
+-- AND t.PoleId = '12101-5540'
 -- AND t.SP_ExecId = 442
 ORDER BY t.LastUpload DESC;

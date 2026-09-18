@@ -50,7 +50,7 @@ class TestFindUnflaggedSql:
         assert "AND t.LastUpload <> '9999-12-31 23:59:59.999 +00:00'" in sql
 
     def test_uses_inner_join_not_left_join(self):
-        """A LocationId with no PoleTimeZones entry at all can't have its
+        """A PoleId with no PoleTimeZones entry at all can't have its
         daylight computed yet -- must be excluded, not included with
         NULL coordinates."""
         sql = pole_daylight_flags_loader._FIND_UNFLAGGED_SQL
@@ -105,7 +105,7 @@ class TestLoadPoleDaylightFlagsSuccessFlow:
         # TestLastUploadIsFormattedAsDtoString below for why this
         # specific detail is the actual bug this loader was fixed for.
         # Each tuple is (IsDaylight, IsDaylightForLedFault,
-        # IsDaylightForPanelFault, LocationId, LastUpload) -- reading 1's
+        # IsDaylightForPanelFault, PoleId, LastUpload) -- reading 1's
         # LED value is True purely from the short-circuit (daylight=True
         # already answers it), and its Panel value is True from BOTH its
         # own separate checks (warmup AND winddown) passing; reading 2's
@@ -395,8 +395,8 @@ class TestLoadPoleDaylightFlagsSuccessFlow:
     ):
         """Regression test for a real production bug: cursor.fast_executemany
         = True infers a fixed buffer size for variable-length string
-        parameters (LocationId varies in length across poles) from the
-        batch -- depending on pyodbc version, a row whose LocationId
+        parameters (PoleId varies in length across poles) from the
+        batch -- depending on pyodbc version, a row whose PoleId
         doesn't fit that inferred size can get silently mis-bound.
         executemany() raises no exception either way (so this still
         looks like success, and total_success still gets incremented),
@@ -757,18 +757,18 @@ class TestFailureRecordingUsesAFreshConnection:
 class TestFindProvisionedUnflaggedSql:
     def test_joins_pole_time_zones_on_provisioned_pole_id(self):
         """The key difference from _FIND_UNFLAGGED_SQL: provisioned telemetry
-        stores ProvisionedPoleId as LocationId, so the join must cross to
-        PoleTimeZones.ProvisionedPoleId, not PoleTimeZones.LocationId."""
+        stores ProvisionedPoleId as PoleId, so the join must cross to
+        PoleTimeZones.ProvisionedPoleId, not PoleTimeZones.PoleId."""
         sql = pole_daylight_flags_loader._FIND_PROVISIONED_UNFLAGGED_SQL
         assert "ptz.ProvisionedPoleId" in sql
-        assert "t.LocationId = ptz.ProvisionedPoleId" in sql
+        assert "t.PoleId = ptz.ProvisionedPoleId" in sql
 
-    def test_does_not_join_on_location_id(self):
+    def test_does_not_join_on_pole_id(self):
         """Regression guard: must not accidentally use the Leadsun join
-        (LocationId = ptz.LocationId), which would find no rows for
-        provisioned poles since PoleTimeZones.LocationId is NULL for them."""
+        (PoleId = ptz.VendorPoleId), which would find no rows for
+        provisioned poles since PoleTimeZones.PoleId is NULL for them."""
         sql = pole_daylight_flags_loader._FIND_PROVISIONED_UNFLAGGED_SQL
-        assert "t.LocationId = ptz.LocationId" not in sql
+        assert "t.PoleId = ptz.VendorPoleId" not in sql
 
     def test_uses_inner_join_not_left(self):
         sql = pole_daylight_flags_loader._FIND_PROVISIONED_UNFLAGGED_SQL
@@ -850,7 +850,7 @@ class TestLoadProvisionedPoleDaylightFlags:
 
         executed_sqls = [call.args[0] for call in cursor.execute.call_args_list]
         assert not any(
-            "t.LocationId = ptz.LocationId" in sql for sql in executed_sqls
+            "t.PoleId = ptz.VendorPoleId" in sql for sql in executed_sqls
         )
 
     def test_exits_immediately_when_no_unflagged_rows(self, mocker):
@@ -887,7 +887,7 @@ class TestLoadProvisionedPoleDaylightFlags:
         many_calls = cursor.executemany.call_args_list
         assert len(many_calls) >= 1
         args = many_calls[0].args[1][0]  # first row in first chunk
-        assert args[3] == "prov-001"  # LocationId passed through
+        assert args[3] == "prov-001"  # PoleId passed through
 
     def test_marks_sp_execution_complete_on_success(self, mocker):
         conn, cursor = self._make_conn()

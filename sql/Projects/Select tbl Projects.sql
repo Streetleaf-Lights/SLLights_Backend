@@ -20,13 +20,13 @@ SELECT TOP (1000) [Id]
     -- AND Active = 1
   ORDER BY [AirTableCreatedDateTime] DESC;
 
--- SELECT DISTINCT t.LocationId
+-- SELECT DISTINCT t.PoleId
 -- FROM PoleTelemetry t
--- WHERE t.LocationId IN (
---     SELECT p.LocationId
+-- WHERE t.PoleId IN (
+--     SELECT p.VendorPoleId
 --     FROM Poles p
 --     JOIN Projects proj ON p.ProjectId = proj.Id
 --     WHERE proj.Name LIKE '%acacia%'
---       AND p.LocationId IS NOT NULL
+--       AND p.VendorPoleId IS NOT NULL
 -- )
--- ORDER BY t.LocationId;
+-- ORDER BY t.PoleId;

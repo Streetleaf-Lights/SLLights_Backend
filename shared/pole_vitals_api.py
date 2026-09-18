@@ -96,7 +96,7 @@ _ROLLUP_PERIOD_TYPE = "Last48Hours"
 # silently dropped from the result entirely.
 _FETCH_SQL_TEMPLATE = """
 WITH RecentPoleStats AS (
-    SELECT LocationId, IsOnline, IsOpenIssueFault, IsPoleFault
+    SELECT PoleId, IsOnline, IsOpenIssueFault, IsPoleFault
     FROM PoleVitals
     WHERE PeriodType = ?
 ),
@@ -108,7 +108,7 @@ PoleWithStatus AS (
         rps.IsOpenIssueFault,
         rps.IsPoleFault
     FROM Poles p
-    LEFT JOIN RecentPoleStats rps ON COALESCE(p.LocationId, p.ProvisionedPoleId) = rps.LocationId
+    LEFT JOIN RecentPoleStats rps ON COALESCE(p.VendorPoleId, p.ProvisionedPoleId) = rps.PoleId
 ),
 ProjectAgg AS (
     SELECT
@@ -147,8 +147,8 @@ ORDER BY c.Name, proj.Name
 #
 # RecentPoleStats here is now a plain, unaggregated SELECT (no GROUP BY
 # at all) -- Last48Hours is structurally always 0-or-1 rows per
-# LocationId (see pole_vitals_loader.py's own _LAST_48_HOURS_MERGE_SQL --
-# it matches PoleVitals on LocationId+PeriodType alone, no PeriodStart,
+# PoleId (see pole_vitals_loader.py's own _LAST_48_HOURS_MERGE_SQL --
+# it matches PoleVitals on PoleId+PeriodType alone, no PeriodStart,
 # so there's exactly one row per pole, or none for a silent one), so
 # there's nothing to aggregate across the way the old Hour-window design
 # needed to.
@@ -168,10 +168,10 @@ ORDER BY c.Name, proj.Name
 # operation pole_vitals_loader.py uses extensively for bucketing.
 #
 # OUTER APPLY (not a JOIN/CTE) for each pole's single most recent
-# PoleTelemetry row -- PoleTelemetry's own PRIMARY KEY is (LocationId,
-# LastUpload), so `TOP 1 ... WHERE LocationId = @x ORDER BY LastUpload
+# PoleTelemetry row -- PoleTelemetry's own PRIMARY KEY is (PoleId,
+# LastUpload), so `TOP 1 ... WHERE PoleId = @x ORDER BY LastUpload
 # DESC` seeks directly into that one pole's rows rather than scanning
-# the table. OUTER, not CROSS: a pole with no LocationId, or zero
+# the table. OUTER, not CROSS: a pole with no PoleId, or zero
 # matching PoleTelemetry rows, must still appear (with these columns
 # NULL).
 #
@@ -194,7 +194,7 @@ SELECT
     proj.Id AS ProjectId,
     p.Id AS PoleId,
     p.PoleNumber AS PoleNumber,
-    p.LocationId AS LocationId,
+    p.VendorPoleId AS VendorPoleId,
     p.InstallDate AS InstallDate,
     p.Lat AS Lat,
     p.Long AS Long,
@@ -252,10 +252,10 @@ SELECT
 FROM Poles p
 JOIN Projects proj ON p.ProjectId = proj.Id
 JOIN Customers c ON proj.CustomerId = c.Id
-LEFT JOIN PoleVitals rps ON COALESCE(p.LocationId, p.ProvisionedPoleId) = rps.LocationId AND rps.PeriodType = ?
+LEFT JOIN PoleVitals rps ON COALESCE(p.VendorPoleId, p.ProvisionedPoleId) = rps.PoleId AND rps.PeriodType = ?
 LEFT JOIN PoleTimeZones ptz ON
-    (p.LocationId IS NOT NULL AND p.LocationId = ptz.LocationId)
-    OR (p.LocationId IS NULL AND p.ProvisionedPoleId IS NOT NULL AND p.ProvisionedPoleId = ptz.ProvisionedPoleId)
+    (p.VendorPoleId IS NOT NULL AND p.VendorPoleId = ptz.VendorPoleId)
+    OR (p.VendorPoleId IS NULL AND p.ProvisionedPoleId IS NOT NULL AND p.ProvisionedPoleId = ptz.ProvisionedPoleId)
 OUTER APPLY (
     SELECT TOP 1
         pt.LastUpload, pt.ControllerCode, pt.GroupId, pt.ProductId, pt.UserName,
@@ -264,7 +264,7 @@ OUTER APPLY (
         pt.BatteryElecCurrent1, pt.BatteryElecCurrent2,
         pt.SolarBoardVoltage, pt.SolarBoardElecCurrent, pt.IsDaylightForPanelFault
     FROM PoleTelemetry pt
-    WHERE pt.LocationId = COALESCE(p.LocationId, p.ProvisionedPoleId)
+    WHERE pt.PoleId = COALESCE(p.VendorPoleId, p.ProvisionedPoleId)
     ORDER BY pt.LastUpload DESC
 ) AS latest_pt
 {where_clause}
@@ -344,7 +344,7 @@ def _pole_row_to_dict(row) -> dict:
     included for the same "sourced from this same latest reading"
     reason, though it's not confirmed to be identical across a given
     pole's own history the same way those three are. All of these are
-    None for a pole with no LocationId or no matching PoleTelemetry rows
+    None for a pole with no PoleId or no matching PoleTelemetry rows
     at all.
 
     The row's ProjectId (first column) and CustomerId (last column,
@@ -357,7 +357,7 @@ def _pole_row_to_dict(row) -> dict:
         _,
         pole_id,
         pole_number,
-        location_id,
+        vendor_pole_id,
         install_date,
         lat,
         long_,
@@ -449,7 +449,7 @@ def _pole_row_to_dict(row) -> dict:
     return {
         "id": json_safe(pole_id),
         "poleNumber": json_safe(pole_number),
-        "locationId": json_safe(location_id),
+        "locationId": json_safe(vendor_pole_id),
         "installDate": json_safe(install_date),
         "lat": json_safe(lat),
         "long": json_safe(long_),
@@ -694,7 +694,7 @@ def get_pole_vitals(customer_id: str = None, project_id: str = None, limit: int 
     (PoleVitals' own period AGGREGATES over many readings, not this
     single most recent one). lastUpdate reflects the pole's own local
     time zone (via PoleTimeZones), not UTC. All of these are None for a
-    pole with no LocationId or no matching PoleTelemetry rows at all.
+    pole with no PoleId or no matching PoleTelemetry rows at all.
     The Customer itself ALSO carries the same four rollup fields (but NOT
     a "poles" list of its own -- poles only ever appear nested under
     their own project), summed across all of that customer's own projects
@@ -879,7 +879,7 @@ _POLE_INFO_FOR_HISTORY_SQL_TEMPLATE = """
 SELECT
     p.Id AS PoleId,
     p.PoleNumber AS PoleNumber,
-    p.LocationId AS LocationId,
+    p.VendorPoleId AS VendorPoleId,
     p.InstallDate AS InstallDate,
     p.Lat AS Lat,
     p.Long AS Long,
@@ -892,15 +892,15 @@ SELECT
     latest_pt.SolarBoardElecCurrent AS SolarBoardElecCurrent
 FROM Poles p
 LEFT JOIN PoleTimeZones ptz ON
-    (p.LocationId IS NOT NULL AND p.LocationId = ptz.LocationId)
-    OR (p.LocationId IS NULL AND p.ProvisionedPoleId IS NOT NULL AND p.ProvisionedPoleId = ptz.ProvisionedPoleId)
+    (p.VendorPoleId IS NOT NULL AND p.VendorPoleId = ptz.VendorPoleId)
+    OR (p.VendorPoleId IS NULL AND p.ProvisionedPoleId IS NOT NULL AND p.ProvisionedPoleId = ptz.ProvisionedPoleId)
 OUTER APPLY (
     SELECT TOP 1
         pt.LastUpload, pt.LampPower1, pt.LampPower2,
         pt.BatteryElecCurrent1, pt.BatteryElecCurrent2,
         pt.SolarBoardVoltage, pt.SolarBoardElecCurrent
     FROM PoleTelemetry pt
-    WHERE pt.LocationId = COALESCE(p.LocationId, p.ProvisionedPoleId)
+    WHERE pt.PoleId = COALESCE(p.VendorPoleId, p.ProvisionedPoleId)
     ORDER BY pt.LastUpload DESC
 ) AS latest_pt
 WHERE p.Id = ?
@@ -934,7 +934,7 @@ WHERE p.Id = ?
 # PoleVitals actually having a row there).
 #
 # The final SELECT LEFT JOINs PoleVitals onto those generated buckets
-# (matched on LocationId + PeriodType='Hour' + PeriodStart) instead of
+# (matched on PoleId + PeriodType='Hour' + PeriodStart) instead of
 # the reverse (selecting PoleVitals and filtering) -- this is what makes
 # a genuinely missing hour still produce its own row, with every
 # PoleVitals-sourced column coming back NULL via the LEFT JOIN's own
@@ -970,17 +970,17 @@ WHERE p.Id = ?
 _POLE_VITALS_HOUR_HISTORY_SQL_TEMPLATE = """
 WITH PoleContext AS (
     SELECT
-        COALESCE(p.LocationId, p.ProvisionedPoleId) AS LocationId,
+        COALESCE(p.VendorPoleId, p.ProvisionedPoleId) AS PoleId,
         ISNULL(ptz.WindowsTimeZone, 'Eastern Standard Time') AS TimeZoneName
     FROM Poles p
     LEFT JOIN PoleTimeZones ptz ON
-        (p.LocationId IS NOT NULL AND p.LocationId = ptz.LocationId)
-        OR (p.LocationId IS NULL AND p.ProvisionedPoleId IS NOT NULL AND p.ProvisionedPoleId = ptz.ProvisionedPoleId)
+        (p.VendorPoleId IS NOT NULL AND p.VendorPoleId = ptz.VendorPoleId)
+        OR (p.VendorPoleId IS NULL AND p.ProvisionedPoleId IS NOT NULL AND p.ProvisionedPoleId = ptz.ProvisionedPoleId)
     WHERE p.Id = ?
 ),
 CurrentBucket AS (
     SELECT
-        LocationId,
+        PoleId,
         TimeZoneName,
         DATEADD(
             HOUR,
@@ -999,7 +999,7 @@ Numbers AS (
 ),
 Buckets AS (
     SELECT
-        cb.LocationId,
+        cb.PoleId,
         cb.TimeZoneName,
         DATEADD(HOUR, -n.n, cb.CurrentBucketStart) AS BucketStart
     FROM CurrentBucket cb
@@ -1019,7 +1019,7 @@ SELECT
     pv.AvgLightPercentage AS AvgLightPercentage
 FROM Buckets b
 LEFT JOIN PoleVitals pv
-    ON pv.LocationId = b.LocationId
+    ON pv.PoleId = b.PoleId
    AND pv.PeriodType = 'Hour'
    AND pv.PeriodStart = (b.BucketStart AT TIME ZONE b.TimeZoneName)
 ORDER BY b.BucketStart DESC
@@ -1151,7 +1151,7 @@ def get_pole_vitals_by_period(pole_id: str, period_type: str, limit: int = None)
     (
         pole_id_,
         pole_number,
-        location_id,
+        vendor_pole_id,
         install_date,
         lat,
         long_,
@@ -1166,7 +1166,7 @@ def get_pole_vitals_by_period(pole_id: str, period_type: str, limit: int = None)
     return {
         "id": json_safe(pole_id_),
         "poleNumber": json_safe(pole_number),
-        "locationId": json_safe(location_id),
+        "locationId": json_safe(vendor_pole_id),
         "installDate": json_safe(install_date),
         "lat": json_safe(lat),
         "long": json_safe(long_),

@@ -17,7 +17,7 @@ EXECUTION_SOURCE = "Leadsun"
 PROVISIONED_EXECUTION_SOURCE = "Provisioned"
 COORDINATE_SOURCE = "CountyTimeZones"
 
-# Resolves and caches each not-yet-seen LocationId's timezone via its
+# Resolves and caches each not-yet-seen PoleId's timezone via its
 # pole's OWN county (Poles.CountyFips, itself sourced from Airtable's
 # "CountyFips" field -- see shared/poles_loader.py's own comments on
 # AIRTABLE_POLES_FIELDS and _clean_county_fips()), joined against
@@ -52,46 +52,46 @@ COORDINATE_SOURCE = "CountyTimeZones"
 # _COUNT_UNRESOLVABLE_SQL exists separately below: to make that gap
 # visible in logs rather than silent.
 #
-# p.LocationId IS NOT NULL matters here specifically: a pole can exist
-# in Poles before it's linked to a real Leadsun device (LocationId not
+# p.VendorPoleId IS NOT NULL matters here specifically: a pole can exist
+# in Poles before it's linked to a real Leadsun device (PoleId not
 # yet assigned) -- such a pole could never appear in PoleTelemetry, so
 # resolving/inserting a timezone row for it would be premature.
 #
 # The inner SELECT's ROW_NUMBER()/"WHERE rn = 1" wrapper deduplicates by
-# LocationId before the MERGE ever sees it -- see
+# PoleId before the MERGE ever sees it -- see
 # _RESOLVE_FROM_COUNTY_BACKFILL_SQL's own comment for the full story:
-# Poles is keyed by Id, not LocationId, so two different Poles rows can
-# share the same LocationId (a real Airtable data quality issue,
+# Poles is keyed by Id, not PoleId, so two different Poles rows can
+# share the same PoleId (a real Airtable data quality issue,
 # confirmed in production), which would otherwise make MERGE fail
 # outright with "attempted to UPDATE or DELETE the same row more than
 # once" (error 8672). This loader's own "not already resolved" filter
 # has so far masked this for existing poles (whichever duplicate got
 # there first via the old Lat/Long-based system already has a
 # PoleTimeZones row, so this MERGE simply never revisits either one) --
-# but a BRAND NEW pair of duplicate LocationIds, appearing for the first
+# but a BRAND NEW pair of duplicate PoleIds, appearing for the first
 # time after this switch, would hit the same failure here without this
 # same fix.
 _RESOLVE_FROM_COUNTY_SQL = """
 MERGE PoleTimeZones AS target
 USING (
-    SELECT LocationId, Longitude, Latitude, IanaTimeZone, WindowsTimeZone
+    SELECT VendorPoleId, Longitude, Latitude, IanaTimeZone, WindowsTimeZone
     FROM (
         SELECT
-            p.LocationId,
+            p.VendorPoleId,
             ctz.Longitude,
             ctz.Latitude,
             ctz.IanaTimeZone,
             ctz.WindowsTimeZone,
-            ROW_NUMBER() OVER (PARTITION BY p.LocationId ORDER BY p.Id) AS rn
+            ROW_NUMBER() OVER (PARTITION BY p.VendorPoleId ORDER BY p.Id) AS rn
         FROM Poles p
-        LEFT JOIN PoleTimeZones ptz ON p.LocationId = ptz.LocationId
+        LEFT JOIN PoleTimeZones ptz ON p.VendorPoleId = ptz.VendorPoleId
         JOIN CountyTimeZones ctz ON p.CountyFips = ctz.FIPS
-        WHERE ptz.LocationId IS NULL
-          AND p.LocationId IS NOT NULL
+        WHERE ptz.VendorPoleId IS NULL
+          AND p.VendorPoleId IS NOT NULL
     ) AS deduped
     WHERE rn = 1
 ) AS source
-ON target.LocationId = source.LocationId
+ON target.VendorPoleId = source.VendorPoleId
 WHEN MATCHED THEN UPDATE SET
     Longitude       = source.Longitude,
     Latitude        = source.Latitude,
@@ -100,8 +100,8 @@ WHEN MATCHED THEN UPDATE SET
     Source          = ?,
     SP_ExecId       = ?
 WHEN NOT MATCHED THEN
-    INSERT (LocationId, Longitude, Latitude, IanaTimeZone, WindowsTimeZone, Source, SP_ExecId)
-    VALUES (source.LocationId, source.Longitude, source.Latitude, source.IanaTimeZone,
+    INSERT (VendorPoleId, Longitude, Latitude, IanaTimeZone, WindowsTimeZone, Source, SP_ExecId)
+    VALUES (source.VendorPoleId, source.Longitude, source.Latitude, source.IanaTimeZone,
             source.WindowsTimeZone, ?, ?);
 """
 
@@ -115,7 +115,7 @@ WHEN NOT MATCHED THEN
 # resolved via the OLD Lat/Long + timezonefinder approach for months
 # before Poles.CountyFips existed at all. That means virtually every
 # pole already has a PoleTimeZones row today -- so the normal MERGE's
-# own "ptz.LocationId IS NULL" condition excludes almost everything,
+# own "ptz.VendorPoleId IS NULL" condition excludes almost everything,
 # and adding CountyFips to Poles changes nothing for a pole that was
 # already resolved, no matter how accurate its county data now is. This
 # variant is the one-time fix for that: re-resolve everything via county
@@ -124,16 +124,16 @@ WHEN NOT MATCHED THEN
 #
 # The inner SELECT's ROW_NUMBER()/"WHERE rn = 1" wrapper exists for a
 # real, confirmed-in-production reason: Poles is keyed by Id (the
-# Airtable record id), not LocationId, so nothing stops two DIFFERENT
-# Poles rows from sharing the same LocationId (a genuine Airtable data
+# Airtable record id), not PoleId, so nothing stops two DIFFERENT
+# Poles rows from sharing the same PoleId (a genuine Airtable data
 # quality issue -- duplicate/misassigned location ids). Without
 # deduplicating first, the USING subquery could produce two source rows
-# for the same LocationId, and MERGE correctly refuses to guess which
+# for the same PoleId, and MERGE correctly refuses to guess which
 # one should win, failing outright with "The MERGE statement attempted
 # to UPDATE or DELETE the same row more than once" (error 8672) --
 # exactly what happened in practice before this fix. The normal,
 # non-backfill MERGE below was never observed hitting this, but only
-# because by the time CountyFips existed, every affected LocationId
+# because by the time CountyFips existed, every affected PoleId
 # already had a PoleTimeZones row from the old Lat/Long-based system,
 # so its own "not already resolved" filter happened to exclude both
 # duplicates -- masking the same underlying data issue, not fixing it.
@@ -145,22 +145,22 @@ WHEN NOT MATCHED THEN
 _RESOLVE_FROM_COUNTY_BACKFILL_SQL = """
 MERGE PoleTimeZones AS target
 USING (
-    SELECT LocationId, Longitude, Latitude, IanaTimeZone, WindowsTimeZone
+    SELECT VendorPoleId, Longitude, Latitude, IanaTimeZone, WindowsTimeZone
     FROM (
         SELECT
-            p.LocationId,
+            p.VendorPoleId,
             ctz.Longitude,
             ctz.Latitude,
             ctz.IanaTimeZone,
             ctz.WindowsTimeZone,
-            ROW_NUMBER() OVER (PARTITION BY p.LocationId ORDER BY p.Id) AS rn
+            ROW_NUMBER() OVER (PARTITION BY p.VendorPoleId ORDER BY p.Id) AS rn
         FROM Poles p
         JOIN CountyTimeZones ctz ON p.CountyFips = ctz.FIPS
-        WHERE p.LocationId IS NOT NULL
+        WHERE p.VendorPoleId IS NOT NULL
     ) AS deduped
     WHERE rn = 1
 ) AS source
-ON target.LocationId = source.LocationId
+ON target.VendorPoleId = source.VendorPoleId
 WHEN MATCHED THEN UPDATE SET
     Longitude       = source.Longitude,
     Latitude        = source.Latitude,
@@ -169,8 +169,8 @@ WHEN MATCHED THEN UPDATE SET
     Source          = ?,
     SP_ExecId       = ?
 WHEN NOT MATCHED THEN
-    INSERT (LocationId, Longitude, Latitude, IanaTimeZone, WindowsTimeZone, Source, SP_ExecId)
-    VALUES (source.LocationId, source.Longitude, source.Latitude, source.IanaTimeZone,
+    INSERT (VendorPoleId, Longitude, Latitude, IanaTimeZone, WindowsTimeZone, Source, SP_ExecId)
+    VALUES (source.VendorPoleId, source.Longitude, source.Latitude, source.IanaTimeZone,
             source.WindowsTimeZone, ?, ?);
 """
 
@@ -184,10 +184,10 @@ WHEN NOT MATCHED THEN
 _COUNT_UNRESOLVABLE_SQL = """
 SELECT COUNT(*)
 FROM Poles p
-LEFT JOIN PoleTimeZones ptz ON p.LocationId = ptz.LocationId
+LEFT JOIN PoleTimeZones ptz ON p.VendorPoleId = ptz.VendorPoleId
 LEFT JOIN CountyTimeZones ctz ON p.CountyFips = ctz.FIPS
-WHERE ptz.LocationId IS NULL
-  AND p.LocationId IS NOT NULL
+WHERE ptz.VendorPoleId IS NULL
+  AND p.VendorPoleId IS NOT NULL
   AND ctz.FIPS IS NULL
 """
 
@@ -199,13 +199,13 @@ _COUNT_UNRESOLVABLE_BACKFILL_SQL = """
 SELECT COUNT(*)
 FROM Poles p
 LEFT JOIN CountyTimeZones ctz ON p.CountyFips = ctz.FIPS
-WHERE p.LocationId IS NOT NULL
+WHERE p.VendorPoleId IS NOT NULL
   AND ctz.FIPS IS NULL
 """
 
-# Counts distinct LocationIds claimed by more than one Poles row -- a
+# Counts distinct PoleIds claimed by more than one Poles row -- a
 # genuine Airtable data quality issue (Poles is keyed by its own Id, not
-# LocationId, so nothing prevents two different pole records from
+# PoleId, so nothing prevents two different pole records from
 # sharing one), confirmed in production as the root cause of a real
 # MERGE failure (error 8672, "attempted to UPDATE or DELETE the same row
 # more than once"). The MERGE statements above now defend against this
@@ -219,10 +219,10 @@ WHERE p.LocationId IS NOT NULL
 _COUNT_DUPLICATE_LOCATION_IDS_SQL = """
 SELECT COUNT(*)
 FROM (
-    SELECT LocationId
+    SELECT VendorPoleId
     FROM Poles
-    WHERE LocationId IS NOT NULL
-    GROUP BY LocationId
+    WHERE VendorPoleId IS NOT NULL
+    GROUP BY VendorPoleId
     HAVING COUNT(*) > 1
 ) AS duplicates
 """
@@ -230,14 +230,14 @@ FROM (
 
 def load_leadsun_pole_timezones(backfill: bool = False) -> None:
     """
-    Resolves and caches each not-yet-seen LocationId's timezone (via its
+    Resolves and caches each not-yet-seen VendorPoleId's timezone (via its
     pole's own county -- see _RESOLVE_FROM_COUNTY_SQL's own comment for
     the full reasoning and the Lat/Long-based approach this replaced)
     into PoleTimeZones, for pole_vitals_loader.py's per-pole Hour/Day/
     Last48Hours bucketing and pole_daylight_flags_loader.py's sunrise/
     sunset calculations.
 
-    Only resolves LocationIds NOT ALREADY in PoleTimeZones -- poles are
+    Only resolves PoleIds NOT ALREADY in PoleTimeZones -- poles are
     stationary, so a location's timezone never changes once resolved,
     making this a one-time-per-pole cost rather than something to redo
     every 30-minute cycle. A single set-based MERGE, not a per-row Python
@@ -285,7 +285,7 @@ def load_leadsun_pole_timezones(backfill: bool = False) -> None:
         sp_exec_id = cursor.fetchone()[0]
         conn.commit()
 
-        # 2. Resolve every eligible LocationId whose pole's county is
+        # 2. Resolve every eligible PoleId whose pole's county is
         # known, in one set-based MERGE -- "eligible" meaning
         # "not-yet-seen" normally, or "every pole" when backfill=True.
         cursor.execute(
@@ -297,7 +297,7 @@ def load_leadsun_pole_timezones(backfill: bool = False) -> None:
         )
         total_success = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
         logging.info(
-            "loadPoleTimeZones: resolved %d LocationId(s) via CountyTimeZones%s.",
+            "loadPoleTimeZones: resolved %d VendorPoleId(s) via CountyTimeZones%s.",
             total_success,
             " (backfill)" if backfill else "",
         )
@@ -310,7 +310,7 @@ def load_leadsun_pole_timezones(backfill: bool = False) -> None:
         unresolvable_count = cursor.fetchone()[0]
         if unresolvable_count > 0:
             logging.warning(
-                "loadPoleTimeZones: %d pole(s) have a LocationId but no resolvable "
+                "loadPoleTimeZones: %d pole(s) have a VendorPoleId but no resolvable "
                 "CountyFips (missing entirely, or not found in CountyTimeZones) -- "
                 "these will keep falling back to the default timezone in "
                 "PoleVitals/daylight calculations until Poles.CountyFips is "
@@ -318,21 +318,21 @@ def load_leadsun_pole_timezones(backfill: bool = False) -> None:
                 unresolvable_count,
             )
 
-        # 3b. Separately report LocationIds claimed by more than one
+        # 3b. Separately report PoleIds claimed by more than one
         # Poles row (see _COUNT_DUPLICATE_LOCATION_IDS_SQL's own comment)
         # -- the MERGE above already defends against this via
         # deduplication so it still completes, but an arbitrary tiebreak
         # (lowest Poles.Id) picking a "winner" isn't the same as the
         # underlying Poles data actually being correct.
         cursor.execute(_COUNT_DUPLICATE_LOCATION_IDS_SQL)
-        duplicate_location_id_count = cursor.fetchone()[0]
-        if duplicate_location_id_count > 0:
+        duplicate_pole_id_count = cursor.fetchone()[0]
+        if duplicate_pole_id_count > 0:
             logging.warning(
-                "loadPoleTimeZones: %d LocationId(s) are claimed by more than one "
+                "loadPoleTimeZones: %d VendorPoleId(s) are claimed by more than one "
                 "Poles row -- resolved using an arbitrary tiebreak (lowest Poles.Id), "
                 "but this is a Poles data quality issue worth correcting at the "
                 "source rather than relying on that tiebreak indefinitely.",
-                duplicate_location_id_count,
+                duplicate_pole_id_count,
             )
 
         conn.commit()
@@ -400,8 +400,8 @@ def load_leadsun_pole_timezones(backfill: bool = False) -> None:
 # ---------------------------------------------------------------------------
 #
 # Mirrors _RESOLVE_FROM_COUNTY_SQL above but keyed on ProvisionedPoleId
-# instead of LocationId. Provisioned poles are never linked to a Leadsun
-# device (no LocationId), so they can never appear in the Leadsun-keyed
+# instead of PoleId. Provisioned poles are never linked to a Leadsun
+# device (no PoleId), so they can never appear in the Leadsun-keyed
 # resolution path above. Their own identifier is Poles.ProvisionedPoleId
 # (populated by provisioned_data_loader.load_provisioned_pole_serials()),
 # which is what PoleTimeZones must key on for these rows.
@@ -472,8 +472,8 @@ def load_provisioned_pole_timezones() -> None:
     (via its pole's own county, same CountyFips -> CountyTimeZones path
     as load_leadsun_pole_timezones()) into PoleTimeZones.
 
-    Keyed on ProvisionedPoleId rather than LocationId -- provisioned poles
-    have no LocationId (it is NULL), so they can never be resolved via the
+    Keyed on ProvisionedPoleId rather than PoleId -- provisioned poles
+    have no VendorPoleId (it is NULL), so they can never be resolved via the
     Leadsun path above. Must run AFTER load_provisioned_pole_serials(),
     which is what populates Poles.ProvisionedPoleId in the first place.
 

@@ -7,7 +7,7 @@
 --     being dropped -- promote it to its own column later if it matters.
 --   * PRIMARY KEY is ModelId alone -- NOT a composite key like PoleTelemetry.
 --     PoleModels is a reference/lookup table (specs per device model), not
---     per-device telemetry, so there's no LocationId/LastUpload concept
+--     per-device telemetry, so there's no PoleId/LastUpload concept
 --     here at all. ModelId arrives as a real JSON integer from the API
 --     (not a string), so no rename or numeric conversion is needed for it
 --     -- unlike PoleTelemetry's "id", it doesn't collide with any of this

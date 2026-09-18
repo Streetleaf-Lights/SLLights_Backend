@@ -22,7 +22,7 @@
 -- zone outside shared/timezone_utils.py's deliberately US-scoped mapping,
 -- still gets a row here (so it isn't re-attempted every cycle), just with
 -- WindowsTimeZone left NULL -- pole_vitals_loader.py falls back to
--- Eastern time for any LocationId in that state (see its own comments).
+-- Eastern time for any VendorPoleId in that state (see its own comments).
 --
 -- No FK anywhere -- same reasoning as PoleTelemetry/PoleModels: this
 -- project doesn't enforce FKs where load/compute order makes it
@@ -32,7 +32,7 @@ IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'PoleTimeZones')
 BEGIN
     CREATE TABLE PoleTimeZones (
         Id              INT           IDENTITY(1,1) NOT NULL PRIMARY KEY,
-        LocationId      NVARCHAR(100) NULL,           -- NULL for provisioned poles
+        VendorPoleId      NVARCHAR(100) NULL,           -- NULL for provisioned poles
         ProvisionedPoleId NVARCHAR(64) NULL,          -- NULL for Leadsun poles
         Longitude       FLOAT         NULL,
         Latitude        FLOAT         NULL,
@@ -42,10 +42,10 @@ BEGIN
         SP_ExecId       INT           NULL
     );
 
-    -- One row per Leadsun pole (LocationId is its identifier)
-    CREATE UNIQUE NONCLUSTERED INDEX UX_PoleTimeZones_LocationId
-        ON PoleTimeZones (LocationId)
-        WHERE LocationId IS NOT NULL;
+    -- One row per Leadsun pole (VendorPoleId is its identifier)
+    CREATE UNIQUE NONCLUSTERED INDEX UX_PoleTimeZones_VendorPoleId
+        ON PoleTimeZones (VendorPoleId)
+        WHERE VendorPoleId IS NOT NULL;
 
     -- One row per provisioned pole (ProvisionedPoleId is its identifier)
     CREATE UNIQUE NONCLUSTERED INDEX UX_PoleTimeZones_ProvisionedPoleId

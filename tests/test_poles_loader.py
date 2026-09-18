@@ -19,7 +19,7 @@ class TestMapRecordToPole:
         record = make_pole_record(
             record_id="recPole001",
             pole_number="P-2002",
-            location_id="LOC-7",
+            pole_id="LOC-7",
             county_fips="12057",
             project_ids=["recProjABC"],
             customer_ids=["recCustXYZ"],
@@ -33,7 +33,7 @@ class TestMapRecordToPole:
 
         assert result["Id"] == "recPole001"
         assert result["PoleNumber"] == "P-2002"
-        assert result["LocationId"] == "LOC-7"
+        assert result["VendorPoleId"] == "LOC-7"
         assert result["CountyFips"] == "12057"
         assert result["ProjectId"] == "recProjABC"  # first (only) linked id
         assert result["CustomerId"] == "recCustXYZ"  # first (only) linked id
@@ -59,17 +59,17 @@ class TestMapRecordToPole:
         result = poles_loader._map_record_to_pole(record)
         assert result["ControllerId"] is None
 
-    def test_location_id_and_county_fips_are_read_from_separate_fields(
+    def test_pole_id_and_county_fips_are_read_from_separate_fields(
         self, make_pole_record
     ):
         """"Location ID" (the pole's own identifier) and "CountyFips"
         (that same pole's county) are unrelated Airtable fields -- must
         never get merged/confused."""
-        record = make_pole_record(location_id="LOC-99", county_fips="06037")
+        record = make_pole_record(pole_id="LOC-99", county_fips="06037")
         result = poles_loader._map_record_to_pole(record)
-        assert result["LocationId"] == "LOC-99"
+        assert result["VendorPoleId"] == "LOC-99"
         assert result["CountyFips"] == "06037"
-        assert result["LocationId"] != result["CountyFips"]
+        assert result["VendorPoleId"] != result["CountyFips"]
 
     def test_multiple_linked_projects_takes_first_id(self, make_pole_record):
         record = make_pole_record(project_ids=["recFirst", "recSecond"])
@@ -107,7 +107,7 @@ class TestMapRecordToPole:
         result = poles_loader._map_record_to_pole(record)
 
         assert result["PoleNumber"] is None
-        assert result["LocationId"] is None
+        assert result["VendorPoleId"] is None
         assert result["CountyFips"] is None
         assert result["ProjectId"] is None
         assert result["CustomerId"] is None
