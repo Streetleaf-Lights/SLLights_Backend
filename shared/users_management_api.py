@@ -374,10 +374,16 @@ def register_user(token: str, password: str) -> dict:
     }
 
 
-def sign_in(email: str, password: str) -> dict:
+def sign_in(email: str, password: str, impersonate_customer_id: str = None) -> dict:
     """
     Verifies email/password and, if valid, creates a new session.
     Deliberately generic error for every failure mode.
+
+    Impersonation (debugging only): if impersonate_customer_id is supplied
+    and the signing-in user is a Streetleaf Admin, the session is created
+    with role 'Customer Owner' scoped to that customer instead of their
+    actual role. The JWT still carries their real user Id so audit trails
+    are intact. Non-Streetleaf-Admin users cannot use this parameter.
     """
     conn = get_connection()
     cursor = conn.cursor()
@@ -396,8 +402,29 @@ def sign_in(email: str, password: str) -> dict:
         if not verify_password(password, password_hash):
             raise AuthError("invalid email or password", status_code=401)
 
+        session_role = role
+        session_customer_id = customer_id
+
+        if impersonate_customer_id:
+            if role != "Streetleaf Admin":
+                raise AuthError(
+                    "only a Streetleaf Admin can sign in with a customerId",
+                    status_code=403,
+                )
+            cursor.execute(
+                "SELECT 1 FROM Customers WHERE Id = ?",
+                impersonate_customer_id,
+            )
+            if cursor.fetchone() is None:
+                raise AuthError(
+                    "customerId does not match any customer",
+                    status_code=404,
+                )
+            session_role = "Customer Owner"
+            session_customer_id = impersonate_customer_id
+
         user_id_str = str(user_id)
-        session_token = create_session(cursor, user_id_str, role, customer_id)
+        session_token = create_session(cursor, user_id_str, session_role, session_customer_id)
         conn.commit()
     finally:
         cursor.close()
@@ -405,7 +432,13 @@ def sign_in(email: str, password: str) -> dict:
 
     return {
         "token": session_token,
-        "user": {"id": user_id_str, "name": name, "email": email, "role": role, "customerId": customer_id},
+        "user": {
+            "id": user_id_str,
+            "name": name,
+            "email": email,
+            "role": session_role,
+            "customerId": session_customer_id,
+        },
     }
 
 

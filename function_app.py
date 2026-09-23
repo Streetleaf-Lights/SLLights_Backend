@@ -898,7 +898,11 @@ def signIn(req: func.HttpRequest) -> func.HttpResponse:
     """
     try:
         body = req.get_json()
-        result = sign_in(email=body.get("email"), password=body.get("password"))
+        result = sign_in(
+            email=body.get("email"),
+            password=body.get("password"),
+            impersonate_customer_id=body.get("customerId"),
+        )
     except AuthError as ex:
         return _auth_error_response(ex)
     except Exception as ex:

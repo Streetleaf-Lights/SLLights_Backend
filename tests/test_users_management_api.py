@@ -497,6 +497,52 @@ class TestSignIn:
         assert result["user"]["email"] == "jane@example.com"
 
 
+    def test_streetleaf_admin_can_sign_in_as_customer_owner_with_customer_id(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        correct_hash = auth_utils.hash_password("correctpassword")
+        mock_cursor.fetchone.side_effect = [
+            ("admin1", "Admin", "Streetleaf Admin", "Active", None, correct_hash),
+            ("cust1",),  # customer exists
+        ]
+
+        result = users_management_api.sign_in(
+            "admin@streetleaf.com", "correctpassword", impersonate_customer_id="cust1"
+        )
+
+        payload = pyjwt.decode(result["token"], "test-jwt-secret", algorithms=["HS256"])
+        assert payload["sub"] == "admin1"
+        assert payload["role"] == "Customer Owner"
+        assert result["user"]["role"] == "Customer Owner"
+        assert result["user"]["customerId"] == "cust1"
+
+    def test_invalid_customer_id_raises_404(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        correct_hash = auth_utils.hash_password("correctpassword")
+        # First fetchone = user row, second = customer lookup → None
+        mock_cursor.fetchone.side_effect = [
+            ("admin1", "Admin", "Streetleaf Admin", "Active", None, correct_hash),
+            None,
+        ]
+
+        with pytest.raises(auth_utils.AuthError, match="does not match any customer"):
+            users_management_api.sign_in(
+                "admin@streetleaf.com", "correctpassword", impersonate_customer_id="invalid-id"
+            )
+
+    def test_non_streetleaf_admin_cannot_impersonate(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        correct_hash = auth_utils.hash_password("correctpassword")
+        mock_cursor.fetchone.return_value = ("user1", "Jane", "Customer Admin", "Active", "cust1", correct_hash)
+
+        with pytest.raises(auth_utils.AuthError, match="only a Streetleaf Admin"):
+            users_management_api.sign_in(
+                "jane@example.com", "correctpassword", impersonate_customer_id="cust2"
+            )
+
+
 class TestSignOut:
     def test_revokes_the_callers_own_session(
         self, patch_get_connection_users_management, mock_conn, mock_cursor
