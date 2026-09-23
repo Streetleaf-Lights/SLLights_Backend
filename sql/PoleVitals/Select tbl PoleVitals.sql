@@ -12,7 +12,8 @@ WITH PoleContext AS (
         VendorPoleId  AS LeadsunVendorPoleId,
         ProvisionedPoleId AS ProvisionedPoleId
     FROM Poles
-    WHERE PoleNumber = 'TESTSL1-1002'  -- ← change filter here
+    WHERE 1=1 
+    AND PoleNumber = 'TESTSL1-1004'  -- ← change filter here
     -- WHERE PoleId = 'DRH-Orl'
     -- WHERE ProvisionedPoleId = '0a10aced202194944a071358'
 ),

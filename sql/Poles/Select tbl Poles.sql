@@ -21,12 +21,13 @@ SELECT --TOP (1000)
 --   AND [VendorPoleId] = 'WREC-1044'
     -- AND VendorPoleId LIKE '%jacks%'
     -- AND PoleNumber = 'TESTSL1-1001'
-    AND PoleNumber LIKE '%TESTSL1-100%'
+    -- AND PoleNumber LIKE '%TESTSL1-100%'
     -- AND (Long IS NULL OR Lat IS NULL)
-    -- AND CountyFips IS NOT NULL
+    -- AND CountyFips IS NULL
     -- AND ControllerId IS NULL
     -- AND ProjectId = 'recsfujvjjvIbycaZ'
     -- AND Active = 1
+    -- AND PoleModelId IS NOT NULL
   ORDER BY [VendorPoleId], [PoleNumber] DESC;
 
 -- SELECT VendorPoleId, COUNT(*) AS PoleCount
@@ -59,3 +60,8 @@ SELECT --TOP (1000)
 --   AND ctz.FIPS IS NULL
 -- GROUP BY p.CountyFips
 -- ORDER BY PoleCount DESC;
+
+SELECT a.PoleNumber
+FROM Poles a
+LEFT JOIN PoleTelemetry b ON a.VendorPoleId = b.PoleId
+WHERE b.PoleId IS NULL;

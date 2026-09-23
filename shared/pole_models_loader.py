@@ -293,7 +293,13 @@ def load_leadsun_pole_models() -> None:
 
         for batch in _chunked(param_rows, _UPSERT_BATCH_SIZE):
             try:
-                cursor.executemany(_STAGING_INSERT_SQL, batch)
+                # Per-row cursor.execute() instead of executemany() -- fast_executemany
+                # pre-allocates fixed-width buffers from the first row's values, which
+                # truncates ExtraFieldsJson on any later row whose JSON is longer than
+                # what the first row established (HY000 / right-truncation warning).
+                # With ~28 models this is negligible overhead.
+                for row in batch:
+                    cursor.execute(_STAGING_INSERT_SQL, row)
                 cursor.execute(_MERGE_FROM_STAGING_SQL)
                 cursor.execute(_TRUNCATE_STAGING_SQL)
                 total_success += len(batch)

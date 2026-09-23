@@ -79,34 +79,34 @@ class TestComputePoleStatusLabels:
     def test_no_telemetry_at_all_gives_all_five_none(self):
         result = self._labels(has_telemetry=False)
         assert result == {
-            "lightStatusLabel": None,
-            "panelStatusLabel": None,
+            "lightStatusText": None,
+            "panelStatusText": None,
             "panelIdleReason": None,
-            "batteryStatusLabel": None,
+            "batteryStatusText": None,
             "electricCurrentAverage": None,
         }
 
-    # -- lightStatusLabel --
+    # -- lightStatusText --
 
     def test_light_status_on_when_lamp_power_sum_positive(self):
-        assert self._labels(lamp_power_1=5.0, lamp_power_2=0)["lightStatusLabel"] == "ON"
+        assert self._labels(lamp_power_1=5.0, lamp_power_2=0)["lightStatusText"] == "ON"
 
     def test_light_status_off_when_lamp_power_sum_zero(self):
-        assert self._labels(lamp_power_1=0, lamp_power_2=0)["lightStatusLabel"] == "OFF"
+        assert self._labels(lamp_power_1=0, lamp_power_2=0)["lightStatusText"] == "OFF"
 
     def test_light_status_treats_a_null_individual_reading_as_zero(self):
-        assert self._labels(lamp_power_1=None, lamp_power_2=3.0)["lightStatusLabel"] == "ON"
-        assert self._labels(lamp_power_1=None, lamp_power_2=0)["lightStatusLabel"] == "OFF"
+        assert self._labels(lamp_power_1=None, lamp_power_2=3.0)["lightStatusText"] == "ON"
+        assert self._labels(lamp_power_1=None, lamp_power_2=0)["lightStatusText"] == "OFF"
 
-    # -- panelStatusLabel --
+    # -- panelStatusText --
 
     def test_panel_status_charging_when_product_positive(self):
         result = self._labels(solar_board_voltage=18.0, solar_board_elec_current=2.0)
-        assert result["panelStatusLabel"] == "Charging"
+        assert result["panelStatusText"] == "Charging"
 
     def test_panel_status_idle_when_either_factor_zero(self):
-        assert self._labels(solar_board_voltage=0, solar_board_elec_current=2.0)["panelStatusLabel"] == "Idle"
-        assert self._labels(solar_board_voltage=18.0, solar_board_elec_current=0)["panelStatusLabel"] == "Idle"
+        assert self._labels(solar_board_voltage=0, solar_board_elec_current=2.0)["panelStatusText"] == "Idle"
+        assert self._labels(solar_board_voltage=18.0, solar_board_elec_current=0)["panelStatusText"] == "Idle"
 
     # -- panelIdleReason --
 
@@ -140,7 +140,7 @@ class TestComputePoleStatusLabels:
         assert result["panelIdleReason"] == "N/A"
 
     def test_panel_idle_reason_is_none_when_panel_status_is_charging(self):
-        """Only computed when panelStatusLabel is actually "Idle" -- a
+        """Only computed when panelStatusText is actually "Idle" -- a
         panel that's actively charging has no "idle reason" at all,
         even if IsDaylightForPanelFault or the battery-current sum
         would otherwise satisfy one of the idle conditions."""
@@ -148,14 +148,14 @@ class TestComputePoleStatusLabels:
             solar_board_voltage=18.0, solar_board_elec_current=2.0,
             is_daylight_for_panel_fault=0,
         )
-        assert result["panelStatusLabel"] == "Charging"
+        assert result["panelStatusText"] == "Charging"
         assert result["panelIdleReason"] is None
 
         result = self._labels(
             solar_board_voltage=18.0, solar_board_elec_current=2.0,
             battery_elec_current_1=100, battery_elec_current_2=100,
         )
-        assert result["panelStatusLabel"] == "Charging"
+        assert result["panelStatusText"] == "Charging"
         assert result["panelIdleReason"] is None
 
     def test_panel_idle_reason_is_computed_when_panel_status_is_idle(self):
@@ -163,29 +163,29 @@ class TestComputePoleStatusLabels:
             solar_board_voltage=0, solar_board_elec_current=0,
             is_daylight_for_panel_fault=0,
         )
-        assert result["panelStatusLabel"] == "Idle"
+        assert result["panelStatusText"] == "Idle"
         assert result["panelIdleReason"] == "Sundown"
 
-    # -- batteryStatusLabel --
+    # -- batteryStatusText --
 
     def test_battery_status_full_when_current_sum_200(self):
         result = self._labels(battery_elec_current_1=100, battery_elec_current_2=100, lamp_power_1=5.0)
-        assert result["batteryStatusLabel"] == "Full"
+        assert result["batteryStatusText"] == "Full"
 
     def test_battery_status_discharging_when_not_full_and_lamp_on(self):
         result = self._labels(battery_elec_current_1=50, battery_elec_current_2=50, lamp_power_1=5.0)
-        assert result["batteryStatusLabel"] == "Discharging"
+        assert result["batteryStatusText"] == "Discharging"
 
     def test_battery_status_charging_when_not_full_and_lamp_off(self):
         result = self._labels(battery_elec_current_1=50, battery_elec_current_2=50, lamp_power_1=0, lamp_power_2=0)
-        assert result["batteryStatusLabel"] == "Charging"
+        assert result["batteryStatusText"] == "Charging"
 
     def test_battery_status_full_takes_priority_over_discharging(self):
         """Full is checked BEFORE the lamp-on check, per the requested
         ordering -- a fully-charged battery reports Full even if the
         lamp also happens to be on."""
         result = self._labels(battery_elec_current_1=100, battery_elec_current_2=100, lamp_power_1=5.0)
-        assert result["batteryStatusLabel"] == "Full"
+        assert result["batteryStatusText"] == "Full"
 
     # -- electricCurrentAverage --
 
@@ -204,8 +204,8 @@ class TestComputePoleStatusLabels:
 
 class TestComputeReportingStalenessLabel:
     """Direct unit tests, per explicit request: this drives
-    overallStatusLabel and the lightStatusLabel/panelStatusLabel/
-    batteryStatusLabel override, both in pole_vitals_api.py's own
+    overallStatusText and the lightStatusText/panelStatusText/
+    batteryStatusText override, both in pole_vitals_api.py's own
     getPoleVitals -- see that module's _compute_pole_vitals_status_fields()."""
 
     def test_none_last_update_is_not_reporting(self):
@@ -247,34 +247,34 @@ class TestComputeReportingStalenessLabel:
 
 
 class TestComputePoleConnectivityLabels:
-    """Direct unit tests for connectedLabel/overallStatusLabel, per
+    """Direct unit tests for connectedText/overallStatusText, per
     explicit request."""
 
-    # -- connectedLabel --
+    # -- connectedText --
 
     def test_online_true_is_online(self):
         result = api_utils.compute_pole_connectivity_labels(
             is_online=True, is_pole_fault=False, last_update="2026-08-28 10:00:00 -04:00"
         )
-        assert result["connectedLabel"] == "Online"
+        assert result["connectedText"] == "Online"
 
     def test_online_false_is_offline(self):
         result = api_utils.compute_pole_connectivity_labels(
             is_online=False, is_pole_fault=False, last_update="2026-08-28 10:00:00 -04:00"
         )
-        assert result["connectedLabel"] == "Offline"
+        assert result["connectedText"] == "Offline"
 
     def test_online_none_with_last_update_is_disconnected(self):
         result = api_utils.compute_pole_connectivity_labels(
             is_online=None, is_pole_fault=False, last_update="2026-08-28 10:00:00 -04:00"
         )
-        assert result["connectedLabel"] == "Disconnected"
+        assert result["connectedText"] == "Disconnected"
 
     def test_online_none_without_last_update_is_unknown(self):
         result = api_utils.compute_pole_connectivity_labels(
             is_online=None, is_pole_fault=False, last_update=None
         )
-        assert result["connectedLabel"] == "Unknown"
+        assert result["connectedText"] == "Unknown"
 
     def test_online_true_takes_priority_even_without_last_update(self):
         """Per spec: isOnline=true -> Online, unconditionally -- not
@@ -282,22 +282,22 @@ class TestComputePoleConnectivityLabels:
         result = api_utils.compute_pole_connectivity_labels(
             is_online=True, is_pole_fault=False, last_update=None
         )
-        assert result["connectedLabel"] == "Online"
+        assert result["connectedText"] == "Online"
 
-    # -- overallStatusLabel --
+    # -- overallStatusText --
 
     def test_null_last_update_is_not_reporting(self):
         result = api_utils.compute_pole_connectivity_labels(
             is_online=True, is_pole_fault=True, last_update=None
         )
-        assert result["overallStatusLabel"] == "Not Reporting"
+        assert result["overallStatusText"] == "Not Reporting"
 
     def test_stale_last_update_is_not_reporting_48h(self):
         with freeze_time("2026-08-28 12:00:00"):
             result = api_utils.compute_pole_connectivity_labels(
                 is_online=True, is_pole_fault=True, last_update="2026-08-20 08:00:00 -04:00"
             )
-        assert result["overallStatusLabel"] == "Not Reporting 48H"
+        assert result["overallStatusText"] == "Not Reporting 48H"
 
     def test_staleness_takes_priority_over_fault(self):
         """Not Reporting (48H) wins even when isPoleFault=True -- a
@@ -305,21 +305,21 @@ class TestComputePoleConnectivityLabels:
         result = api_utils.compute_pole_connectivity_labels(
             is_online=None, is_pole_fault=True, last_update=None
         )
-        assert result["overallStatusLabel"] == "Not Reporting"
+        assert result["overallStatusText"] == "Not Reporting"
 
     def test_pole_fault_true_is_fault(self):
         with freeze_time("2026-08-28 12:00:00"):
             result = api_utils.compute_pole_connectivity_labels(
                 is_online=True, is_pole_fault=True, last_update="2026-08-28 10:00:00 -04:00"
             )
-        assert result["overallStatusLabel"] == "Fault"
+        assert result["overallStatusText"] == "Fault"
 
     def test_pole_fault_false_is_ok(self):
         with freeze_time("2026-08-28 12:00:00"):
             result = api_utils.compute_pole_connectivity_labels(
                 is_online=True, is_pole_fault=False, last_update="2026-08-28 10:00:00 -04:00"
             )
-        assert result["overallStatusLabel"] == "OK"
+        assert result["overallStatusText"] == "OK"
 
 
 class TestComputePoleLocalSunset:

@@ -306,10 +306,29 @@ CREATE TABLE #PoleTelemetryStaging (
 );
 """
 
+# Separate statement -- pyodbc cannot execute CREATE TABLE and CREATE INDEX
+# in a single cursor.execute() call. Executed immediately after _STAGING_TABLE_SQL.
+# Clustered index on the MERGE join key so SQL Server can seek rather than
+# scan the staging table for each row in the target. Without this, a full
+# staging-table scan per target row makes the MERGE O(N×M) instead of O(N+M).
+_STAGING_INDEX_SQL = """
+CREATE CLUSTERED INDEX IX_PoleTelemetryStaging_PoleId_LastUpload
+    ON #PoleTelemetryStaging (PoleId, LastUpload);
+"""
+
 _STAGING_INSERT_SQL = (
     f"INSERT INTO #PoleTelemetryStaging ({_sql_column_list(_ALL_COLUMNS)})\n"
     f"VALUES ({_sql_placeholder_list(_ALL_COLUMNS)})"
 )
+
+# Index of ExtraFieldsJson in _ALL_COLUMNS -- used by setinputsizes to
+# pre-declare it as SQL_WVARCHAR MAX so fast_executemany doesn't infer a
+# fixed buffer width from the first row and truncate longer values (HY000).
+_EXTRA_FIELDS_JSON_COL_INDEX = _ALL_COLUMNS.index("ExtraFieldsJson")
+
+# pyodbc SQL type constants for setinputsizes
+import pyodbc as _pyodbc
+_SQL_WVARCHAR_MAX = (_pyodbc.SQL_WVARCHAR, 0, 0)  # size 0 = MAX
 
 # Diff-checked via INTERSECT (NULL-safe across the mixed column types
 # here -- floats, ints, strings, datetimes, a bit).
@@ -362,7 +381,6 @@ def load_leadsun_pole_telemetry() -> None:
     start_time = _to_dto_string(_now_eastern())
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.fast_executemany = True
 
     sp_exec_id = None
     total_success = 0
@@ -413,16 +431,25 @@ def load_leadsun_pole_telemetry() -> None:
             is_open_issue_fault = mapped["PoleId"] in open_issue_pole_ids
             param_rows.append(_build_row(mapped, sp_exec_id, is_open_issue_fault))
 
-        if param_rows:
-            cursor.execute(_STAGING_TABLE_SQL)
-
         for batch in _chunked(param_rows, _UPSERT_BATCH_SIZE):
             try:
+                cursor.execute(_STAGING_TABLE_SQL)
+                cursor.execute(_STAGING_INDEX_SQL)
+                # fast_executemany stages all rows in one network round-trip.
+                # setinputsizes pre-declares ExtraFieldsJson as NVARCHAR(MAX)
+                # so pyodbc doesn't infer a fixed buffer width from the first
+                # row and truncate longer values (HY000 right-truncation).
+                cursor.fast_executemany = True
+                input_sizes = [None] * len(_ALL_COLUMNS)
+                input_sizes[_EXTRA_FIELDS_JSON_COL_INDEX] = _SQL_WVARCHAR_MAX
+                cursor.setinputsizes(input_sizes)
                 cursor.executemany(_STAGING_INSERT_SQL, batch)
+                cursor.fast_executemany = False
                 cursor.execute(_MERGE_FROM_STAGING_SQL)
                 cursor.execute(_TRUNCATE_STAGING_SQL)
                 total_success += len(batch)
             except Exception as batch_error:
+                cursor.fast_executemany = False
                 logging.warning(
                     "loadPoleTelemetry: chunk of %d failed to bulk-merge (%s); retrying row-by-row.",
                     len(batch),
@@ -437,7 +464,7 @@ def load_leadsun_pole_telemetry() -> None:
                         total_errors += 1
                         logging.error(
                             "loadPoleTelemetry: failed to upsert %s: %s",
-                            row[0],  # PoleId is the first positional param
+                            row[0],
                             row_error,
                         )
 

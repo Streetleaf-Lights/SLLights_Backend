@@ -288,38 +288,24 @@ def loadDeviceDataManual(req: func.HttpRequest) -> func.HttpResponse:
 # --------------------------------------------------------------------------
 # loadProvisionedPoleTelemetry -- EVENT-DRIVEN, not timer/HTTP-triggered
 # like everything else in this file. Streetleaf's own provisioned poles
-# push real-time telemetry to an Azure Event Hub (namespace
-# ProvisionTestEventHub, event hub provisiontesteventhub); this function
-# fires automatically whenever new messages arrive, rather than on a
-# schedule this project controls. See shared/provisioned_telemetry_loader.py's
+# push real-time telemetry to an Azure Event Hub; this function fires
+# automatically whenever new messages arrive, rather than on a schedule
+# this project controls. See shared/provisioned_telemetry_loader.py's
 # own module docstring for the full message shape/field mapping.
 #
-# cardinality="many": receives a BATCH of messages per invocation (a
-# Python list, even when Azure only had one message ready), not one
-# message per invocation -- lets process_provisioned_telemetry_events()
-# reuse the same chunked staging/MERGE upsert pattern every other loader
-# here already uses, instead of a much less efficient single-row upsert
-# per function invocation.
+# cardinality="many": receives a batch of messages per invocation (a
+# Python list, even when Azure only had one message ready), letting
+# process_provisioned_telemetry_events() reuse the same chunked
+# staging/MERGE upsert pattern every other loader uses.
 #
-# connection="PROVISIONED_EVENT_HUB_CONNECTION_STRING": an app setting
-# holding that Event Hub instance's own connection string (Azure's own
-# per-Event-Hub connection string already includes
-# "EntityPath=provisiontesteventhub", so event_hub_name below is
-# supplied explicitly anyway, for clarity, not because the connection
-# string itself is ambiguous without it).
-#
-# consumer_group="iothub-consumer-group": a DEDICATED consumer group for
-# this function, not the shared $Default one -- so this function's own
-# checkpoint position (how far it's read) never collides with any other
-# reader of this same Event Hub, present or future. This consumer group
-# must already exist on the Event Hub itself (Azure Portal -> the Event
-# Hub -> Consumer Groups -> +Consumer Group) before this function can
-# use it -- creating/naming it here in code doesn't provision it on the
-# Event Hub side.
-#
-# No Dev-environment skip, unlike loadAirTableData/loadDeviceData --
-# there's no equivalent "wait for a schedule" concept to skip; a message
-# either exists to process or it doesn't, in every environment alike.
+# Dev-environment skip: unlike the timer-triggered loaders (where
+# skipping means "don't run until manually triggered"), an Event Hub
+# trigger fires automatically whenever messages arrive. In Dev we drop
+# incoming events immediately rather than processing them -- Dev has no
+# real provisioned poles pushing data, and processing real events
+# automatically is undesirable in a dev environment. Use
+# loadDeviceDataManual to trigger the downstream loaders (daylight flags,
+# vitals) on demand in Dev.
 @app.event_hub_message_trigger(
     arg_name="events",
     event_hub_name="provisiontesteventhub",
@@ -328,6 +314,13 @@ def loadDeviceDataManual(req: func.HttpRequest) -> func.HttpResponse:
     cardinality="many",
 )
 def loadProvisionedPoleTelemetry(events: List[func.EventHubEvent]) -> None:
+    if ENVIRONMENT == "Dev":
+        logging.info(
+            "loadProvisionedPoleTelemetry: skipping %d event(s) in Dev -- "
+            "use loadDeviceDataManual to trigger downstream loaders on demand.",
+            len(events),
+        )
+        return
     parsed_events = [json.loads(event.get_body()) for event in events]
     logging.info(
         "loadProvisionedPoleTelemetry: received %d event(s).", len(parsed_events)

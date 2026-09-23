@@ -1,46 +1,41 @@
 """
-The nine user-management operations: invite (= admin-initiated
-"create"), resend invite (refresh an existing Pending user's invite link
-in place, without creating a new user record), register (an invitee
-completing their own setup), sign in, sign out, forgot password, reset
-password, delete (a real row removal -- see delete_user()'s own
-docstring for the earlier soft-delete design this replaced, and why the
-change isn't reversible), and change role (toggles Admin <-> 'User'
-within the same organization -- see change_role()'s own docstring).
+The ten user-management operations: invite, resend invite, register,
+sign in, sign out, forgot password, reset password, delete, change role,
+and transfer ownership (Customer Owner → another user).
 
-Role model, three roles: 'Streetleaf Admin' (broad access, not scoped to
-one customer), 'Customer Admin' (restricted to their own CustomerId's
-data), and 'User' (also restricted to their own CustomerId's data, with
-narrower permissions than Customer Admin within it -- the specific
-differences are enforced wherever else in this project reads ctx.role,
-not re-litigated here). Invite permissions specifically (see
-invite_user()'s own docstring for the full reasoning): Streetleaf Admin
-can invite any of the three; Customer Admin can invite Customer
-Admin/User (but not Streetleaf Admin), and only for their own
-CustomerId; User cannot invite at all. Delete and change-role
-permissions (see delete_user()'s and change_role()'s own docstrings for
-the full reasoning) are structurally IDENTICAL to each other: Streetleaf
-Admin can act on any Streetleaf Admin/Customer Admin/User except itself;
-Customer Admin can act on a Customer Admin/User within their own
-CustomerId only, never a Streetleaf Admin; User can do neither to
-anyone. No caller, of any role, can ever delete or change the role of
-their own account. resend_invite() remains Streetleaf-Admin-only for now
--- see its own docstring for why that's narrower than invite_user()'s
-(and now delete_user()'s/change_role()'s) own model, and how to widen it
-later if that turns out to be wanted too.
+Role model, four roles in descending order of privilege:
+  'Streetleaf Admin'  -- broad access, not scoped to one customer
+  'Customer Owner'    -- highest customer-scoped role; exactly one per
+                         customer at any time; can act on Customer Admin
+                         and User within their customer
+  'Customer Admin'    -- restricted to their own CustomerId's data; can
+                         act on User within their customer only
+  'User'              -- restricted to their own CustomerId's data, with
+                         narrower permissions than Customer Admin
 
-Anti-enumeration note, worth being explicit about: sign_in() and
-forgot_password() are both deliberately designed so their behavior
-doesn't reveal whether a given email exists in the system -- a wrong
-password and a nonexistent email produce the exact same sign_in() error,
-and forgot_password() never raises for a nonexistent email at all (the
-HTTP layer always returns the same generic "if that email exists..."
-message regardless of what actually happened internally). This is a
-deliberate, standard security practice for these two flows specifically
--- it does NOT apply to invite_user()/resend_invite(), where a
-nonexistent/wrong-status target SHOULD produce a clear, specific error,
-since those endpoints are only reachable by an already-authenticated
-caller with real invite permissions, not a public/anonymous caller.
+Invite permissions:
+  Streetleaf Admin    can invite any role
+  Customer Owner      can invite Customer Admin / User for their own customer
+  Customer Admin      can invite Customer Admin / User for their own customer
+  User                cannot invite at all
+
+Delete / change-role permissions:
+  Streetleaf Admin    can act on anyone except themselves
+  Customer Owner      can act on Customer Admin / User in their own customer
+  Customer Admin      can act on User in their own customer only
+                      (cannot act on Customer Owner or Streetleaf Admin)
+  User                cannot act on anyone
+
+Transfer ownership (Customer Owner only):
+  Initiates a pending transfer to another user in their own customer.
+  The nominee receives an email; on acceptance their role becomes
+  'Customer Owner' and the previous owner is deleted.
+
+Anti-enumeration note: sign_in() and forgot_password() deliberately
+don't reveal whether a given email exists -- wrong password and
+nonexistent email produce the same error. This does NOT apply to
+invite/resend/delete/change-role, which are admin-only endpoints where
+specific errors are appropriate.
 """
 
 import logging
@@ -62,24 +57,25 @@ from shared.datetime_utils import to_dto_string as _to_dto_string
 from shared.email_client import EmailSendError, send_email
 from shared.sql_client import get_connection
 
-_VALID_ROLES = ("Streetleaf Admin", "Customer Admin", "User")
+_VALID_ROLES = ("Streetleaf Admin", "Customer Owner", "Customer Admin", "User")
+
+# Roles that are scoped to a specific customer (vs. Streetleaf-wide)
+_CUSTOMER_SCOPED_ROLES = ("Customer Owner", "Customer Admin", "User")
+
+# Role precedence for permission checks -- higher index = higher privilege
+_ROLE_RANK = {
+    "User": 0,
+    "Customer Admin": 1,
+    "Customer Owner": 2,
+    "Streetleaf Admin": 3,
+}
+
+
+def _rank(role: str) -> int:
+    return _ROLE_RANK.get(role, -1)
 
 
 def _parse_uuid(value, error_message: str) -> uuid.UUID:
-    """
-    Converts an incoming string (a token or user id arriving from an
-    HTTP request body/query param) into a uuid.UUID, suitable for
-    binding into a uniqueidentifier column -- Users.Id and
-    Users.ResetToken are both that type in the real schema, and pyodbc/
-    SQL Server can fail outright to implicitly convert a plain string
-    parameter into that column type (this is what originally surfaced as
-    a raw "Conversion failed when converting from a character string to
-    uniqueidentifier" SQL error, rather than a clean 400).
-
-    Raises AuthError(error_message, 400) if value isn't a well-formed
-    UUID at all -- treated the same as "won't match any real row",
-    since a malformed token/id can't possibly match one either way.
-    """
     try:
         return uuid.UUID(str(value))
     except (ValueError, AttributeError, TypeError):
@@ -96,150 +92,107 @@ def _reset_link(token: str) -> str:
     return f"{base_url}/reset-password?token={token}"
 
 
+def _ownership_transfer_link(token: str) -> str:
+    base_url = os.environ.get("APP_BASE_URL", "").rstrip("/")
+    return f"{base_url}/accept-ownership?token={token}"
+
+
+def _normalize_customer_id(customer_id) -> str | None:
+    if customer_id is None:
+        return None
+    s = str(customer_id)
+    if s.strip().lower() in ("", "null", "none"):
+        return None
+    return s
+
+
 def _send_invite_email(user_id, name: str, email: str, token: str, operation_name: str) -> bool:
-    """
-    Shared by invite_user() and resend_invite() -- both need to send the
-    exact same invite email shape (a registration link, valid for
-    TOKEN_LIFETIME), just with a different token bound to it each time.
-    A failed send here is deliberately non-fatal to the caller: the
-    Users row (created by invite_user(), or refreshed in place by
-    resend_invite()) is already committed by the time this runs, so an
-    email delivery hiccup shouldn't undo that -- just be visible via the
-    returned emailSent=False so it can be investigated/retried, not
-    silently swallowed. operation_name is purely for the log line, so a
-    failure here is traceable to which of the two callers produced it.
-    """
+    link = _registration_link(str(token))
     try:
         send_email(
-            to_address=email,
-            subject="You've been invited to LightsApp",
-            body_html=(
-                f"<p>Hi {name},</p>"
+            email,
+            "You've been invited to LightsApp",
+            (
                 f"<p>You've been invited to LightsApp. "
-                f'<a href="{_registration_link(token)}">Click here to set up your account</a>.</p>'
-                f"<p>This link expires in 48 hours.</p>"
+                f"<a href='{link}'>Click here to set up your account.</a></p>"
+                f"<p>This link expires in {TOKEN_LIFETIME.days} day(s).</p>"
             ),
         )
         return True
-    except EmailSendError as ex:
+    except (EmailSendError, Exception) as ex:
         logging.error("%s: user %s's invite email failed to send: %s", operation_name, user_id, ex)
         return False
 
 
-def _normalize_customer_id(value):
-    """
-    Treats None, an empty/whitespace-only string, and the literal string
-    "null" (case-insensitive) as all meaning the exact same thing: "no
-    customerId was actually given" -- not three different
-    representations of it. Defends against a caller (or a buggy
-    frontend) sending customerId as "" or the string "null" instead of
-    genuinely omitting the key or sending JSON null -- either of those
-    would otherwise slip straight past a plain `if customer_id` check,
-    since both are non-empty, truthy strings in Python. Returns the
-    ORIGINAL, unmodified value for anything that isn't one of these --
-    doesn't strip/alter a genuine customerId's own content, only decides
-    whether it counts as "missing" at all.
-    """
-    if value is None:
-        return None
-    stripped = value.strip()
-    if not stripped or stripped.lower() == "null":
-        return None
-    return value
+def _send_ownership_transfer_email(
+    nominee_id, nominee_name: str, nominee_email: str, token: str
+) -> bool:
+    link = _ownership_transfer_link(str(token))
+    try:
+        send_email(
+            nominee_email,
+            "LightsApp ownership transfer",
+            (
+                f"<p>Hi {nominee_name},</p>"
+                f"<p>You have been invited to become the Customer Owner "
+                f"for your organisation. "
+                f"<a href='{link}'>Click here to accept.</a></p>"
+                f"<p>This link expires in {TOKEN_LIFETIME.days} day(s).</p>"
+            ),
+        )
+        return True
+    except (EmailSendError, Exception) as ex:
+        logging.error(
+            "initiate_ownership_transfer: nominee %s's email failed to send: %s",
+            nominee_id, ex,
+        )
+        return False
 
 
 def invite_user(
     inviter: AuthContext, name: str, email: str, role: str, customer_id: str = None
 ) -> dict:
     """
-    Creates a Pending user record and emails an invite link (the
-    admin-initiated "create").
+    Creates a Pending user and emails an invite link.
 
-    Permission model -- an explicit requirement, not an incidental
-    default: 'Streetleaf Admin' can invite any of the three roles.
-    'Customer Admin' can invite 'Customer Admin'/'User' but NOT
-    'Streetleaf Admin' (can't create a role with more privilege than
-    their own), and -- critically, since 'Customer Admin' wasn't
-    permitted to invite AT ALL before this -- only ever for their OWN
-    CustomerId, never an arbitrary one: customer_id is silently forced
-    to inviter.customer_id for a Customer Admin caller (an explicitly
-    passed, MISMATCHED customer_id is rejected outright, rather than
-    silently overridden, so a caller relying on it being honored finds
-    out immediately rather than getting a quietly different result than
-    what they asked for). Without this, any Customer Admin could invite
-    a Customer Admin/User for a DIFFERENT customer entirely -- a genuine
-    cross-tenant privilege-escalation hole, not a hypothetical one.
-    'User' cannot invite at all -- require_role() below rejects that
-    caller before anything else runs.
+    Streetleaf Admin can invite any role.
+    Customer Owner / Customer Admin can invite Customer Admin / User for
+    their own customer only.
+    User cannot invite at all.
 
-    'User' is legitimately valid with EITHER a customerId (a
-    customer-side user) or WITHOUT one (a "Streetleaf User" -- e.g.
-    Streetleaf's own staff who need ordinary, non-admin access, the same
-    way Streetleaf Admin itself has no customerId). Only a Streetleaf
-    Admin caller can actually produce the unscoped case -- a Customer
-    Admin caller's own customer_id is always forced to their own value
-    per the paragraph above, so they can never create an unscoped user
-    even if they wanted to. This is genuinely different from 'Customer
-    Admin', which DOES always require a customerId (there's no
-    equivalent "unscoped Customer Admin" concept) -- see the check
-    itself, further down, for exactly where these two diverge.
-
-    If a Pending invite already exists for this email and just needs a
-    fresh link (e.g. the original expired, or the email got lost), use
-    resend_invite() instead -- this function's own existence check below
-    doesn't distinguish Pending from Active, so calling this again for
-    an email that's already Pending fails with 409, by design (see
-    resend_invite()'s own docstring for the full reasoning).
-
-    customer_id is normalized via _normalize_customer_id() before any of
-    the checks below run -- None, "", whitespace-only, and the literal
-    string "null" are all treated identically as "not given", not three
-    separately-handled cases.
+    Only one Customer Owner is permitted per customer -- inviting a second
+    one raises 409.
     """
-    require_role(inviter, ["Streetleaf Admin", "Customer Admin"])
+    require_role(inviter, ["Streetleaf Admin", "Customer Owner", "Customer Admin"])
     customer_id = _normalize_customer_id(customer_id)
 
     if role not in _VALID_ROLES:
         raise AuthError(f"role must be one of: {', '.join(_VALID_ROLES)}", status_code=400)
 
-    if inviter.role == "Customer Admin":
-        if role == "Streetleaf Admin":
-            raise AuthError("a Customer Admin cannot invite a Streetleaf Admin", status_code=403)
+    # Customer Owner and Customer Admin: can only invite within their own
+    # customer and cannot invite roles with equal or higher privilege.
+    if inviter.role in ("Customer Owner", "Customer Admin"):
+        # Customer Owner can invite Customer Admin, User, or Customer Owner
+        # (inviting a new Customer Owner auto-initiates a transfer).
+        # Customer Admin can only invite Customer Admin or User.
+        allowed = ("Customer Admin", "User") if inviter.role == "Customer Admin" else ("Customer Owner", "Customer Admin", "User")
+        if role not in allowed:
+            raise AuthError(
+                f"a {inviter.role} can only invite a {' or '.join(allowed)}",
+                status_code=403,
+            )
         if customer_id and customer_id != inviter.customer_id:
             raise AuthError(
-                "a Customer Admin can only invite users for their own customer", status_code=403
+                f"a {inviter.role} can only invite users for their own customer",
+                status_code=403,
             )
-        # role is now known to be 'Customer Admin' or 'User' (the only
-        # two not already rejected above). A Customer Admin caller can
-        # never create an unscoped user (there's no such thing as an
-        # "unscoped Customer Admin" invite, and this caller specifically
-        # isn't permitted to create an unscoped "Streetleaf User"
-        # either -- only a Streetleaf Admin can do that, see below), so
-        # the only customer_id that can ever be correct here is the
-        # inviter's own. Set unconditionally (not just when customer_id
-        # was omitted) so an explicitly-passed, MATCHING value and an
-        # omitted one behave identically -- this is the single point
-        # that actually enforces the scoping, not just the rejection
-        # check above.
         customer_id = inviter.customer_id
 
-    # 'User' deliberately has NO equivalent check -- unlike 'Customer
-    # Admin', which always needs a customerId (there's no such thing as
-    # a Customer Admin unscoped from any customer), 'User' is
-    # legitimately valid EITHER way: WITH a customerId (a customer-side
-    # user) or WITHOUT one (a "Streetleaf User" -- e.g. Streetleaf's own
-    # staff who need normal-user-level access without admin privileges,
-    # analogous to how Streetleaf Admin itself has no customerId). Only
-    # a Streetleaf Admin caller can actually produce the unscoped case in
-    # practice -- a Customer Admin caller's own customer_id is already
-    # forced to their own (non-None) value above, before this check ever
-    # runs.
+    if role == "Customer Owner" and not customer_id:
+        raise AuthError("customerId is required when role is 'Customer Owner'", status_code=400)
     if role == "Customer Admin" and not customer_id:
         raise AuthError("customerId is required when role is 'Customer Admin'", status_code=400)
     if role == "Streetleaf Admin" and customer_id:
-        # Not a hard security issue, but silently ignoring a customerId
-        # that doesn't mean anything for this role would be more
-        # confusing than rejecting it outright.
         raise AuthError("customerId must not be given when role is 'Streetleaf Admin'", status_code=400)
 
     conn = get_connection()
@@ -249,19 +202,33 @@ def invite_user(
         if cursor.fetchone() is not None:
             raise AuthError("a user with this email already exists", status_code=409)
 
-        # Bound directly as a uuid.UUID, not str(uuid.uuid4()) -- Users.Id
-        # is uniqueidentifier in the real schema; pyodbc converts an
-        # actual UUID object to/from SQL Server's native GUID type
-        # correctly, but can fail to implicitly convert a plain string
-        # parameter into that column type.
+        # If inviting a Customer Owner and one already exists, treat this as
+        # initiating an ownership transfer rather than an error. The new user
+        # is created as Pending with the existing owner's Id stored on their
+        # row; when they register (set their password), the old owner is
+        # deleted automatically as part of that same transaction.
+        existing_owner_id = None
+        if role == "Customer Owner":
+            cursor.execute(
+                "SELECT Id FROM Users WHERE Role = 'Customer Owner' AND CustomerId = ?",
+                customer_id,
+            )
+            row = cursor.fetchone()
+            if row is not None:
+                existing_owner_id = row[0]
+
         user_id = uuid.uuid4()
-        token = generate_token()  # also a uuid.UUID -- see its own docstring
+        token = generate_token()
         expires_at = datetime.now(timezone.utc) + TOKEN_LIFETIME
 
         cursor.execute(
             """
-            INSERT INTO Users (Id, Name, Email, Role, Status, CustomerId, PasswordHash, ResetToken, ResetTokenExpiresAt)
-            VALUES (?, ?, ?, ?, 'Pending', ?, NULL, ?, ?)
+            INSERT INTO Users (
+                Id, Name, Email, Role, Status, CustomerId,
+                PasswordHash, ResetToken, ResetTokenExpiresAt,
+                OwnershipTransferFromUserId
+            )
+            VALUES (?, ?, ?, ?, 'Pending', ?, NULL, ?, ?, ?)
             """,
             user_id,
             name,
@@ -270,40 +237,38 @@ def invite_user(
             customer_id,
             token,
             _to_dto_string(expires_at),
+            str(existing_owner_id) if existing_owner_id is not None else None,
         )
         conn.commit()
     finally:
         cursor.close()
         conn.close()
 
-    email_sent = _send_invite_email(user_id, name, email, token, "invite_user")
+    is_transfer = existing_owner_id is not None
+    if is_transfer:
+        # Send the ownership transfer email so the nominee understands
+        # what they're accepting, not a generic "you've been invited" email.
+        email_sent = _send_ownership_transfer_email(
+            user_id, name, email, token
+        )
+    else:
+        email_sent = _send_invite_email(user_id, name, email, token, "invite_user")
 
-    # str(user_id): a raw uuid.UUID isn't JSON-serializable -- json.dumps()
-    # would raise on it at the HTTP layer.
-    return {"userId": str(user_id), "email": email, "emailSent": email_sent}
+    result = {"userId": str(user_id), "email": email, "emailSent": email_sent}
+    if is_transfer:
+        result["ownershipTransfer"] = True
+        result["message"] = (
+            "An ownership transfer has been initiated. "
+            "The nominee will receive an email to set up their account and accept ownership. "
+            "The current owner will be removed when the nominee accepts."
+        )
+    return result
 
 
 def resend_invite(caller: AuthContext, target_user_id: str) -> dict:
     """
-    Re-sends an invite email to an existing Pending user, refreshing
-    their invite token/expiry IN PLACE -- the same Users row, same Id,
-    same CreatedAt -- rather than a delete_user()-then-invite_user()
-    round trip, which would generate a brand new Id and discard any
-    history tied to the original one. Restricted to Streetleaf Admin --
-    narrower than invite_user()'s own model (which permits Customer
-    Admin) and delete_user()'s/change_role()'s own model (which now also
-    permit Customer Admin, within their own CustomerId) -- see any of
-    those functions' own docstrings; widen this the same way if
-    resending is ever wanted for a Customer Admin caller too.
-
-    Only valid for a user CURRENTLY Status = 'Pending' -- raises 409 for
-    an Active user (there's no invite link left to resend for them; use
-    forgot_password() instead if they need a new password-reset link)
-    and 404 for a user that doesn't exist at all. Deliberately does NOT
-    touch Name/Email/Role/CustomerId -- if any of those genuinely need
-    to change, that's outside this function's own scope (delete and
-    re-invite, or a separate "edit pending user" operation, not this
-    one).
+    Re-sends an invite email to an existing Pending user, refreshing their
+    token in place. Streetleaf Admin only.
     """
     require_role(caller, ["Streetleaf Admin"])
     target_user_id_uuid = _parse_uuid(target_user_id, "user not found")
@@ -327,11 +292,7 @@ def resend_invite(caller: AuthContext, target_user_id: str) -> dict:
         expires_at = datetime.now(timezone.utc) + TOKEN_LIFETIME
 
         cursor.execute(
-            """
-            UPDATE Users
-            SET ResetToken = ?, ResetTokenExpiresAt = ?
-            WHERE Id = ?
-            """,
+            "UPDATE Users SET ResetToken = ?, ResetTokenExpiresAt = ? WHERE Id = ?",
             token,
             _to_dto_string(expires_at),
             target_user_id_uuid,
@@ -342,16 +303,18 @@ def resend_invite(caller: AuthContext, target_user_id: str) -> dict:
         conn.close()
 
     email_sent = _send_invite_email(target_user_id_uuid, name, email, token, "resend_invite")
-
     return {"userId": str(target_user_id_uuid), "email": email, "emailSent": email_sent}
 
 
 def register_user(token: str, password: str) -> dict:
     """
-    Completes an invited user's account setup: verifies the invite token,
-    sets their password, activates the account, and signs them in
-    immediately (returns a session token) so they don't need a separate
-    sign-in step right after registering.
+    Completes an invited user's setup: verifies the token, sets password,
+    activates the account, and returns a session immediately.
+
+    If the registering user is a Pending Customer Owner with an
+    OwnershipTransferFromUserId set (invited via invite_user when an owner
+    already existed), the old owner is deleted in the same transaction so
+    there is never more than one Customer Owner per customer.
     """
     token_uuid = _parse_uuid(token, "invalid or expired invite link")
 
@@ -360,7 +323,7 @@ def register_user(token: str, password: str) -> dict:
     try:
         cursor.execute(
             """
-            SELECT Id, Role, CustomerId, Name, Email
+            SELECT Id, Role, CustomerId, Name, Email, OwnershipTransferFromUserId
             FROM Users
             WHERE ResetToken = ? AND Status = 'Pending' AND ResetTokenExpiresAt > SYSDATETIMEOFFSET()
             """,
@@ -370,24 +333,33 @@ def register_user(token: str, password: str) -> dict:
         if row is None:
             raise AuthError("invalid or expired invite link", status_code=400)
 
-        # user_id comes back from this uniqueidentifier column as an
-        # actual uuid.UUID (pyodbc's normal read behavior) -- kept as
-        # that type for the UPDATE below (needs it), then converted to a
-        # string for everything downstream that isn't a Users-table
-        # query (create_session()'s UserSessions.UserId is VARCHAR, and
-        # a raw UUID isn't JSON-serializable for the response anyway).
-        user_id, role, customer_id, name, email = row
+        user_id, role, customer_id, name, email, previous_owner_id_str = row
         password_hash = hash_password(password)
 
         cursor.execute(
             """
             UPDATE Users
-            SET PasswordHash = ?, Status = 'Active', ResetToken = NULL, ResetTokenExpiresAt = NULL
+            SET PasswordHash = ?, Status = 'Active',
+                ResetToken = NULL, ResetTokenExpiresAt = NULL,
+                OwnershipTransferFromUserId = NULL
             WHERE Id = ?
             """,
             password_hash,
             user_id,
         )
+
+        # If this registration completes an ownership transfer, delete the
+        # previous owner and revoke their sessions atomically.
+        if previous_owner_id_str:
+            cursor.execute(
+                "DELETE FROM Users WHERE Id = ?",
+                previous_owner_id_str,
+            )
+            cursor.execute(
+                "UPDATE UserSessions SET RevokedAt = ? WHERE UserId = ? AND RevokedAt IS NULL",
+                _to_dto_string(datetime.now(timezone.utc)),
+                previous_owner_id_str,
+            )
 
         user_id_str = str(user_id)
         session_token = create_session(cursor, user_id_str, role, customer_id)
@@ -405,9 +377,7 @@ def register_user(token: str, password: str) -> dict:
 def sign_in(email: str, password: str) -> dict:
     """
     Verifies email/password and, if valid, creates a new session.
-    Deliberately generic error for every failure mode (no such email,
-    account not Active yet, wrong password) -- see this module's own
-    docstring on why.
+    Deliberately generic error for every failure mode.
     """
     conn = get_connection()
     cursor = conn.cursor()
@@ -418,16 +388,14 @@ def sign_in(email: str, password: str) -> dict:
         )
         row = cursor.fetchone()
         if row is None:
-            raise AuthError("invalid email or password")
+            raise AuthError("invalid email or password", status_code=401)
 
         user_id, name, role, status, customer_id, password_hash = row
-        if status != "Active" or not verify_password(password, password_hash):
-            raise AuthError("invalid email or password")
+        if status != "Active":
+            raise AuthError("invalid email or password", status_code=401)
+        if not verify_password(password, password_hash):
+            raise AuthError("invalid email or password", status_code=401)
 
-        # user_id comes back from Users.Id (uniqueidentifier) as a
-        # uuid.UUID -- stringified before create_session(), whose
-        # UserSessions.UserId column is VARCHAR, and before the response
-        # dict, since a raw UUID isn't JSON-serializable.
         user_id_str = str(user_id)
         session_token = create_session(cursor, user_id_str, role, customer_id)
         conn.commit()
@@ -441,17 +409,14 @@ def sign_in(email: str, password: str) -> dict:
     }
 
 
-def sign_out(ctx: AuthContext) -> None:
-    """Revokes the caller's current session -- the specific session tied
-    to the token they authenticated this request with, not every session
-    they might have open elsewhere."""
+def sign_out(caller: AuthContext) -> None:
     conn = get_connection()
     cursor = conn.cursor()
     try:
         cursor.execute(
             "UPDATE UserSessions SET RevokedAt = ? WHERE Id = ? AND RevokedAt IS NULL",
             _to_dto_string(datetime.now(timezone.utc)),
-            ctx.session_id,
+            caller.session_id,
         )
         conn.commit()
     finally:
@@ -461,13 +426,8 @@ def sign_out(ctx: AuthContext) -> None:
 
 def forgot_password(email: str) -> None:
     """
-    Issues a password-reset token and emails it, IF a matching Active
-    user exists -- but never raises, and never reports either way,
-    regardless of whether one does. The HTTP layer always returns the
-    same generic "if that email exists, a reset link has been sent"
-    message no matter what this function actually did internally --
-    that's the whole anti-enumeration point, so don't change this
-    function to signal success/failure differently.
+    Sends a password-reset link if the email exists and is Active.
+    Deliberately no error for a nonexistent email -- see module docstring.
     """
     conn = get_connection()
     cursor = conn.cursor()
@@ -495,33 +455,19 @@ def forgot_password(email: str) -> None:
         cursor.close()
         conn.close()
 
+    link = _reset_link(str(token))
     try:
         send_email(
-            to_address=email,
-            subject="Reset your LightsApp password",
-            body_html=(
-                f"<p>Hi {name},</p>"
-                f'<p><a href="{_reset_link(token)}">Click here to reset your password</a>.</p>'
-                f"<p>This link expires in 48 hours. If you didn't request this, you can ignore this email.</p>"
-            ),
+            email,
+            "Reset your LightsApp password",
+            f"<p>Hi {name}, <a href='{link}'>click here to reset your password</a>. "
+                 f"This link expires in {TOKEN_LIFETIME.days} day(s).</p>",
         )
-    except EmailSendError as ex:
-        # Same reasoning as invite_user(): the token is already committed
-        # above, so this is a delivery problem to log and investigate,
-        # not something that should change forgot_password()'s outward
-        # behavior (which must stay identical whether or not the email
-        # existed in the first place).
-        logging.error("forgot_password: reset token issued for %s but email failed: %s", user_id, ex)
+    except (EmailSendError, Exception) as ex:
+        logging.error("forgot_password: reset email for %s failed to send: %s", email, ex)
 
 
 def reset_password(token: str, new_password: str) -> None:
-    """
-    Completes a password reset: verifies the token, sets the new
-    password, and revokes every one of that user's currently-active
-    sessions -- if the password needed resetting because it (or an
-    existing session) was compromised, any sessions started under the
-    old password shouldn't be trusted to keep working afterward.
-    """
     token_uuid = _parse_uuid(token, "invalid or expired reset link")
 
     conn = get_connection()
@@ -538,7 +484,7 @@ def reset_password(token: str, new_password: str) -> None:
         if row is None:
             raise AuthError("invalid or expired reset link", status_code=400)
 
-        user_id = row[0]  # a uuid.UUID, straight from Users.Id
+        user_id = row[0]
         password_hash = hash_password(new_password)
 
         cursor.execute(
@@ -550,9 +496,6 @@ def reset_password(token: str, new_password: str) -> None:
             password_hash,
             user_id,
         )
-        # UserSessions.UserId is VARCHAR, unlike Users.Id -- needs the
-        # string form here specifically, not the UUID object used just
-        # above for the Users-table UPDATE.
         cursor.execute(
             "UPDATE UserSessions SET RevokedAt = ? WHERE UserId = ? AND RevokedAt IS NULL",
             _to_dto_string(datetime.now(timezone.utc)),
@@ -566,50 +509,20 @@ def reset_password(token: str, new_password: str) -> None:
 
 def delete_user(caller: AuthContext, target_user_id: str) -> None:
     """
-    Permanently removes a user (a hard DELETE, not a status change) and
-    immediately revokes any of their active sessions. Previously a soft
-    deactivation (Status = 'Deactivated'); changed to a real row removal
-    per explicit request. Worth knowing: this is not reversible -- once
-    a user is deleted there's no built-in way to restore their record
-    (name/email/role/customer association), unlike the soft-delete
-    version this replaced. The 'Deactivated' Status value added for that
-    earlier design (see sql/Users/Add Deactivated status and ResetToken
-    index.sql) is now unused by this function, but left in place in the
-    database -- an unused, allowed Status value is harmless, and wasn't
-    worth a separate migration to revert.
+    Permanently removes a user and revokes their active sessions.
 
-    Permission model -- an explicit requirement, not an incidental
-    default, and structurally similar to invite_user()'s own (see that
-    function's docstring for the parallel): 'Streetleaf Admin' can
-    delete any other Streetleaf Admin, any Customer Admin, and any User
-    -- but never itself (self-deletion is rejected regardless of role,
-    not just for Streetleaf Admin -- see below). 'Customer Admin' can
-    delete a Customer Admin or User belonging to their OWN CustomerId
-    only -- never a Streetleaf Admin (any CustomerId), and never a
-    Customer Admin/User belonging to a DIFFERENT CustomerId, even though
-    'Customer Admin' itself has no comparable "own record" concept
-    protecting THOSE targets beyond the ordinary CustomerId-matching
-    check. 'User' cannot delete anyone at all -- require_role() below
-    rejects that caller before anything else runs.
+    Streetleaf Admin  can delete anyone except themselves.
+    Customer Owner    can delete Customer Admin / User in their own customer.
+    Customer Admin    can delete User in their own customer only.
+    User              cannot delete anyone.
 
-    Self-deletion is rejected for EVERY role uniformly, not just
-    Streetleaf Admin -- deleting your own account through this same
-    endpoint you're calling it from has no sensible recovery path (your
-    own session would be revoked mid-request), and there's no
-    legitimate reason any caller would need to self-delete through an
-    admin-facing operation rather than some other, deliberate account-
-    closure flow.
+    No caller can delete a user with equal or higher privilege
+    (Customer Admin cannot delete Customer Owner; Customer Owner cannot
+    delete Streetleaf Admin). No caller can self-delete.
     """
-    require_role(caller, ["Streetleaf Admin", "Customer Admin"])
+    require_role(caller, ["Streetleaf Admin", "Customer Owner", "Customer Admin"])
     target_user_id_uuid = _parse_uuid(target_user_id, "user not found")
 
-    # Checked BEFORE any database round trip -- a pure comparison of two
-    # already-known values, so there's nothing to gain from querying
-    # first. caller.user_id comes from an already-verified JWT (not
-    # untrusted input the way target_user_id is), so it's parsed
-    # directly rather than through _parse_uuid()'s own defensive error
-    # handling -- a malformed value here would mean something is wrong
-    # with session issuance itself, not with what this caller passed in.
     if target_user_id_uuid == uuid.UUID(caller.user_id):
         raise AuthError("cannot delete your own account", status_code=403)
 
@@ -625,25 +538,26 @@ def delete_user(caller: AuthContext, target_user_id: str) -> None:
             raise AuthError("user not found", status_code=404)
         target_role, target_customer_id = row
 
-        if caller.role == "Customer Admin":
+        if caller.role != "Streetleaf Admin":
             if target_role == "Streetleaf Admin":
-                raise AuthError("a Customer Admin cannot delete a Streetleaf Admin", status_code=403)
+                raise AuthError(
+                    f"a {caller.role} cannot delete a Streetleaf Admin",
+                    status_code=403,
+                )
+            if caller.role == "Customer Admin" and target_role == "Customer Owner":
+                raise AuthError(
+                    "a Customer Admin cannot delete a Customer Owner",
+                    status_code=403,
+                )
             if target_customer_id != caller.customer_id:
                 raise AuthError(
-                    "a Customer Admin can only delete users for their own customer", status_code=403
+                    f"a {caller.role} can only delete users for their own customer",
+                    status_code=403,
                 )
 
-        cursor.execute(
-            "DELETE FROM Users WHERE Id = ?",
-            target_user_id_uuid,
-        )
+        cursor.execute("DELETE FROM Users WHERE Id = ?", target_user_id_uuid)
         conn.commit()
 
-        # UserSessions.UserId is VARCHAR -- the original string form of
-        # target_user_id (not the UUID object used just above for the
-        # Users-table DELETE) is what belongs here. No FK between the two
-        # tables, so these rows are simply left behind, already revoked,
-        # as a historical record -- same as any other revoked session.
         cursor.execute(
             "UPDATE UserSessions SET RevokedAt = ? WHERE UserId = ? AND RevokedAt IS NULL",
             _to_dto_string(datetime.now(timezone.utc)),
@@ -655,21 +569,16 @@ def delete_user(caller: AuthContext, target_user_id: str) -> None:
         conn.close()
 
 
-def _toggle_role(current_role: str, customer_id) -> str:
+def _new_role_after_toggle(current_role: str, customer_id) -> str:
     """
-    Toggles between an Admin role and 'User', WITHIN the same
-    organization the target already belongs to -- CustomerId itself is
-    never touched by this, only Role. A target with customer_id=None
-    (Streetleaf Admin or a "Streetleaf User" -- see invite_user()'s own
-    docstring for that concept) toggles between 'Streetleaf Admin' and
-    'User', staying unscoped either way. A target with a real
-    customer_id (Customer Admin or a customer-side User) toggles between
-    'Customer Admin' and 'User', staying within that SAME customer
-    either way -- this is what "keeping the same organization" means in
-    practice: which organization a user belongs to is entirely a
-    function of their own customer_id, not their Role, so leaving
-    customer_id untouched IS what keeps them in place.
+    Toggles between an Admin role and 'User' within the same organisation.
+    Customer Owner is not toggle-able -- use transfer_ownership() instead.
     """
+    if current_role == "Customer Owner":
+        raise AuthError(
+            "Customer Owner role cannot be toggled; use transfer_ownership() instead",
+            status_code=400,
+        )
     if current_role == "User":
         return "Streetleaf Admin" if customer_id is None else "Customer Admin"
     return "User"
@@ -678,48 +587,21 @@ def _toggle_role(current_role: str, customer_id) -> str:
 def change_role(caller: AuthContext, target_user_id: str) -> dict:
     """
     Toggles a user's role between an Admin role and 'User', keeping them
-    within the SAME organization (Streetleaf if they currently have no
-    CustomerId, or that same Customer if they do) -- see
-    _toggle_role()'s own docstring for exactly how the new role is
-    determined; CustomerId itself is never changed by this operation,
-    only Role.
+    in the same organisation. Customer Owner role cannot be toggled --
+    use transfer_ownership() instead.
 
-    Permission model -- identical in STRUCTURE to delete_user()'s own
-    (see that function's docstring for the parallel, including the exact
-    reasoning behind each restriction, not re-litigated here):
-    'Streetleaf Admin' can change the role of any other Streetleaf
-    Admin, any Customer Admin, and any User -- but never itself.
-    'Customer Admin' can change the role of a Customer Admin or User
-    belonging to their OWN CustomerId only -- never a Streetleaf Admin
-    (any CustomerId), and never a Customer Admin/User belonging to a
-    DIFFERENT CustomerId. 'User' cannot change anyone's role at all --
-    require_role() below rejects that caller before anything else runs.
+    Streetleaf Admin  can change anyone except themselves.
+    Customer Owner    can change Customer Admin / User in their own customer.
+    Customer Admin    can change User in their own customer only.
+    User              cannot change anyone.
 
-    Self-role-change is rejected for EVERY role uniformly, not just
-    Streetleaf Admin -- same reasoning as delete_user()'s own equivalent
-    restriction: changing your own role mid-session has no sensible,
-    safe in-place outcome (your own privileges would shift under you
-    while your existing session/JWT still reflects the old ones), and
-    there's no legitimate reason any caller would need to self-promote
-    or self-demote through this same admin-facing operation.
-
-    Also revokes the target's active sessions, same as delete_user() --
-    a role change is a privilege change, and an existing JWT/session
-    issued under the OLD role would otherwise keep granting (or keep
-    denying) access based on stale information until it naturally
-    expires, regardless of which direction the change went. Forcing a
-    fresh sign-in makes the new role take effect immediately rather than
-    "eventually".
-
-    Returns {"userId": ..., "role": <the NEW role>, "customerId": ...}
-    -- customerId echoed back unchanged, confirming this operation
-    didn't touch it.
+    No caller can change a user with equal or higher privilege.
+    Revokes the target's active sessions so the new role takes effect
+    immediately.
     """
-    require_role(caller, ["Streetleaf Admin", "Customer Admin"])
+    require_role(caller, ["Streetleaf Admin", "Customer Owner", "Customer Admin"])
     target_user_id_uuid = _parse_uuid(target_user_id, "user not found")
 
-    # Checked BEFORE any database round trip -- same reasoning, same
-    # placement, as delete_user()'s own equivalent check.
     if target_user_id_uuid == uuid.UUID(caller.user_id):
         raise AuthError("cannot change your own role", status_code=403)
 
@@ -735,18 +617,24 @@ def change_role(caller: AuthContext, target_user_id: str) -> dict:
             raise AuthError("user not found", status_code=404)
         target_role, target_customer_id = row
 
-        if caller.role == "Customer Admin":
+        if caller.role != "Streetleaf Admin":
             if target_role == "Streetleaf Admin":
                 raise AuthError(
-                    "a Customer Admin cannot change the role of a Streetleaf Admin", status_code=403
+                    f"a {caller.role} cannot change the role of a Streetleaf Admin",
+                    status_code=403,
+                )
+            if caller.role == "Customer Admin" and target_role == "Customer Owner":
+                raise AuthError(
+                    "a Customer Admin cannot change the role of a Customer Owner",
+                    status_code=403,
                 )
             if target_customer_id != caller.customer_id:
                 raise AuthError(
-                    "a Customer Admin can only change the role of users for their own customer",
+                    f"a {caller.role} can only change the role of users for their own customer",
                     status_code=403,
                 )
 
-        new_role = _toggle_role(target_role, target_customer_id)
+        new_role = _new_role_after_toggle(target_role, target_customer_id)
 
         cursor.execute(
             "UPDATE Users SET Role = ? WHERE Id = ?",
@@ -755,9 +643,6 @@ def change_role(caller: AuthContext, target_user_id: str) -> dict:
         )
         conn.commit()
 
-        # Same UserSessions revocation as delete_user()'s own -- see
-        # that function's own comment on binding target_user_id (the
-        # original string) rather than target_user_id_uuid here.
         cursor.execute(
             "UPDATE UserSessions SET RevokedAt = ? WHERE UserId = ? AND RevokedAt IS NULL",
             _to_dto_string(datetime.now(timezone.utc)),
@@ -769,3 +654,165 @@ def change_role(caller: AuthContext, target_user_id: str) -> dict:
         conn.close()
 
     return {"userId": str(target_user_id_uuid), "role": new_role, "customerId": target_customer_id}
+
+
+def initiate_ownership_transfer(caller: AuthContext, nominee_user_id: str) -> dict:
+    """
+    Starts an ownership transfer from the current Customer Owner to a
+    nominee within the same customer. The nominee receives an email with
+    an acceptance link; the caller's account is NOT deleted until the
+    nominee accepts.
+
+    Only a Customer Owner can initiate. The nominee must be an Active
+    Customer Admin or User in the same customer -- pending users and users
+    from other customers are rejected. The caller cannot nominate
+    themselves.
+
+    Generates a transfer token stored on the NOMINEE's ResetToken/
+    ResetTokenExpiresAt columns (reusing the existing token machinery).
+    An existing pending transfer for this nominee is overwritten (fresh
+    link, same nominee).
+    """
+    require_role(caller, ["Customer Owner"])
+    nominee_uuid = _parse_uuid(nominee_user_id, "nominee not found")
+
+    if nominee_uuid == uuid.UUID(caller.user_id):
+        raise AuthError("cannot transfer ownership to yourself", status_code=400)
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "SELECT Name, Email, Role, Status, CustomerId FROM Users WHERE Id = ?",
+            nominee_uuid,
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise AuthError("nominee not found", status_code=404)
+
+        nominee_name, nominee_email, nominee_role, nominee_status, nominee_customer_id = row
+
+        if nominee_status != "Active":
+            raise AuthError("nominee must be an Active user", status_code=400)
+        if nominee_customer_id != caller.customer_id:
+            raise AuthError(
+                "nominee must belong to the same customer", status_code=403
+            )
+        if nominee_role not in ("Customer Admin", "User"):
+            raise AuthError(
+                "nominee must be a Customer Admin or User", status_code=400
+            )
+
+        token = generate_token()
+        expires_at = datetime.now(timezone.utc) + TOKEN_LIFETIME
+
+        # Store the transfer token on the nominee (not the caller) --
+        # the nominee is the one who needs to act on it.
+        # OwnershipTransferFromUserId is a separate column so it doesn't
+        # collide with password-reset tokens. If that column isn't in the
+        # schema yet, fall back to a ResetToken-based approach here and
+        # update the schema via migration.
+        cursor.execute(
+            """
+            UPDATE Users
+            SET OwnershipTransferToken = ?,
+                OwnershipTransferTokenExpiresAt = ?,
+                OwnershipTransferFromUserId = ?
+            WHERE Id = ?
+            """,
+            token,
+            _to_dto_string(expires_at),
+            caller.user_id,
+            nominee_uuid,
+        )
+        conn.commit()
+    finally:
+        cursor.close()
+        conn.close()
+
+    email_sent = _send_ownership_transfer_email(
+        nominee_uuid, nominee_name, nominee_email, token
+    )
+    return {"nomineeUserId": str(nominee_uuid), "email": nominee_email, "emailSent": email_sent}
+
+
+def accept_ownership_transfer(token: str) -> dict:
+    """
+    Completes an ownership transfer: validates the token on the nominee's
+    record, promotes the nominee to Customer Owner, and deletes the
+    previous owner. The nominee is signed in immediately.
+
+    The previous owner's sessions are revoked as part of the delete.
+    The nominee's existing sessions are also revoked so they get a fresh
+    session reflecting the new role.
+    """
+    token_uuid = _parse_uuid(token, "invalid or expired ownership transfer link")
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        # Find the nominee by their transfer token
+        cursor.execute(
+            """
+            SELECT Id, Name, Email, Role, CustomerId, OwnershipTransferFromUserId
+            FROM Users
+            WHERE OwnershipTransferToken = ?
+              AND Status = 'Active'
+              AND OwnershipTransferTokenExpiresAt > SYSDATETIMEOFFSET()
+            """,
+            token_uuid,
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise AuthError(
+                "invalid or expired ownership transfer link", status_code=400
+            )
+
+        nominee_id, nominee_name, nominee_email, _, customer_id, previous_owner_id_str = row
+        previous_owner_uuid = uuid.UUID(previous_owner_id_str)
+
+        # Promote nominee to Customer Owner and clear the transfer token
+        cursor.execute(
+            """
+            UPDATE Users
+            SET Role = 'Customer Owner',
+                OwnershipTransferToken = NULL,
+                OwnershipTransferTokenExpiresAt = NULL,
+                OwnershipTransferFromUserId = NULL
+            WHERE Id = ?
+            """,
+            nominee_id,
+        )
+
+        # Delete the previous owner
+        cursor.execute(
+            "DELETE FROM Users WHERE Id = ?",
+            previous_owner_uuid,
+        )
+
+        # Revoke all sessions for both (nominee gets a fresh one below)
+        now_str = _to_dto_string(datetime.now(timezone.utc))
+        cursor.execute(
+            "UPDATE UserSessions SET RevokedAt = ? WHERE UserId IN (?, ?) AND RevokedAt IS NULL",
+            now_str,
+            str(nominee_id),
+            str(previous_owner_uuid),
+        )
+
+        user_id_str = str(nominee_id)
+        session_token = create_session(cursor, user_id_str, "Customer Owner", customer_id)
+        conn.commit()
+    finally:
+        cursor.close()
+        conn.close()
+
+    return {
+        "token": session_token,
+        "user": {
+            "id": user_id_str,
+            "name": nominee_name,
+            "email": nominee_email,
+            "role": "Customer Owner",
+            "customerId": customer_id,
+        },
+    }

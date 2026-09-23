@@ -8,5 +8,5 @@ SELECT TOP (1000) [FIPS]
       ,[CoordinateOverrideReason]
   FROM [dbo].[CountyTimeZones]
   WHERE 1 = 1
-    AND CountyName LIKE '%Dade%';
+    AND CountyName LIKE '%York%';
     -- AND [FIPS] = '12031'

@@ -2026,7 +2026,8 @@ class TestLoadProvisionedPoleTelemetry:
             events.append(event)
         return events
 
-    def test_parses_each_event_body_and_delegates_to_the_processor(self, mocker):
+    def test_parses_each_event_body_and_delegates_to_the_processor(self, mocker, monkeypatch):
+        monkeypatch.setattr(function_app, "ENVIRONMENT", "Staging")
         mock_process = mocker.patch("function_app.process_provisioned_telemetry_events")
         payload_1 = {"PoleID": "uid-1", "Timestamp": 1789391964}
         payload_2 = {"PoleID": "uid-2", "Timestamp": 1789391970}
@@ -2037,7 +2038,8 @@ class TestLoadProvisionedPoleTelemetry:
 
         mock_process.assert_called_once_with([payload_1, payload_2])
 
-    def test_single_event_batch(self, mocker):
+    def test_single_event_batch(self, mocker, monkeypatch):
+        monkeypatch.setattr(function_app, "ENVIRONMENT", "Staging")
         mock_process = mocker.patch("function_app.process_provisioned_telemetry_events")
         payload = {"PoleID": "uid-1", "Timestamp": 1789391964}
 
@@ -2045,9 +2047,21 @@ class TestLoadProvisionedPoleTelemetry:
 
         mock_process.assert_called_once_with([payload])
 
-    def test_empty_batch_still_calls_processor_with_empty_list(self, mocker):
+    def test_empty_batch_still_calls_processor_with_empty_list(self, mocker, monkeypatch):
+        monkeypatch.setattr(function_app, "ENVIRONMENT", "Staging")
         mock_process = mocker.patch("function_app.process_provisioned_telemetry_events")
 
         function_app.loadProvisionedPoleTelemetry([])
 
         mock_process.assert_called_once_with([])
+
+    def test_dev_skip_drops_events_without_processing(self, mocker, monkeypatch, caplog):
+        monkeypatch.setattr(function_app, "ENVIRONMENT", "Dev")
+        mock_process = mocker.patch("function_app.process_provisioned_telemetry_events")
+        payload = {"PoleID": "uid-1", "Timestamp": 1789391964}
+
+        with caplog.at_level("INFO"):
+            function_app.loadProvisionedPoleTelemetry(self._make_event_hub_events([payload]))
+
+        mock_process.assert_not_called()
+        assert any("skipping" in rec.message and "Dev" in rec.message for rec in caplog.records)

@@ -395,9 +395,9 @@ def _pole_row_to_dict(row) -> dict:
     # whenever lastUpdate is null OR more than 48 hours old -- a fault
     # reading tied to telemetry that old (or nonexistent) isn't
     # trustworthy as a CURRENT fault state, same reasoning as
-    # overallStatusLabel/lightStatusLabel/etc.'s own staleness override
+    # overallStatusText/lightStatusText/etc.'s own staleness override
     # below. Two fields are deliberately EXCLUDED from this override:
-    #   isOnline      -- wasn't named in the request, and connectedLabel's
+    #   isOnline      -- wasn't named in the request, and connectedText's
     #                    own logic already reads is_online directly
     #                    regardless of staleness (see
     #                    api_utils.compute_pole_connectivity_labels()).
@@ -509,9 +509,9 @@ def _compute_pole_vitals_status_fields(
     """
     getPoleVitals-specific layer on top of api_utils.compute_pole_status_
     labels()'s own five fields, per explicit request -- adds
-    connectedLabel/overallStatusLabel (see
+    connectedText/overallStatusText (see
     api_utils.compute_pole_connectivity_labels()), and overrides
-    lightStatusLabel/panelStatusLabel/batteryStatusLabel specifically to
+    lightStatusText/panelStatusText/batteryStatusText specifically to
     api_utils.compute_reporting_staleness_label()'s own "Not
     Reporting"/"Not Reporting 48H" whenever that applies -- taking
     priority over whatever compute_pole_status_labels() itself computed
@@ -550,9 +550,9 @@ def _compute_pole_vitals_status_fields(
 
     staleness_label = compute_reporting_staleness_label(last_update)
     if staleness_label:
-        status_labels["lightStatusLabel"] = staleness_label
-        status_labels["panelStatusLabel"] = staleness_label
-        status_labels["batteryStatusLabel"] = staleness_label
+        status_labels["lightStatusText"] = staleness_label
+        status_labels["panelStatusText"] = staleness_label
+        status_labels["batteryStatusText"] = staleness_label
         status_labels["electricCurrentAverage"] = None
 
     return {
@@ -642,8 +642,8 @@ def get_pole_vitals(customer_id: str = None, project_id: str = None, limit: int 
     solarBoardVoltage, solarBoardElecCurrent, isOnline, isLedFault,
     isBatteryFault, isPanelFault, isOpenIssueFault, isPoleFault,
     avgBatteryPercentage, avgPanelPercentage, avgLightPercentage,
-    lightStatusLabel, panelStatusLabel, panelIdleReason,
-    batteryStatusLabel, electricCurrentAverage (these five calculated
+    lightStatusText, panelStatusText, panelIdleReason,
+    batteryStatusText, electricCurrentAverage (these five calculated
     via api_utils.compute_pole_status_labels() -- see that function's
     own docstring for the full logic), and sunsetTime (today's sunset
     for THIS pole's own location, expressed in that same pole's own

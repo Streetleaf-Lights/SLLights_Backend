@@ -9,215 +9,69 @@ from shared.pole_telemetry_loader import _MISSING_LAST_UPLOAD_SENTINEL
 
 ENVIRONMENT = os.environ.get("ENVIRONMENT", "Dev")
 SOURCE_NAME = "Leadsun"
+PROVISIONED_SOURCE_NAME = "Provisioned"
 
 PERIOD_TYPES = ("Hour", "Last48Hours")
 
-# How many rows to KEEP per PoleId for each period type -- this table
-# had no retention/pruning at all before this; it grew one row per pole
-# per Hour forever. Hour is a genuinely historical, discrete bucket
-# sequence, so pruning means "delete anything beyond the newest N,
-# ORDER BY PeriodStart DESC" (see _RETENTION_PRUNE_SQL below).
-# Last48Hours isn't in this dict at all -- it's a single, continuously
-# upserted row per pole (its own MERGE matches on PoleId+PeriodType
-# alone, not PeriodStart -- see _LAST_48_HOURS_MERGE_SQL's own comment),
-# so there's structurally never more than one row per pole to prune.
-_RETENTION_LIMITS = {
-    # 720 = 30 days of hourly buckets, no gaps -- raised from an earlier
-    # 168 (7 days) specifically so getPoleVitalsByPeriod(period_type=
-    # 'Hour', limit=...) can actually serve up to 30 days back (see
-    # pole_vitals_api.py's own _POLE_VITALS_HOUR_HISTORY_SQL_TEMPLATE,
-    # whose window bound is now derived from the caller's own limit
-    # rather than a fixed 48). Raising this cap is NOT retroactive --
-    # any row already pruned under the OLD, smaller cap is gone for
-    # good (a genuine DELETE, not an archive/soft-delete -- see
-    # _RETENTION_PRUNE_SQL below), so the full 30-day window won't
-    # actually be AVAILABLE until that much new data has accumulated
-    # under this new cap going forward.
-    "Hour": 720,
-}
+# Number of Hour rows to keep per PoleId (30 days of hourly buckets).
+# Last48Hours is excluded -- it's always exactly one row per pole.
+_RETENTION_LIMITS = {"Hour": 720}
 
-# How far back each period type recomputes on a normal (non-backfill) run.
-# For Hour, wide enough to cover "the current bucket + the previous
-# bucket" (so late-arriving telemetry near a boundary still lands in the
-# right bucket) without rescanning PoleTelemetry's full 6-month retention
-# window every 10 minutes -- the same round-trip-count trap already hit
-# (and fixed) for Poles/PoleTelemetry itself. Bounded by
-# IX_PoleTelemetry_LastUpload_Covering.
-#
-# Last48Hours is different in kind, not just degree: it's not an
-# incremental "current + previous bucket" window at all -- every run
-# recomputes the ENTIRE rolling 48-hour window fresh (there's no
-# "previous Last48Hours bucket" the way Hour has previous buckets),
-# so its own lookback IS the full window, always exactly 48 hours,
-# regardless of when this loader last ran.
+# Lookback windows for normal scheduled runs.
+# Hour: covers the current bucket plus the previous one so late-arriving
+#   telemetry near a boundary still lands in the right bucket.
+# Last48Hours: always the full 48-hour rolling window, every run.
 _DEFAULT_LOOKBACK = {
     "Hour": timedelta(hours=3),
     "Last48Hours": timedelta(hours=48),
 }
 
-# Wide enough to cover PoleTelemetry's entire 6-month retention window --
-# for a one-off historical backfill via load_leadsun_pole_vitals(backfill=True).
-# Doesn't apply to Last48Hours at all (see above -- there's no
-# "backfill history" concept for a single rolling-window row; backfill=True
-# only widens Hour's lookback).
+# Wide enough to cover the entire PoleTelemetry retention window --
+# used only for load_*_pole_vitals(backfill=True) on the Hour period.
 _BACKFILL_LOOKBACK = timedelta(days=400)
 
 
 def _compute_cutoff(now, period_type: str, backfill: bool):
     """
-    Returns the DTO-formatted cutoff string for the WHERE t.LastUpload >= ?
-    AND t.LastUpload <> ? parameters -- pure function, kept separate from
-    load_leadsun_pole_vitals() so the lookback-window math is unit-testable
-    without a database. backfill is ignored for Last48Hours -- see
-    _DEFAULT_LOOKBACK's own comment for why that period type has no
-    backfill-history concept to widen.
+    Returns the DTO-formatted cutoff string for WHERE t.LastUpload >= ?.
+    For Hour: 3-hour rolling window normally, 400-day window on backfill.
+    For Last48Hours: always 48 hours regardless of backfill flag.
     """
-    if period_type == "Last48Hours":
-        return _to_dto_string(now - _DEFAULT_LOOKBACK["Last48Hours"])
-    lookback = _BACKFILL_LOOKBACK if backfill else _DEFAULT_LOOKBACK[period_type]
+    if backfill and period_type == "Hour":
+        lookback = _BACKFILL_LOOKBACK
+    else:
+        lookback = _DEFAULT_LOOKBACK[period_type]
     return _to_dto_string(now - lookback)
 
 
-# ----------------------------------------------------------------------
-# Fault-flag design (replaces the earlier Daylight-based LightStatus
-# classification -- LightStatus itself no longer exists anywhere in this
-# schema; see the README for that history). IsDaylight, however, IS back
-# -- restored specifically to drive IsLedFault below with real
-# per-day/per-location sunrise/sunset math (shared/daylight_utils.py,
-# via shared/pole_daylight_flags_loader.py), after a fixed 7:00AM-8:00PM
-# clock window was tried first and found to have a real, unavoidable
-# flaw: whichever bucket straddles the actual sunrise/sunset moment for a
-# given day/location gets misclassified in one direction or the other.
+# ---------------------------------------------------------------------------
+# Leadsun vitals SQL
+# ---------------------------------------------------------------------------
 #
-# Four independent fault signals, computed per PoleTelemetry reading:
-#   IsLedFault      = (LampPower1 + LampPower2) = 0, EXCEPT while
-#                      IsDaylightForLedFault = 1 -- a solar-powered
-#                      light is SUPPOSED to be off while the sun is
-#                      actually up, so zero lamp power during real
-#                      daylight is expected, correct behavior, never a
-#                      fault; only once it's genuinely dark
-#                      (IsDaylightForLedFault = 0, or NULL if not yet
-#                      computed for this reading -- treated the same as
-#                      confirmed-dark, not exempted) does zero lamp
-#                      power indicate a real problem.
-#                      IsDaylightForLedFault (a PoleTelemetry column,
-#                      computed by pole_daylight_flags_loader.py) is
-#                      DELIBERATELY not the same value as IsPanelFault's
-#                      own IsDaylight below -- it's true at the exact
-#                      moment, OR within a 1-hour grace period before OR
-#                      after that moment, confirmed necessary in practice
-#                      since a real lamp doesn't always turn on the
-#                      instant the sun crosses the sunset threshold (nor
-#                      off exactly at sunrise -- some lamps sense
-#                      approaching dawn light and turn off slightly
-#                      early). IsPanelFault has no equivalent lag (solar
-#                      output tracks the sun
-#                      closely), so it keeps using the strict column.
-#   IsBatteryFault  = (BatteryElecCurrent1 + BatteryElecCurrent2) / 2 < 10
-#   IsPanelFault    = (SolarBoardVoltage * SolarBoardElecCurrent) = 0,
-#                      EXCEPT while IsDaylightForPanelFault = 0 (a solar
-#                      panel only charges once it's been daylight for at
-#                      least an hour -- IsDaylightForPanelFault, a
-#                      PoleTelemetry column computed by
-#                      pole_daylight_flags_loader.py, gives the panel
-#                      time to physically warm up right after sunrise --
-#                      so zero panel output at night OR during that
-#                      first hour is expected, correct behavior, never a
-#                      fault; only once it's past the warmup period
-#                      (IsDaylightForPanelFault = 1, or NULL if not yet
-#                      computed for this reading -- treated the same as
-#                      confirmed-past-warmup, not exempted) does zero
-#                      panel output indicate a real problem -- mirror
-#                      image of IsLedFault above: each flag's own
-#                      condition only applies during the OPPOSITE time
-#                      of day), AND EXCEPT while the total of
-#                      BatteryElecCurrent1 + BatteryElecCurrent2 is
-#                      exactly 200 (replaces an earlier version of this
-#                      check -- average BatteryVoltage1/BatteryVoltage2
-#                      against a per-model BatteryChargingMin threshold
-#                      from PoleModels -- by explicit request;
-#                      BatteryChargingMin has been removed from
-#                      PoleModels entirely).
-#   IsOpenIssueFault = t.IsOpenIssueFault (already computed and stored per
-#                      reading by pole_telemetry_loader.py -- joining
-#                      PoleOpenIssues at read time here would be
-#                      redundant work already done at write time)
-# IsPoleFault = IsLedFault OR IsBatteryFault OR IsPanelFault OR
-# IsOpenIssueFault -- never stored as its own per-reading column, only
-# computed once per bucket below (and again, identically, at the
-# getPoleVitals API layer for anything reading PoleVitals directly).
+# Fault-flag aggregation rules (shared by all Leadsun MERGEs):
+#   IsLedFault/IsBatteryFault/IsPanelFault: MAX over the window -- any
+#     single faulted reading marks the whole bucket faulted.
+#   IsOpenIssueFault: single most-recent reading's value (ROW_NUMBER +
+#     MAX(CASE WHEN rn=1...)) -- it's a current fact about the pole from
+#     PoleOpenIssues, not something to aggregate across a window.
+#   IsPoleFault: OR of all four.
+#   IsOnline: MAX over the window ("was any reading online").
 #
-# A reading with NULL inputs (e.g. LampPower1/2 both NULL) does NOT get
-# treated as faulted -- SQL's NULL propagation means
-# "(NULL + NULL) = 0" evaluates to UNKNOWN, not TRUE, so these CASE
-# expressions naturally fall through to "not a fault" rather than
-# guessing. Missing data is a different state from confirmed-zero
-# output, even though this project has no separate "unknown" tri-state
-# for these specific flags (unlike LightStatus's old NULL-vs-DayLight
-# distinction) -- treating "we don't know" as "not faulted" is the more
-# conservative failure mode here (a real fault only ever produces actual
-# zero/low readings, not missing ones, in practice).
-#
-# Bucket-level aggregation (Hour/Last48Hours both share this same
-# logic, just over different windows of readings):
-#   IsLedFault/IsBatteryFault/IsPanelFault: ANY reading in the window
-#     faulted -> the whole bucket is faulted. A single confirmed fault
-#     within the window shouldn't get averaged away by several
-#     otherwise-fine readings.
-#   IsOpenIssueFault: NOT an aggregate across the window at all -- takes
-#     the single MOST RECENT reading's own IsOpenIssueFault value
-#     (identified via ROW_NUMBER() ... ORDER BY LastUpload DESC, then
-#     MAX(CASE WHEN rn = 1 THEN ...) to extract that one row's value --
-#     a standard "pick a column from the row with max/min of another
-#     column, within a group" pattern). This differs from the other
-#     three specifically because open-issue status is a current fact
-#     about the POLE (from a completely different data source,
-#     PoleOpenIssues), not something that should be judged by whether it
-#     was EVER true across a whole window of otherwise-unrelated
-#     telemetry readings.
-#   IsPoleFault: OR of all four, computed once in the final SELECT feeding
-#     each MERGE below.
-#
-# IsOnline bucket-level aggregation is unchanged from the prior design:
-# "was ANY reading in the window online" -- both Hour and Last48Hours use
-# this same definition, just over their own respective windows.
-# ----------------------------------------------------------------------
+# IsLedFaultFlag uses IsDaylightForLedFault (±1h grace period around
+# sunrise/sunset). IsPanelFaultFlag uses IsDaylightForPanelFault (must
+# have been daylight for 1h already AND daylight for 1h more). These
+# are separate columns in PoleTelemetry because each fault flag needs a
+# different daylight definition tuned to its hardware's response lag.
+# NULL daylight flags: treated as "unknown = subject to normal check"
+# (same as confirmed-night for LED, confirmed-past-warmup for panel).
 
-# A GENUINELY DIFFERENT query shape from _HOUR_MERGE_SQL below, not a
-# parameter variation of it -- built for a specific, one-off need:
-# ensure EVERY pole has an up-to-date "Hour" PoleVitals row reflecting
-# its own most recent known telemetry, even for a pole that's gone
-# completely silent (its latest reading is older than
-# _DEFAULT_LOOKBACK["Hour"]'s normal 3-hour window, and even older than
-# Last48Hours' own 48-hour window) -- such a pole's "Hour" row would
-# otherwise never get touched again by the normal, scheduled run, no
-# matter how long this loader keeps running, since it simply never
-# appears in that run's own global time-cutoff filter.
-#
-# load_leadsun_pole_vitals(backfill=True) does NOT solve this the way it might
-# look like it should: it widens Hour's lookback to
-# _BACKFILL_LOOKBACK (400 days), but that's a GLOBAL cutoff still --
-# it recomputes EVERY historical hourly bucket within that huge window,
-# for every pole, which is both enormously more expensive than what's
-# needed here and produces the wrong shape of result (many old buckets
-# per pole, not "just make sure the ONE latest bucket per pole is
-# current").
-#
-# Scoping mechanism: for each pole independently, find its own
-# MAX(LastUpload), convert that to the pole's own local time, truncate
-# to the start of that local hour, then include only THAT pole's own
-# readings that fall within that same local hour -- no global time
-# cutoff parameter at all, since each pole's own window floats
-# independently based on its own data, not "now".
-#
-# The fault-flag/aggregation logic below (TelemetryWithVitals's own CASE
-# expressions and comments, Bucketed, Aggregated, and the final MERGE)
-# is IDENTICAL to _HOUR_MERGE_SQL's own -- deliberately kept as an exact
-# copy rather than shared/factored out, matching this project's existing
-# convention of Hour/Last48Hours each carrying their own full copy
-# rather than a shared SQL view or stored procedure. This does mean a
-# FOURTH copy to keep in sync if these fault-flag definitions change
-# again -- a real, known cost, not an oversight.
+# ---------------------------------------------------------------------------
+# _BACKFILL_LATEST_HOUR_PER_POLE_MERGE_SQL
+# ---------------------------------------------------------------------------
+# Ensures every pole has an up-to-date Hour row for its own most-recent
+# telemetry bucket -- even poles that have gone silent and fall outside
+# the normal 3-hour rolling window. Each pole's window floats to its own
+# MAX(LastUpload) independently; no global time cutoff parameter.
 _BACKFILL_LATEST_HOUR_PER_POLE_MERGE_SQL = """
 SET ANSI_WARNINGS OFF;
 ;WITH MaxReadingPerPole AS (
@@ -226,7 +80,7 @@ SET ANSI_WARNINGS OFF;
         MAX(t.LastUpload) AS MaxLastUpload
     FROM PoleTelemetry t
     WHERE t.Source = 'Leadsun'
-      AND t.LastUpload <> ?  -- exclude the missing-LastUpload sentinel (see pole_telemetry_loader.py)
+      AND t.LastUpload <> ?
     GROUP BY t.PoleId
 ),
 LatestBucketPerPole AS (
@@ -253,37 +107,17 @@ TelemetryWithVitals AS (
              THEN t.BatteryElecCurrent1
              ELSE (t.BatteryElecCurrent1 + t.BatteryElecCurrent2) / 2.0
         END AS BatteryPercentage,
-        -- ISNULL(pm.SunboardPower, 80)/ISNULL(pm.LightPower, 30):
-        -- a ModelId with no PoleModels match at all (the LEFT JOIN
-        -- above produces NULL for both) now defaults to a representative
-        -- rated capacity instead of leaving PanelPercentage/
-        -- LightPercentage NULL for that reading -- an unmatched model is
-        -- treated the same as a
-        -- matched one with a sensible default, not "unknown", so it
-        -- still contributes to this bucket's AVG() instead of silently
-        -- dropping out of it. NULLIF(..., 0) still wraps the OUTSIDE of
-        -- that default, unchanged from before -- it now only guards
-        -- against a genuinely-matched PoleModels row that explicitly
-        -- has SunboardPower/LightPower = 0 (a real, if unusual, model
-        -- record), since the default values themselves (80, 30) are
-        -- never 0.
         (t.SolarBoardVoltage * t.SolarBoardElecCurrent) / NULLIF(ISNULL(pm.SunboardPower, 80), 0) * 100.0 AS PanelPercentage,
         CASE WHEN t.LampPower2 IS NULL THEN t.LampPower1
              ELSE t.LampPower1 + t.LampPower2
         END / NULLIF(ISNULL(pm.LightPower, 30), 0) * 100.0 AS LightPercentage,
         CASE WHEN t.IsOnline = 1 THEN 1 ELSE 0 END AS IsOnlineFlag,
-        -- See _HOUR_MERGE_SQL's own comment on this exact CASE
-        -- expression for the full reasoning -- copied verbatim here,
-        -- not re-explained.
         CASE
             WHEN t.IsDaylightForLedFault = 1 THEN 0
             WHEN (CASE WHEN t.LampPower2 IS NULL THEN t.LampPower1 ELSE t.LampPower1 + t.LampPower2 END) = 0 THEN 1
             ELSE 0
         END AS IsLedFaultFlag,
         CASE WHEN (CASE WHEN t.BatteryElecCurrent2 IS NULL THEN t.BatteryElecCurrent1 ELSE (t.BatteryElecCurrent1 + t.BatteryElecCurrent2) / 2.0 END) < 10 THEN 1 ELSE 0 END AS IsBatteryFaultFlag,
-        -- See _HOUR_MERGE_SQL's own comment on this exact CASE
-        -- expression for the full reasoning -- copied verbatim here,
-        -- not re-explained.
         CASE
             WHEN t.IsDaylightForPanelFault = 0 THEN 0
             WHEN (CASE WHEN t.BatteryElecCurrent2 IS NULL THEN t.BatteryElecCurrent1 ELSE t.BatteryElecCurrent1 + t.BatteryElecCurrent2 END) = (CASE WHEN t.BatteryElecCurrent2 IS NULL THEN 100 ELSE 200 END) THEN 0
@@ -296,7 +130,7 @@ TelemetryWithVitals AS (
     JOIN LatestBucketPerPole lb ON t.PoleId = lb.PoleId
     LEFT JOIN PoleModels pm ON t.ModelId = pm.ModelId
     WHERE t.Source = 'Leadsun'
-      AND t.LastUpload <> ?  -- exclude the missing-LastUpload sentinel (see pole_telemetry_loader.py)
+      AND t.LastUpload <> ?
       AND CAST(t.LastUpload AT TIME ZONE lb.TimeZoneName AS DATETIME2(3)) >= lb.BucketStart
       AND CAST(t.LastUpload AT TIME ZONE lb.TimeZoneName AS DATETIME2(3)) < DATEADD(HOUR, 1, lb.BucketStart)
 ),
@@ -376,29 +210,12 @@ WHEN NOT MATCHED THEN
 SET ANSI_WARNINGS ON;
 """
 
-# A GENUINELY DIFFERENT scope from _BACKFILL_LATEST_HOUR_PER_POLE_MERGE_SQL
-# above: that one produces exactly ONE Hour bucket per pole (its own
-# single latest hour of telemetry). This one produces UP TO 48 hourly
-# buckets per pole -- every hour that has telemetry within a 48-hour
-# window ending at that SAME pole's own latest reading. Built for a
-# specific, related need: pole_vitals_api.py's GetPoleVitalsByPeriod now
-# anchors its own 48-hour display window to each pole's latest telemetry
-# too (see _POLE_VITALS_HOUR_HISTORY_SQL_TEMPLATE there) -- but that
-# anchor change only actually shows something useful for an offline pole
-# if PoleVitals rows genuinely exist across that pole's own last 48
-# hours of activity in the first place. A pole that was already offline
-# before this project's Hour-vitals logic existed, or one whose Hour
-# rows from that window were never successfully computed for some other
-# reason, needs this fuller backfill -- the single-bucket variant above
-# only ever fixes the newest hour, not the 47 behind it.
-#
-# Structurally, this is _HOUR_MERGE_SQL's own TelemetryWithVitals/
-# Bucketed/Aggregated/MERGE logic, copied verbatim (same reasoning as
-# _BACKFILL_LATEST_HOUR_PER_POLE_MERGE_SQL's own copy -- see that
-# constant's comment) -- the ONLY structural difference is a new
-# MaxReadingPerPole CTE feeding a per-pole, relative-to-its-own-data
-# WHERE clause, replacing _HOUR_MERGE_SQL's own global
-# "t.LastUpload >= ?" cutoff relative to "now".
+# ---------------------------------------------------------------------------
+# _BACKFILL_LAST_48_HOURS_OF_HOUR_PER_POLE_MERGE_SQL
+# ---------------------------------------------------------------------------
+# Covers each pole's own last 48 hours of activity, with each pole's
+# window ending at its own MaxLastUpload independently. Used by the
+# backfill script rather than the normal scheduled loader.
 _BACKFILL_LAST_48_HOURS_OF_HOUR_PER_POLE_MERGE_SQL = """
 SET ANSI_WARNINGS OFF;
 ;WITH MaxReadingPerPole AS (
@@ -406,7 +223,8 @@ SET ANSI_WARNINGS OFF;
         t.PoleId,
         MAX(t.LastUpload) AS MaxLastUpload
     FROM PoleTelemetry t
-    WHERE t.LastUpload <> ?  -- exclude the missing-LastUpload sentinel (see pole_telemetry_loader.py)
+    WHERE t.Source = 'Leadsun'
+      AND t.LastUpload <> ?
     GROUP BY t.PoleId
 ),
 TelemetryWithVitals AS (
@@ -418,121 +236,17 @@ TelemetryWithVitals AS (
              THEN t.BatteryElecCurrent1
              ELSE (t.BatteryElecCurrent1 + t.BatteryElecCurrent2) / 2.0
         END AS BatteryPercentage,
-        -- ISNULL(pm.SunboardPower, 80)/ISNULL(pm.LightPower, 30):
-        -- a ModelId with no PoleModels match at all (the LEFT JOIN
-        -- above produces NULL for both) now defaults to a representative
-        -- rated capacity instead of leaving PanelPercentage/
-        -- LightPercentage NULL for that reading -- an unmatched model is
-        -- treated the same as a
-        -- matched one with a sensible default, not "unknown", so it
-        -- still contributes to this bucket's AVG() instead of silently
-        -- dropping out of it. NULLIF(..., 0) still wraps the OUTSIDE of
-        -- that default, unchanged from before -- it now only guards
-        -- against a genuinely-matched PoleModels row that explicitly
-        -- has SunboardPower/LightPower = 0 (a real, if unusual, model
-        -- record), since the default values themselves (80, 30) are
-        -- never 0.
         (t.SolarBoardVoltage * t.SolarBoardElecCurrent) / NULLIF(ISNULL(pm.SunboardPower, 80), 0) * 100.0 AS PanelPercentage,
         CASE WHEN t.LampPower2 IS NULL THEN t.LampPower1
              ELSE t.LampPower1 + t.LampPower2
         END / NULLIF(ISNULL(pm.LightPower, 30), 0) * 100.0 AS LightPercentage,
         CASE WHEN t.IsOnline = 1 THEN 1 ELSE 0 END AS IsOnlineFlag,
-        -- Solar-powered lights are SUPPOSED to be off during daylight --
-        -- LampPower1+LampPower2=0 while the sun is actually up
-        -- (t.IsDaylightForLedFault, computed via real per-day/
-        -- per-location sunrise/sunset math in
-        -- pole_daylight_flags_loader.py -- NOT a fixed clock window,
-        -- which was tried first and had a real, unavoidable flaw:
-        -- whichever bucket straddles the actual sunrise/sunset moment
-        -- for a given day/location gets misclassified in one direction
-        -- or the other) is expected, correct behavior, not a fault.
-        -- Only when it's actually dark does zero lamp power indicate a
-        -- real problem. See this CASE's own ordering: the daylight
-        -- check comes first and unconditionally returns 0, regardless
-        -- of LampPower -- only falls through to the actual LampPower
-        -- check once it's established this reading is genuinely at
-        -- night.
-        --
-        -- t.IsDaylightForLedFault is DELIBERATELY NOT the same as
-        -- IsPanelFaultFlag's own t.IsDaylight below -- it's a more
-        -- forgiving definition (true at the exact moment, OR within 1
-        -- hour before OR after -- see pole_daylight_flags_loader.py's
-        -- own _LED_FAULT_GRACE_PERIOD), confirmed necessary in
-        -- practice: a real lamp doesn't always turn on the INSTANT the
-        -- sun crosses the sunset threshold (the "before" side of the
-        -- grace period), nor does one always turn off exactly at
-        -- sunrise -- some lamps sense approaching dawn light and turn
-        -- off slightly early (the "after" side). IsPanelFault has no
-        -- equivalent lag (solar output genuinely does track the sun
-        -- closely), so it keeps using the strict column unmodified --
-        -- these two flags need different daylight definitions, which
-        -- is exactly why this is two separate PoleTelemetry columns,
-        -- not one shared value.
-        --
-        -- t.IsDaylightForLedFault NULL (not yet computed by
-        -- pole_daylight_flags_loader.py for this specific reading) falls
-        -- through to the LampPower check below, same as "confirmed
-        -- dark" -- treating "we don't know yet" as "subject to the
-        -- normal check" is the safer default, rather than silently
-        -- exempting a reading from fault detection just because its
-        -- daylight status hasn't been computed yet.
         CASE
             WHEN t.IsDaylightForLedFault = 1 THEN 0
             WHEN (CASE WHEN t.LampPower2 IS NULL THEN t.LampPower1 ELSE t.LampPower1 + t.LampPower2 END) = 0 THEN 1
             ELSE 0
         END AS IsLedFaultFlag,
         CASE WHEN (CASE WHEN t.BatteryElecCurrent2 IS NULL THEN t.BatteryElecCurrent1 ELSE (t.BatteryElecCurrent1 + t.BatteryElecCurrent2) / 2.0 END) < 10 THEN 1 ELSE 0 END AS IsBatteryFaultFlag,
-        -- Solar panels only need to charge when BOTH (a) it's been
-        -- daylight for at least an hour (t.IsDaylightForPanelFault = 1
-        -- -- see pole_daylight_flags_loader.py's own
-        -- _PANEL_FAULT_SUNRISE_WARMUP_PERIOD; gives a panel time to
-        -- physically warm up right after sunrise) AND (b) the battery
-        -- actually needs it -- the TOTAL (not average) of
-        -- BatteryElecCurrent1 + BatteryElecCurrent2 is NOT exactly 200.
-        -- Replaces an earlier version of this same check (average
-        -- BatteryVoltage1/BatteryVoltage2 against a per-model
-        -- BatteryChargingMin threshold from PoleModels) by explicit
-        -- request -- BatteryChargingMin itself has been removed from
-        -- PoleModels entirely (see "sql/PoleModels/Drop
-        -- BatteryChargingMin column.sql"), so PoleModels is no longer
-        -- involved in this specific check at all (it's still joined
-        -- below for SunboardPower/LightPower, used elsewhere in this
-        -- same CTE -- just no longer for this). When the total current
-        -- IS exactly 200, zero panel output is expected, correct
-        -- behavior (nothing left to charge), not a fault, even during
-        -- daylight. Only once it's past the sunrise warmup AND this
-        -- condition does NOT hold does zero panel output indicate a
-        -- real problem. See this CASE's own ordering:
-        -- t.IsDaylightForPanelFault = 0 is checked first and
-        -- unconditionally returns 0 regardless of anything else -- it's
-        -- False both at night (no daylight at all) AND during the first
-        -- hour after sunrise (daylight, but not yet past warmup), so
-        -- this single check covers both cases without needing a
-        -- separate plain-nighttime condition; the total-current check
-        -- is checked second and ALSO unconditionally returns 0
-        -- regardless of panel output -- only once both of those are
-        -- ruled out does this fall through to the actual panel-output
-        -- check.
-        --
-        -- t.IsDaylightForPanelFault NULL (not yet computed by
-        -- pole_daylight_flags_loader.py for this specific reading) falls
-        -- through past that first check, same as "confirmed past
-        -- warmup" -- treating "we don't know yet" as "subject to the
-        -- normal check" is the safer default, rather than silently
-        -- exempting a reading from fault detection just because its
-        -- daylight status hasn't been computed yet. This is the mirror
-        -- image of IsLedFaultFlag's own NULL handling above (which
-        -- treats unknown as "confirmed dark" instead) -- each flag's
-        -- fault condition only applies during the OPPOSITE time of day,
-        -- so "unknown" always falls through to that flag's own check,
-        -- just via a different comparison (= 1 there, = 0 here).
-        --
-        -- A NULL BatteryElecCurrent1/BatteryElecCurrent2 (missing
-        -- readings) means the total is also NULL, and "NULL = 200" is
-        -- UNKNOWN (not TRUE) in T-SQL -- so a missing reading falls
-        -- through past this check too, same "unknown is treated as
-        -- subject to the normal check" reasoning as the daylight-NULL
-        -- case above, not silently exempted from fault detection.
         CASE
             WHEN t.IsDaylightForPanelFault = 0 THEN 0
             WHEN (CASE WHEN t.BatteryElecCurrent2 IS NULL THEN t.BatteryElecCurrent1 ELSE t.BatteryElecCurrent1 + t.BatteryElecCurrent2 END) = (CASE WHEN t.BatteryElecCurrent2 IS NULL THEN 100 ELSE 200 END) THEN 0
@@ -545,18 +259,10 @@ TelemetryWithVitals AS (
     JOIN MaxReadingPerPole mr ON t.PoleId = mr.PoleId
     LEFT JOIN PoleModels pm ON t.ModelId = pm.ModelId
     LEFT JOIN PoleTimeZones ptz ON t.PoleId = ptz.VendorPoleId
-    -- Bounded to THIS POLE'S OWN last 48 hours of real activity,
-    -- ending at its own most recent reading -- NOT a global cutoff
-    -- relative to "now" like _HOUR_MERGE_SQL's own WHERE clause
-    -- uses. Deliberately > / <= (not >= / <) on the lower/upper
-    -- bounds respectively: a half-open interval, so a reading
-    -- exactly 48 hours before MaxLastUpload is excluded (giving a
-    -- clean, unambiguous 48-hour span) while MaxLastUpload itself
-    -- is always included.
     WHERE t.Source = 'Leadsun'
       AND t.LastUpload > DATEADD(HOUR, -48, mr.MaxLastUpload)
       AND t.LastUpload <= mr.MaxLastUpload
-      AND t.LastUpload <> ?  -- exclude the missing-LastUpload sentinel (see pole_telemetry_loader.py)
+      AND t.LastUpload <> ?
 ),
 Bucketed AS (
     SELECT
@@ -565,10 +271,6 @@ Bucketed AS (
         DATEADD(HOUR, DATEDIFF(HOUR, '19000101', LocalTime), '19000101') AS BucketStart,
         BatteryPercentage, PanelPercentage, LightPercentage,
         IsOnlineFlag, IsLedFaultFlag, IsBatteryFaultFlag, IsPanelFaultFlag, IsOpenIssueFault,
-        -- Identifies each bucket's own most-recent reading, for
-        -- IsOpenIssueFault's "take the last telemetry" rule below --
-        -- NOT used for anything else (the other three fault flags and
-        -- IsOnline are ANY-in-window, not last-in-window).
         ROW_NUMBER() OVER (
             PARTITION BY PoleId, DATEADD(HOUR, DATEDIFF(HOUR, '19000101', LocalTime), '19000101')
             ORDER BY LastUpload DESC
@@ -638,6 +340,13 @@ WHEN NOT MATCHED THEN
 SET ANSI_WARNINGS ON;
 """
 
+# ---------------------------------------------------------------------------
+# _HOUR_MERGE_SQL — normal scheduled Leadsun Hour recompute
+# ---------------------------------------------------------------------------
+# Joins PoleTimeZones on VendorPoleId (Leadsun poles).
+# PanelPercentage/LightPercentage default to 80W/30W rated capacity when
+# ModelId has no matching PoleModels row, so unmatched poles still
+# contribute to averages rather than silently dropping out.
 _HOUR_MERGE_SQL = """
 SET ANSI_WARNINGS OFF;
 ;WITH TelemetryWithVitals AS (
@@ -649,121 +358,23 @@ SET ANSI_WARNINGS OFF;
              THEN t.BatteryElecCurrent1
              ELSE (t.BatteryElecCurrent1 + t.BatteryElecCurrent2) / 2.0
         END AS BatteryPercentage,
-        -- ISNULL(pm.SunboardPower, 80)/ISNULL(pm.LightPower, 30):
-        -- a ModelId with no PoleModels match at all (the LEFT JOIN
-        -- above produces NULL for both) now defaults to a representative
-        -- rated capacity instead of leaving PanelPercentage/
-        -- LightPercentage NULL for that reading -- an unmatched model is
-        -- treated the same as a
-        -- matched one with a sensible default, not "unknown", so it
-        -- still contributes to this bucket's AVG() instead of silently
-        -- dropping out of it. NULLIF(..., 0) still wraps the OUTSIDE of
-        -- that default, unchanged from before -- it now only guards
-        -- against a genuinely-matched PoleModels row that explicitly
-        -- has SunboardPower/LightPower = 0 (a real, if unusual, model
-        -- record), since the default values themselves (80, 30) are
-        -- never 0.
         (t.SolarBoardVoltage * t.SolarBoardElecCurrent) / NULLIF(ISNULL(pm.SunboardPower, 80), 0) * 100.0 AS PanelPercentage,
         CASE WHEN t.LampPower2 IS NULL THEN t.LampPower1
              ELSE t.LampPower1 + t.LampPower2
         END / NULLIF(ISNULL(pm.LightPower, 30), 0) * 100.0 AS LightPercentage,
         CASE WHEN t.IsOnline = 1 THEN 1 ELSE 0 END AS IsOnlineFlag,
-        -- Solar-powered lights are SUPPOSED to be off during daylight --
-        -- LampPower1+LampPower2=0 while the sun is actually up
-        -- (t.IsDaylightForLedFault, computed via real per-day/
-        -- per-location sunrise/sunset math in
-        -- pole_daylight_flags_loader.py -- NOT a fixed clock window,
-        -- which was tried first and had a real, unavoidable flaw:
-        -- whichever bucket straddles the actual sunrise/sunset moment
-        -- for a given day/location gets misclassified in one direction
-        -- or the other) is expected, correct behavior, not a fault.
-        -- Only when it's actually dark does zero lamp power indicate a
-        -- real problem. See this CASE's own ordering: the daylight
-        -- check comes first and unconditionally returns 0, regardless
-        -- of LampPower -- only falls through to the actual LampPower
-        -- check once it's established this reading is genuinely at
-        -- night.
-        --
-        -- t.IsDaylightForLedFault is DELIBERATELY NOT the same as
-        -- IsPanelFaultFlag's own t.IsDaylight below -- it's a more
-        -- forgiving definition (true at the exact moment, OR within 1
-        -- hour before OR after -- see pole_daylight_flags_loader.py's
-        -- own _LED_FAULT_GRACE_PERIOD), confirmed necessary in
-        -- practice: a real lamp doesn't always turn on the INSTANT the
-        -- sun crosses the sunset threshold (the "before" side of the
-        -- grace period), nor does one always turn off exactly at
-        -- sunrise -- some lamps sense approaching dawn light and turn
-        -- off slightly early (the "after" side). IsPanelFault has no
-        -- equivalent lag (solar output genuinely does track the sun
-        -- closely), so it keeps using the strict column unmodified --
-        -- these two flags need different daylight definitions, which
-        -- is exactly why this is two separate PoleTelemetry columns,
-        -- not one shared value.
-        --
-        -- t.IsDaylightForLedFault NULL (not yet computed by
-        -- pole_daylight_flags_loader.py for this specific reading) falls
-        -- through to the LampPower check below, same as "confirmed
-        -- dark" -- treating "we don't know yet" as "subject to the
-        -- normal check" is the safer default, rather than silently
-        -- exempting a reading from fault detection just because its
-        -- daylight status hasn't been computed yet.
+        -- Lights are off during daylight (IsDaylightForLedFault uses ±1h
+        -- grace period around sunrise/sunset for lamp response lag).
+        -- NULL IsDaylightForLedFault falls through to the lamp check.
         CASE
             WHEN t.IsDaylightForLedFault = 1 THEN 0
             WHEN (CASE WHEN t.LampPower2 IS NULL THEN t.LampPower1 ELSE t.LampPower1 + t.LampPower2 END) = 0 THEN 1
             ELSE 0
         END AS IsLedFaultFlag,
         CASE WHEN (CASE WHEN t.BatteryElecCurrent2 IS NULL THEN t.BatteryElecCurrent1 ELSE (t.BatteryElecCurrent1 + t.BatteryElecCurrent2) / 2.0 END) < 10 THEN 1 ELSE 0 END AS IsBatteryFaultFlag,
-        -- Solar panels only need to charge when BOTH (a) it's been
-        -- daylight for at least an hour (t.IsDaylightForPanelFault = 1
-        -- -- see pole_daylight_flags_loader.py's own
-        -- _PANEL_FAULT_SUNRISE_WARMUP_PERIOD; gives a panel time to
-        -- physically warm up right after sunrise) AND (b) the battery
-        -- actually needs it -- the TOTAL (not average) of
-        -- BatteryElecCurrent1 + BatteryElecCurrent2 is NOT exactly 200.
-        -- Replaces an earlier version of this same check (average
-        -- BatteryVoltage1/BatteryVoltage2 against a per-model
-        -- BatteryChargingMin threshold from PoleModels) by explicit
-        -- request -- BatteryChargingMin itself has been removed from
-        -- PoleModels entirely (see "sql/PoleModels/Drop
-        -- BatteryChargingMin column.sql"), so PoleModels is no longer
-        -- involved in this specific check at all (it's still joined
-        -- below for SunboardPower/LightPower, used elsewhere in this
-        -- same CTE -- just no longer for this). When the total current
-        -- IS exactly 200, zero panel output is expected, correct
-        -- behavior (nothing left to charge), not a fault, even during
-        -- daylight. Only once it's past the sunrise warmup AND this
-        -- condition does NOT hold does zero panel output indicate a
-        -- real problem. See this CASE's own ordering:
-        -- t.IsDaylightForPanelFault = 0 is checked first and
-        -- unconditionally returns 0 regardless of anything else -- it's
-        -- False both at night (no daylight at all) AND during the first
-        -- hour after sunrise (daylight, but not yet past warmup), so
-        -- this single check covers both cases without needing a
-        -- separate plain-nighttime condition; the total-current check
-        -- is checked second and ALSO unconditionally returns 0
-        -- regardless of panel output -- only once both of those are
-        -- ruled out does this fall through to the actual panel-output
-        -- check.
-        --
-        -- t.IsDaylightForPanelFault NULL (not yet computed by
-        -- pole_daylight_flags_loader.py for this specific reading) falls
-        -- through past that first check, same as "confirmed past
-        -- warmup" -- treating "we don't know yet" as "subject to the
-        -- normal check" is the safer default, rather than silently
-        -- exempting a reading from fault detection just because its
-        -- daylight status hasn't been computed yet. This is the mirror
-        -- image of IsLedFaultFlag's own NULL handling above (which
-        -- treats unknown as "confirmed dark" instead) -- each flag's
-        -- fault condition only applies during the OPPOSITE time of day,
-        -- so "unknown" always falls through to that flag's own check,
-        -- just via a different comparison (= 1 there, = 0 here).
-        --
-        -- A NULL BatteryElecCurrent1/BatteryElecCurrent2 (missing
-        -- readings) means the total is also NULL, and "NULL = 200" is
-        -- UNKNOWN (not TRUE) in T-SQL -- so a missing reading falls
-        -- through past this check too, same "unknown is treated as
-        -- subject to the normal check" reasoning as the daylight-NULL
-        -- case above, not silently exempted from fault detection.
+        -- Panel fault only applies when IsDaylightForPanelFault=1 (has been
+        -- daylight ≥1h AND daylight for ≥1h more) AND battery not full.
+        -- NULL IsDaylightForPanelFault falls through to the panel check.
         CASE
             WHEN t.IsDaylightForPanelFault = 0 THEN 0
             WHEN (CASE WHEN t.BatteryElecCurrent2 IS NULL THEN t.BatteryElecCurrent1 ELSE t.BatteryElecCurrent1 + t.BatteryElecCurrent2 END) = (CASE WHEN t.BatteryElecCurrent2 IS NULL THEN 100 ELSE 200 END) THEN 0
@@ -777,7 +388,7 @@ SET ANSI_WARNINGS OFF;
     LEFT JOIN PoleTimeZones ptz ON t.PoleId = ptz.VendorPoleId
     WHERE t.Source = 'Leadsun'
       AND t.LastUpload >= ?
-      AND t.LastUpload <> ?  -- exclude the missing-LastUpload sentinel (see pole_telemetry_loader.py)
+      AND t.LastUpload <> ?
 ),
 Bucketed AS (
     SELECT
@@ -786,10 +397,6 @@ Bucketed AS (
         DATEADD(HOUR, DATEDIFF(HOUR, '19000101', LocalTime), '19000101') AS BucketStart,
         BatteryPercentage, PanelPercentage, LightPercentage,
         IsOnlineFlag, IsLedFaultFlag, IsBatteryFaultFlag, IsPanelFaultFlag, IsOpenIssueFault,
-        -- Identifies each bucket's own most-recent reading, for
-        -- IsOpenIssueFault's "take the last telemetry" rule below --
-        -- NOT used for anything else (the other three fault flags and
-        -- IsOnline are ANY-in-window, not last-in-window).
         ROW_NUMBER() OVER (
             PARTITION BY PoleId, DATEADD(HOUR, DATEDIFF(HOUR, '19000101', LocalTime), '19000101')
             ORDER BY LastUpload DESC
@@ -859,30 +466,16 @@ WHEN NOT MATCHED THEN
 SET ANSI_WARNINGS ON;
 """
 
-# Last48Hours -- a genuinely different kind of "period" from Hour: a
-# single, continuously-updated ROLLING window per pole ("the last 48
-# hours as of whenever this loader last ran"), not one of a sequence of
-# discrete, non-overlapping historical buckets. There's no per-pole
-# "history" of Last48Hours rows the way Hour has 720 of them -- only ever
-# one, matching the explicit "only 1 of Last48Hours period" retention
-# rule (see load_leadsun_pole_vitals()'s own docstring).
+# ---------------------------------------------------------------------------
+# _LAST_48_HOURS_MERGE_SQL — rolling 48-hour window, one row per pole
+# ---------------------------------------------------------------------------
+# No PoleTimeZones join (no timezone bucketing needed -- 48h is a pure
+# duration comparison on UTC instants). MERGE key is PoleId+PeriodType
+# only (not PeriodStart) so PeriodStart/PeriodEnd are overwritten in
+# place each run, keeping exactly one row per pole.
 #
-# No PoleTimeZones join, no local-time bucketing at all -- unlike
-# Hour, this window is a pure 48-hour DURATION ("however long ago",
-# not "the last 2 calendar days" in any particular timezone), and
-# DATETIMEOFFSET comparisons are already timezone-aware (comparing actual
-# UTC instants), so there's nothing for a timezone conversion to add here.
-#
-# The MERGE's ON clause matches on PoleId + PeriodType alone --
-# deliberately NOT including PeriodStart, unlike Hour. PeriodStart
-# shifts forward by definition on every run (it's always "now - 48h"),
-# so matching on it would mean this could only ever INSERT a new row,
-# never UPDATE the existing one -- exactly the "only 1 row" guarantee
-# this needs would be violated without the retention-pruning step Hour
-# relies on (which doesn't apply here -- see _RETENTION_LIMITS' own
-# comment). Matching on PoleId+PeriodType alone means PeriodStart/
-# PeriodEnd are simply overwritten to the fresh window's bounds on every
-# run, keeping exactly one row per pole updated in place.
+# AvgPanelPercentage: only daylight readings where battery isn't full.
+# AvgLightPercentage: only nighttime readings.
 _LAST_48_HOURS_MERGE_SQL = """
 SET ANSI_WARNINGS OFF;
 ;WITH TelemetryWithVitals AS (
@@ -892,39 +485,10 @@ SET ANSI_WARNINGS OFF;
              THEN t.BatteryElecCurrent1
              ELSE (t.BatteryElecCurrent1 + t.BatteryElecCurrent2) / 2.0
         END AS BatteryPercentage,
-        -- ISNULL(pm.SunboardPower, 80)/ISNULL(pm.LightPower, 30):
-        -- a ModelId with no PoleModels match at all (the LEFT JOIN
-        -- above produces NULL for both) now defaults to a representative
-        -- rated capacity instead of leaving PanelPercentage/
-        -- LightPercentage NULL for that reading -- an unmatched model is
-        -- treated the same as a
-        -- matched one with a sensible default, not "unknown", so it
-        -- still contributes to this bucket's AVG() instead of silently
-        -- dropping out of it. NULLIF(..., 0) still wraps the OUTSIDE of
-        -- that default, unchanged from before -- it now only guards
-        -- against a genuinely-matched PoleModels row that explicitly
-        -- has SunboardPower/LightPower = 0 (a real, if unusual, model
-        -- record), since the default values themselves (80, 30) are
-        -- never 0.
         (t.SolarBoardVoltage * t.SolarBoardElecCurrent) / NULLIF(ISNULL(pm.SunboardPower, 80), 0) * 100.0 AS PanelPercentage,
         CASE WHEN t.LampPower2 IS NULL THEN t.LampPower1
              ELSE t.LampPower1 + t.LampPower2
         END / NULLIF(ISNULL(pm.LightPower, 30), 0) * 100.0 AS LightPercentage,
-        -- Exposed as their own output columns (not just used inline
-        -- within other expressions) specifically so the Aggregated CTE
-        -- downstream can reference them for AvgPanelPercentage's/
-        -- AvgLightPercentage's own new conditional-AVG() filters below
-        -- -- see that CTE's own comment for the full reasoning. NULL
-        -- handling for each mirrors this SAME query's own
-        -- IsPanelFaultFlag/IsLedFaultFlag precedent exactly, for
-        -- consistency: a NULL IsDaylightForPanelFault falls through
-        -- IsPanelFaultFlag's own daylight check the same way "confirmed
-        -- past warmup" would, so it's treated as daylight here too; a
-        -- NULL IsDaylightForLedFault falls through IsLedFaultFlag's own
-        -- daylight check the same way "confirmed dark" would, so it's
-        -- treated as night here too -- both are applied via ISNULL() at
-        -- the point of use in Aggregated, not baked into these raw
-        -- columns themselves.
         t.IsDaylightForPanelFault,
         t.IsDaylightForLedFault,
         CASE WHEN t.BatteryElecCurrent2 IS NULL
@@ -932,102 +496,12 @@ SET ANSI_WARNINGS OFF;
              ELSE t.BatteryElecCurrent1 + t.BatteryElecCurrent2
         END AS BatteryElecCurrentTotal,
         CASE WHEN t.IsOnline = 1 THEN 1 ELSE 0 END AS IsOnlineFlag,
-        -- Solar-powered lights are SUPPOSED to be off during daylight --
-        -- LampPower1+LampPower2=0 while the sun is actually up
-        -- (t.IsDaylightForLedFault, computed via real per-day/
-        -- per-location sunrise/sunset math in
-        -- pole_daylight_flags_loader.py -- NOT a fixed clock window,
-        -- which was tried first and had a real, unavoidable flaw:
-        -- whichever bucket straddles the actual sunrise/sunset moment
-        -- for a given day/location gets misclassified in one direction
-        -- or the other) is expected, correct behavior, not a fault.
-        -- Only when it's actually dark does zero lamp power indicate a
-        -- real problem. See this CASE's own ordering: the daylight
-        -- check comes first and unconditionally returns 0, regardless
-        -- of LampPower -- only falls through to the actual LampPower
-        -- check once it's established this reading is genuinely at
-        -- night.
-        --
-        -- t.IsDaylightForLedFault is DELIBERATELY NOT the same as
-        -- IsPanelFaultFlag's own t.IsDaylight below -- it's a more
-        -- forgiving definition (true at the exact moment, OR within 1
-        -- hour before OR after -- see pole_daylight_flags_loader.py's
-        -- own _LED_FAULT_GRACE_PERIOD), confirmed necessary in
-        -- practice: a real lamp doesn't always turn on the INSTANT the
-        -- sun crosses the sunset threshold (the "before" side of the
-        -- grace period), nor does one always turn off exactly at
-        -- sunrise -- some lamps sense approaching dawn light and turn
-        -- off slightly early (the "after" side). IsPanelFault has no
-        -- equivalent lag (solar output genuinely does track the sun
-        -- closely), so it keeps using the strict column unmodified --
-        -- these two flags need different daylight definitions, which
-        -- is exactly why this is two separate PoleTelemetry columns,
-        -- not one shared value.
-        --
-        -- t.IsDaylightForLedFault NULL (not yet computed by
-        -- pole_daylight_flags_loader.py for this specific reading) falls
-        -- through to the LampPower check below, same as "confirmed
-        -- dark" -- treating "we don't know yet" as "subject to the
-        -- normal check" is the safer default, rather than silently
-        -- exempting a reading from fault detection just because its
-        -- daylight status hasn't been computed yet.
         CASE
             WHEN t.IsDaylightForLedFault = 1 THEN 0
             WHEN (CASE WHEN t.LampPower2 IS NULL THEN t.LampPower1 ELSE t.LampPower1 + t.LampPower2 END) = 0 THEN 1
             ELSE 0
         END AS IsLedFaultFlag,
         CASE WHEN (CASE WHEN t.BatteryElecCurrent2 IS NULL THEN t.BatteryElecCurrent1 ELSE (t.BatteryElecCurrent1 + t.BatteryElecCurrent2) / 2.0 END) < 10 THEN 1 ELSE 0 END AS IsBatteryFaultFlag,
-        -- Solar panels only need to charge when BOTH (a) it's been
-        -- daylight for at least an hour (t.IsDaylightForPanelFault = 1
-        -- -- see pole_daylight_flags_loader.py's own
-        -- _PANEL_FAULT_SUNRISE_WARMUP_PERIOD; gives a panel time to
-        -- physically warm up right after sunrise) AND (b) the battery
-        -- actually needs it -- the TOTAL (not average) of
-        -- BatteryElecCurrent1 + BatteryElecCurrent2 is NOT exactly 200.
-        -- Replaces an earlier version of this same check (average
-        -- BatteryVoltage1/BatteryVoltage2 against a per-model
-        -- BatteryChargingMin threshold from PoleModels) by explicit
-        -- request -- BatteryChargingMin itself has been removed from
-        -- PoleModels entirely (see "sql/PoleModels/Drop
-        -- BatteryChargingMin column.sql"), so PoleModels is no longer
-        -- involved in this specific check at all (it's still joined
-        -- below for SunboardPower/LightPower, used elsewhere in this
-        -- same CTE -- just no longer for this). When the total current
-        -- IS exactly 200, zero panel output is expected, correct
-        -- behavior (nothing left to charge), not a fault, even during
-        -- daylight. Only once it's past the sunrise warmup AND this
-        -- condition does NOT hold does zero panel output indicate a
-        -- real problem. See this CASE's own ordering:
-        -- t.IsDaylightForPanelFault = 0 is checked first and
-        -- unconditionally returns 0 regardless of anything else -- it's
-        -- False both at night (no daylight at all) AND during the first
-        -- hour after sunrise (daylight, but not yet past warmup), so
-        -- this single check covers both cases without needing a
-        -- separate plain-nighttime condition; the total-current check
-        -- is checked second and ALSO unconditionally returns 0
-        -- regardless of panel output -- only once both of those are
-        -- ruled out does this fall through to the actual panel-output
-        -- check.
-        --
-        -- t.IsDaylightForPanelFault NULL (not yet computed by
-        -- pole_daylight_flags_loader.py for this specific reading) falls
-        -- through past that first check, same as "confirmed past
-        -- warmup" -- treating "we don't know yet" as "subject to the
-        -- normal check" is the safer default, rather than silently
-        -- exempting a reading from fault detection just because its
-        -- daylight status hasn't been computed yet. This is the mirror
-        -- image of IsLedFaultFlag's own NULL handling above (which
-        -- treats unknown as "confirmed dark" instead) -- each flag's
-        -- fault condition only applies during the OPPOSITE time of day,
-        -- so "unknown" always falls through to that flag's own check,
-        -- just via a different comparison (= 1 there, = 0 here).
-        --
-        -- A NULL BatteryElecCurrent1/BatteryElecCurrent2 (missing
-        -- readings) means the total is also NULL, and "NULL = 200" is
-        -- UNKNOWN (not TRUE) in T-SQL -- so a missing reading falls
-        -- through past this check too, same "unknown is treated as
-        -- subject to the normal check" reasoning as the daylight-NULL
-        -- case above, not silently exempted from fault detection.
         CASE
             WHEN t.IsDaylightForPanelFault = 0 THEN 0
             WHEN (CASE WHEN t.BatteryElecCurrent2 IS NULL THEN t.BatteryElecCurrent1 ELSE t.BatteryElecCurrent1 + t.BatteryElecCurrent2 END) = (CASE WHEN t.BatteryElecCurrent2 IS NULL THEN 100 ELSE 200 END) THEN 0
@@ -1035,43 +509,18 @@ SET ANSI_WARNINGS OFF;
             ELSE 0
         END AS IsPanelFaultFlag,
         t.IsOpenIssueFault,
-        -- Identifies each pole's own single most-recent reading in the
-        -- window, for IsOpenIssueFault's "take the last telemetry" rule.
         ROW_NUMBER() OVER (PARTITION BY t.PoleId ORDER BY t.LastUpload DESC) AS LatestOverall
     FROM PoleTelemetry t
     LEFT JOIN PoleModels pm ON t.ModelId = pm.ModelId
     WHERE t.Source = 'Leadsun'
       AND t.LastUpload >= ?
-      AND t.LastUpload <> ?  -- exclude the missing-LastUpload sentinel (see pole_telemetry_loader.py)
+      AND t.LastUpload <> ?
 ),
 Aggregated AS (
     SELECT
         PoleId,
         AVG(BatteryPercentage) AS AvgBatteryPercentage,
-        -- CHANGED by explicit request: only readings taken (a) during
-        -- daylight (ISNULL(IsDaylightForPanelFault, 1) = 1 -- NULL
-        -- treated as daylight, matching IsPanelFaultFlag's own NULL
-        -- handling above) AND (b) where the battery genuinely needs
-        -- charging (BatteryElecCurrentTotal <> 200 -- a NULL total
-        -- makes this UNKNOWN, not TRUE, so a reading with missing
-        -- current data is excluded from this average rather than
-        -- assumed to qualify) now contribute to AvgPanelPercentage.
-        -- SQL's own AVG() already ignores NULL inputs, so wrapping the
-        -- column itself in a CASE that evaluates to NULL for a
-        -- non-qualifying reading -- rather than filtering rows out of
-        -- the CTE entirely -- correctly excludes it from JUST this one
-        -- average while leaving every other aggregate in this same
-        -- Aggregated CTE (AvgBatteryPercentage, the fault-flag MAX()es,
-        -- RecordCount) computed over the full, unfiltered reading set,
-        -- exactly as before.
         AVG(CASE WHEN ISNULL(IsDaylightForPanelFault, 1) = 1 AND BatteryElecCurrentTotal <> 200 THEN PanelPercentage END) AS AvgPanelPercentage,
-        -- CHANGED by explicit request: only readings taken at night
-        -- (ISNULL(IsDaylightForLedFault, 0) = 0 -- NULL treated as
-        -- night, matching IsLedFaultFlag's own NULL handling above) now
-        -- contribute to AvgLightPercentage -- same "wrap the column in
-        -- a CASE, let AVG() ignore the NULLs" mechanism as
-        -- AvgPanelPercentage's own change just above; see that
-        -- constant's own comment for the full reasoning.
         AVG(CASE WHEN ISNULL(IsDaylightForLedFault, 0) = 0 THEN LightPercentage END) AS AvgLightPercentage,
         MAX(IsOnlineFlag)       AS IsOnlineAgg,
         MAX(IsLedFaultFlag)     AS IsLedFaultAgg,
@@ -1087,19 +536,6 @@ USING (
     SELECT
         PoleId,
         'Last48Hours' AS PeriodType,
-        -- Converted to Eastern -- SYSDATETIMEOFFSET() alone reflects the
-        -- SERVER's own time zone (Azure SQL Database runs in UTC
-        -- regardless of physical region), which would otherwise show
-        -- PeriodStart/PeriodEnd as +00:00 while every other "now"-style
-        -- timestamp in this project (e.g. SP_Execution's StartDateTime/
-        -- EndDateTime, via shared/datetime_utils.py's now_eastern())
-        -- is Eastern -- confusing side-by-side, and inconsistent with
-        -- the rest of this codebase for no real reason. Applying AT TIME
-        -- ZONE before subtracting 48 hours doesn't change WHICH absolute
-        -- instant PeriodStart lands on (DATEADD operates on the
-        -- underlying instant, not the display offset, so this is safe
-        -- even across a DST transition) -- it only changes how that
-        -- same instant is displayed.
         DATEADD(HOUR, -48, SYSDATETIMEOFFSET() AT TIME ZONE 'Eastern Standard Time') AS PeriodStart,
         SYSDATETIMEOFFSET() AT TIME ZONE 'Eastern Standard Time' AS PeriodEnd,
         AvgBatteryPercentage, AvgPanelPercentage, AvgLightPercentage,
@@ -1146,13 +582,6 @@ _MERGE_SQL_BY_PERIOD_TYPE = {
     "Last48Hours": _LAST_48_HOURS_MERGE_SQL,
 }
 
-# Deletes anything beyond the newest N rows per PoleId, ordered by
-# PeriodStart DESC -- run once per period type, right after that period
-# type's own MERGE commits. Only Hour is in _RETENTION_LIMITS --
-# count-based retention doesn't apply to Last48Hours, which is always
-# exactly one row per pole by construction, not a growing history to cap.
-# Last48Hours has its own, different cleanup need instead -- see
-# _LAST_48_HOURS_STALE_ROW_PRUNE_SQL below.
 _RETENTION_PRUNE_SQL = """
 ;WITH Ranked AS (
     SELECT PoleId, PeriodStart,
@@ -1166,25 +595,9 @@ JOIN Ranked r ON pv.PoleId = r.PoleId AND pv.PeriodStart = r.PeriodStart
 WHERE pv.PeriodType = ? AND r.rn > ?
 """
 
-# Removes any existing Last48Hours row for a pole that no longer has ANY
-# telemetry within the current 48-hour window -- without this, a pole
-# that goes completely silent (zero readings at all, not even one) keeps
-# whatever it last successfully computed FOREVER, since
-# _LAST_48_HOURS_MERGE_SQL's own source query only ever includes poles
-# that DO still have recent telemetry -- a silent pole simply never
-# appears in that source at all, so the MERGE can neither update nor
-# remove its existing row. A stale "IsOnline=1" (or whatever it last
-# was) for a pole that hasn't reported in days would keep silently
-# counting toward getPoleVitals' connectedLights/totalLights, which is
-# actively misleading, not just imprecise -- this is a correctness gap,
-# not a nice-to-have.
-#
-# cutoff/sentinel here must be the SAME two values bound into
-# _LAST_48_HOURS_MERGE_SQL's own WHERE clause for this same run -- this
-# has to describe exactly the same "no recent telemetry" condition the
-# MERGE itself used to decide who's IN its source, or this could delete
-# (or fail to delete) the wrong set of rows relative to what the MERGE
-# just did.
+# Removes stale Last48Hours rows for poles that have no telemetry in the
+# current 48-hour window. Without this, a silent pole's last-known values
+# would persist forever, misleadingly counting toward connected-lights totals.
 _LAST_48_HOURS_STALE_ROW_PRUNE_SQL = """
 DELETE pv
 FROM PoleVitals pv
@@ -1199,20 +612,10 @@ WHERE pv.PeriodType = 'Last48Hours'
 
 
 def _run_cleanup_for_period_type(cursor, period_type: str, cutoff: str) -> int:
-    """
-    Runs whatever "remove now-irrelevant rows" step applies to this
-    period type, right after its own MERGE succeeds. Hour gets the
-    keep-newest-N retention prune; Last48Hours gets its own stale-row
-    removal instead (see _LAST_48_HOURS_STALE_ROW_PRUNE_SQL's own
-    comment for why retention-by-count doesn't apply to it). A single,
-    shared call site for both success paths in load_leadsun_pole_vitals() (the
-    normal one and the benign-01003-warning one) -- rather than
-    duplicating this same period-type dispatch logic in both places,
-    which had already happened once before this function existed and
-    was exactly the kind of near-identical duplication worth collapsing.
-
-    Returns the number of rows removed, for logging.
-    """
+    """Runs the appropriate cleanup after each period type's MERGE commits.
+    Hour: count-based retention prune (keep newest 720).
+    Last48Hours: remove rows for poles with no recent telemetry.
+    Returns number of rows removed."""
     retention_limit = _RETENTION_LIMITS.get(period_type)
     if retention_limit is not None:
         cursor.execute(_RETENTION_PRUNE_SQL, period_type, period_type, retention_limit)
@@ -1229,456 +632,237 @@ def _run_cleanup_for_period_type(cursor, period_type: str, cutoff: str) -> int:
     return 0
 
 
-
 def _is_benign_null_aggregate_warning(exc: Exception) -> bool:
-    """
-    SQLSTATE 01003 ("Warning: Null value is eliminated by an aggregate or
-    other SET operation") is SQL Server's informational notice that
-    AVG()/etc. skipped over a NULL -- not a real failure. It's the
-    designed, expected consequence of this loader's NULLIF-guarded
-    PanelPercentage/LightPercentage formulas: a reading whose PoleModels
-    row explicitly has SunboardPower/LightPower = 0 is *supposed* to drop
-    out of that specific average -- a genuinely unmatched ModelId no
-    longer reaches this path at all (ISNULL(pm.SunboardPower, 80)/
-    ISNULL(pm.LightPower, 30) give it a default instead), but a real
-    PoleModels row explicitly recorded as 0 still hits the same NULLIF
-    guard, same as before. pyodbc still raises this as a Python exception
-    though (SQLSTATE class "01" is warning, not error, but pyodbc doesn't
-    distinguish for the purposes of cursor.execute() raising), so without
-    this check a MERGE that actually completed successfully gets logged
-    and counted as a failure.
-    """
+    """Returns True for SQLSTATE 01003 -- SQL Server's informational warning
+    that AVG() skipped a NULL (expected when NULLIF guards produce NULLs for
+    PoleModels rows with SunboardPower/LightPower = 0). pyodbc raises this as
+    a Python exception even though the MERGE completed successfully."""
     args = getattr(exc, "args", ())
     return bool(args) and args[0] == "01003"
 
 
 def _safe_rollback(conn, context: str) -> None:
-    """
-    Attempts conn.rollback(), but never lets a FAILED rollback itself
-    replace/mask whatever original exception the caller is already
-    handling. Confirmed in practice as a real production incident: if
-    the connection is already broken (e.g. the same class of 08S01
-    "Communication link failure" this project has already hit once, in
-    load_leadsun_pole_vitals()'s own top-level except block, before that one got
-    its own fresh-connection fix), conn.rollback() can ITSELF raise --
-    and since every caller of this helper originally called
-    conn.rollback() BEFORE its own logging.error() describing the REAL
-    problem, that logging.error() call never ran at all. The original,
-    useful error message (which period type, which step, what actually
-    failed) was silently lost, replaced by an uninformative
-    connection-level exception with no context -- exactly the shape of
-    the "n/a" / no-descriptive-message failures this was built to
-    prevent going forward.
-
-    A failed rollback here isn't a NEW problem needing its own separate
-    handling or its own error-level log entry -- the connection is
-    already on its way to being closed in the caller's own top-level
-    `finally` block regardless (nothing further to protect by rolling
-    back successfully), so this is logged as a warning, not re-raised.
-    context is purely for that log line, so it's traceable to which
-    caller's own rollback attempt this was.
-    """
+    """Attempts rollback without letting a failed rollback mask the original
+    exception. A broken connection can raise on rollback itself; this logs
+    the rollback failure as a warning and continues."""
     try:
         conn.rollback()
     except Exception as rollback_error:
         logging.warning(
-            "%s: rollback itself failed (connection likely already broken, same underlying "
-            "cause as whatever the ORIGINAL failure being handled was) -- %s",
+            "%s: rollback itself failed (connection likely broken): %s",
             context,
             rollback_error,
         )
 
 
-def load_leadsun_pole_vitals(backfill: bool = False) -> None:
+def _open_sp_execution(cursor, name: str, source: str) -> int:
+    """Inserts an SP_Execution row and returns its Id."""
+    cursor.execute(
+        """
+        INSERT INTO SP_Execution (Name, Environment, StartDateTime, Source, BatchCount, IsFinalBatch)
+        OUTPUT INSERTED.Id
+        VALUES (?, ?, ?, ?, 0, 0)
+        """,
+        name,
+        ENVIRONMENT,
+        _to_dto_string(_now_eastern()),
+        source,
+    )
+    return cursor.fetchone()[0]
+
+
+def _close_sp_execution(cursor, sp_exec_id: int, success: int, errors: int, batches: int) -> None:
+    """Updates the SP_Execution row with final counts."""
+    cursor.execute(
+        """
+        UPDATE SP_Execution
+        SET EndDateTime = ?,
+            TotalSuccessfulRecords = ?,
+            TotalErrorRecords = ?,
+            BatchCount = ?,
+            IsFinalBatch = 1
+        WHERE Id = ?
+        """,
+        _to_dto_string(_now_eastern()),
+        success,
+        errors,
+        batches,
+        sp_exec_id,
+    )
+
+
+def _record_sp_execution_failure(sp_exec_id: int, ex: Exception, success: int, errors: int) -> None:
+    """Records a run failure in SP_Execution using a fresh connection, so a
+    broken main connection doesn't prevent the error from being logged."""
+    try:
+        recovery_conn = get_connection()
+        recovery_cursor = recovery_conn.cursor()
+        try:
+            recovery_cursor.execute(
+                """
+                UPDATE SP_Execution
+                SET EndDateTime = ?, ErrorMessage = ?,
+                    TotalSuccessfulRecords = ?, TotalErrorRecords = ?
+                WHERE Id = ?
+                """,
+                _to_dto_string(_now_eastern()),
+                str(ex),
+                success,
+                errors,
+                sp_exec_id,
+            )
+            recovery_conn.commit()
+        finally:
+            recovery_cursor.close()
+            recovery_conn.close()
+    except Exception as recording_error:
+        logging.error(
+            "SP_Execution Id=%s: additionally failed to record run failure: %s "
+            "(original error was: %s)",
+            sp_exec_id,
+            recording_error,
+            ex,
+        )
+
+
+def _run_vitals_for_source(
+    sp_name: str,
+    source_name: str,
+    merge_sql_by_period_type: dict,
+    backfill: bool,
+) -> None:
     """
-    Recomputes PoleVitals from PoleTelemetry + PoleModels + PoleTimeZones.
-    Each period type is its own MERGE (plus, for Hour, a retention
-    prune immediately after) -- no per-row Python loop or staging table
-    needed here, unlike the other loaders, since the SQL aggregation
-    itself produces a modest number of output rows (bounded by distinct
-    PoleIds x a couple of buckets), not thousands of individually-
-    bound parameter rows.
+    Shared implementation for both load_leadsun_pole_vitals() and
+    load_provisioned_pole_vitals(). Runs each period type's MERGE in order,
+    commits + runs cleanup after each, and records the run in SP_Execution.
 
-    Two period types: Hour, Last48Hours. ('Day', 'Week', and 'Month' were
-    all removed entirely by explicit request -- 'Week'/'Month' had
-    already been dropped from active computation earlier, leaving only
-    the PeriodType CHECK constraint still permitting them; 'Day' was
-    still actively computed until this same removal.
-    LastKnown48Hours -- a THIRD period type that used to persist here,
-    specifically so a pole that had gone silent would still show its
-    last known state instead of nothing -- was later removed entirely
-    by a separate explicit request/correction: a silent pole (no
-    current Last48Hours row) is now supposed to genuinely return null
-    for its per-pole detail fields, not fall back to stale last-known
-    values. Existing historical rows with any of these removed
-    PeriodType values are deliberately left in the table untouched --
-    only the CHECK constraint was tightened and this loader's own
-    computation stopped, nothing was deleted.) See this module's own
-    header comment for the full fault-flag design (IsLedFault/
-    IsBatteryFault/IsPanelFault/IsOpenIssueFault/IsPoleFault) all three
-    now compute, replacing the earlier Daylight-based LightStatus
-    classification entirely.
-
-    Retention: Hour keeps the newest 720 rows per pole (30 days, no
-    gaps) -- this table had no pruning at all before this was
-    introduced, so it shrank (once) the first time this ran against an
-    existing, unpruned table. Last48Hours doesn't need count-based
-    retention (it's structurally always exactly one row per pole -- see
-    _LAST_48_HOURS_MERGE_SQL's own comment for why its MERGE is built
-    that way), but DOES get its own different cleanup: any existing row
-    for a pole that's gone completely silent (no telemetry at all within
-    the current 48-hour window) is removed, since the MERGE itself can
-    never touch such a pole -- it simply never appears in the MERGE's
-    own source query, so without this cleanup its last-known values
-    would persist forever, misleadingly counting toward getPoleVitals'
-    connectedLights/totalLights long after the pole stopped reporting.
-    This is now the ONLY behavior for a silent pole -- its Last48Hours
-    row simply disappears, and every reader of PoleVitals (getPoleVitals,
-    getPoles) is expected to treat that absence as null, not to fall back
-    to anything else.
-
-    Commits after EACH period type's MERGE (and its own cleanup step --
-    retention prune for Hour, stale-row removal for Last48Hours)
-    individually, not once at the end for all of them -- a slow or
-    failing period type can no longer roll back an earlier period
-    type's already-computed, already-succeeded results. Each period
-    type's fate -- commit on success, rollback on genuine failure -- is
-    independent of what happens to the others.
-
-    Set backfill=True for a one-off historical recompute covering
-    PoleTelemetry's entire 6-month retention window for Hour, instead
-    of the small "current + previous bucket" window used on every normal
-    run. Ignored for Last48Hours, which always uses the full 48-hour
-    window regardless (see _compute_cutoff()'s own docstring).
+    Commits after each period type independently -- a slow or failing period
+    type cannot roll back an earlier one's already-committed results.
     """
-    start_time = _to_dto_string(_now_eastern())
     conn = get_connection()
     cursor = conn.cursor()
-
     sp_exec_id = None
     total_success = 0
     total_errors = 0
 
     try:
-        # 1. Open an SP_Execution row for this run
-        cursor.execute(
-            """
-            INSERT INTO SP_Execution (Name, Environment, StartDateTime, Source, BatchCount, IsFinalBatch)
-            OUTPUT INSERTED.Id
-            VALUES (?, ?, ?, ?, 0, 0)
-            """,
-            "loadPoleVitals",
-            ENVIRONMENT,
-            start_time,
-            SOURCE_NAME,
-        )
-        sp_exec_id = cursor.fetchone()[0]
+        sp_exec_id = _open_sp_execution(cursor, sp_name, source_name)
         conn.commit()
 
-        # 2. Recompute each period type, committing immediately after
-        # each one succeeds (MERGE, then retention prune if applicable)
-        # -- NOT once at the end for all three. See load_leadsun_pole_vitals()'s
-        # own docstring for why this matters in practice, not just in
-        # theory.
         upsert_start = time.perf_counter()
         now = _now_eastern()
         for period_type in PERIOD_TYPES:
-            merge_sql = _MERGE_SQL_BY_PERIOD_TYPE[period_type]
+            merge_sql = merge_sql_by_period_type[period_type]
             cutoff = _compute_cutoff(now, period_type, backfill)
-            params = (cutoff, _MISSING_LAST_UPLOAD_SENTINEL, SOURCE_NAME, sp_exec_id)
+            params = (cutoff, _MISSING_LAST_UPLOAD_SENTINEL, source_name, sp_exec_id)
 
             try:
                 cursor.execute(merge_sql, *params)
                 affected = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
-
                 pruned = _run_cleanup_for_period_type(cursor, period_type, cutoff)
-
                 conn.commit()
                 total_success += affected
                 logging.info(
-                    "loadPoleVitals: %s period recomputed and committed, %d row(s) affected, "
-                    "%d stale row(s) pruned (since %s).",
-                    period_type,
-                    affected,
-                    pruned,
-                    cutoff,
+                    "%s: %s period committed, %d row(s) affected, %d pruned (since %s).",
+                    sp_name, period_type, affected, pruned, cutoff,
                 )
             except Exception as period_error:
                 if _is_benign_null_aggregate_warning(period_error):
-                    # SQLSTATE 01003 -- see _is_benign_null_aggregate_warning's
-                    # docstring. The MERGE itself completed, so this still
-                    # commits (including the retention prune, run the same
-                    # way as the success path above) -- only pyodbc's
-                    # exception-raising made it look like a failure.
                     affected = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
                     pruned = _run_cleanup_for_period_type(cursor, period_type, cutoff)
                     conn.commit()
                     total_success += affected
                     logging.info(
-                        "loadPoleVitals: %s period recomputed and committed, %d row(s) affected, "
-                        "%d stale row(s) pruned (since %s) -- some reading(s) had a PoleModels row "
-                        "explicitly recording zero SunboardPower or LightPower and were excluded "
-                        "from that specific average, which is expected, not an error.",
-                        period_type,
-                        affected,
-                        pruned,
-                        cutoff,
+                        "%s: %s period committed, %d row(s) affected, %d pruned (since %s) "
+                        "-- null aggregate warning (expected, not an error).",
+                        sp_name, period_type, affected, pruned, cutoff,
                     )
                 else:
-                    # A genuine failure -- explicitly roll back THIS
-                    # period type's attempt (rather than leaving it in
-                    # whatever ambiguous uncommitted state the failed
-                    # statement left behind) before moving on to the
-                    # next period type in the same connection/transaction.
-                    # _safe_rollback (not conn.rollback() directly) --
-                    # see that helper's own docstring for why: a FAILED
-                    # rollback here must not prevent the logging.error()
-                    # right below from actually running.
-                    _safe_rollback(conn, f"loadPoleVitals ({period_type})")
+                    _safe_rollback(conn, f"{sp_name} ({period_type})")
                     total_errors += 1
                     logging.error(
-                        "loadPoleVitals: failed to recompute %s period (rolled back, other "
-                        "period types unaffected): %s",
-                        period_type,
-                        period_error,
+                        "%s: %s period failed (rolled back, other periods unaffected): %s",
+                        sp_name, period_type, period_error,
                     )
 
-        logging.info(
-            "loadPoleVitals: recompute phase took %.1fs.",
-            time.perf_counter() - upsert_start,
-        )
+        logging.info("%s: recompute phase took %.1fs.", sp_name, time.perf_counter() - upsert_start)
 
-        # 3. Close out the SP_Execution row with final counts
-        cursor.execute(
-            """
-            UPDATE SP_Execution
-            SET EndDateTime = ?,
-                TotalSuccessfulRecords = ?,
-                TotalErrorRecords = ?,
-                BatchCount = ?,
-                IsFinalBatch = 1
-            WHERE Id = ?
-            """,
-            _to_dto_string(_now_eastern()),
-            total_success,
-            total_errors,
-            # len(PERIOD_TYPES): one batch per period type in the main
-            # loop -- no longer +1 for a separate LastKnown48Hours step,
-            # since that period type was removed entirely. BatchCount is
-            # purely a diagnostic count of "how many distinct recompute
-            # steps this run did", not something anything else depends
-            # on for correctness.
-            len(PERIOD_TYPES),
-            sp_exec_id,
-        )
+        _close_sp_execution(cursor, sp_exec_id, total_success, total_errors, len(PERIOD_TYPES))
         conn.commit()
 
     except Exception as ex:
-        logging.error("loadPoleVitals: run failed: %s", ex)
+        logging.error("%s: run failed: %s", sp_name, ex)
         if sp_exec_id:
-            # Fresh connection for recording the failure -- a real
-            # production gap this loader had, unlike every other loader
-            # in this project (pole_daylight_flags_loader.py/
-            # pole_timezones_loader.py/this same module's own
-            # backfill_*_for_all_poles() functions): the exception that
-            # got us here might BE a connection-level failure (confirmed
-            # in practice -- an 08S01 "Communication link failure" during
-            # this loader's own recompute phase), in which case
-            # reusing the SAME connection/cursor to record it just fails
-            # a SECOND time (conn.rollback() above, then this same
-            # UPDATE), and that second failure was going completely
-            # uncaught -- propagating past this except block entirely
-            # and crashing the whole loadDeviceData timer invocation,
-            # with SP_Execution's own row left half-finished (no
-            # EndDateTime, no ErrorMessage) instead of recording
-            # anything useful about what actually happened.
-            try:
-                recovery_conn = get_connection()
-                recovery_cursor = recovery_conn.cursor()
-                try:
-                    recovery_cursor.execute(
-                        """
-                        UPDATE SP_Execution
-                        SET EndDateTime = ?, ErrorMessage = ?, TotalSuccessfulRecords = ?, TotalErrorRecords = ?
-                        WHERE Id = ?
-                        """,
-                        _to_dto_string(_now_eastern()),
-                        str(ex),
-                        total_success,
-                        total_errors,
-                        sp_exec_id,
-                    )
-                    recovery_conn.commit()
-                finally:
-                    recovery_cursor.close()
-                    recovery_conn.close()
-            except Exception as recording_error:
-                logging.error(
-                    "loadPoleVitals: additionally failed to record this run's failure in "
-                    "SP_Execution (Id=%s): %s -- that row will be left with EndDateTime still "
-                    "NULL. The ORIGINAL failure (%s) is what's actually raised below, not this one.",
-                    sp_exec_id,
-                    recording_error,
-                    ex,
-                )
+            _record_sp_execution_failure(sp_exec_id, ex, total_success, total_errors)
         raise
     finally:
         cursor.close()
         conn.close()
 
 
+def load_leadsun_pole_vitals(backfill: bool = False) -> None:
+    """
+    Recomputes PoleVitals from PoleTelemetry + PoleModels + PoleTimeZones
+    for all Leadsun poles. Runs Hour and Last48Hours period types in order,
+    committing and cleaning up after each independently.
+
+    Set backfill=True to widen the Hour lookback to 400 days (the full
+    PoleTelemetry retention window) instead of the normal 3-hour window.
+    Has no effect on Last48Hours, which always uses a 48-hour window.
+    """
+    _run_vitals_for_source("loadPoleVitals", SOURCE_NAME, _MERGE_SQL_BY_PERIOD_TYPE, backfill)
+
+
 def backfill_latest_hour_for_all_poles() -> None:
     """
-    One-off operation: ensures EVERY pole has an up-to-date "Hour"
-    PoleVitals row reflecting its own most recent known telemetry,
-    REGARDLESS of how old that telemetry is -- unlike load_leadsun_pole_vitals()
-    (even with backfill=True), which only ever looks within a GLOBAL
-    time window relative to "now". A pole that's gone completely silent
-    (its latest reading older than even Last48Hours' own 48-hour window)
-    would otherwise never get its "Hour" row touched again, no matter
-    how many times the normal, scheduled loader runs -- it simply never
-    appears in that run's own global time-cutoff filter.
+    Ensures every Leadsun pole has an up-to-date Hour PoleVitals row for
+    its own most-recent telemetry bucket, even poles that have gone silent
+    and fall outside the normal 3-hour rolling window.
 
-    See _BACKFILL_LATEST_HOUR_PER_POLE_MERGE_SQL's own comment for the
-    full reasoning and exactly how each pole's own scope is determined
-    (its own MAX(LastUpload), converted to ITS OWN local time zone,
-    truncated to the start of that local hour).
-
-    A single set-based MERGE covering every pole at once, not a per-pole
-    Python loop -- SQL Server resolves each pole's own MAX(LastUpload)
-    and its own bucket boundaries together, in one pass.
-
-    Intended to be run manually, as a one-off catch-up (e.g. after
-    correcting a batch of poles' data, or after noticing a specific pole
-    stuck on stale Hour vitals) -- NOT part of the normal, scheduled
-    loadDeviceData cycle. See
-    scripts/backfill_latest_hour_pole_vitals.py for how to invoke it.
-
-    Only touches the "Hour" period type -- Day and Last48Hours are
-    unaffected. If a matching need arises for those too, each would need
-    its own analogous query (see this function's own module-level SQL
-    constant's comment on why this is a full, separate copy rather than
-    something parameterizable across period types).
+    Run manually after correcting stale pole data. Only touches Hour.
     """
     start_time = _to_dto_string(_now_eastern())
     conn = get_connection()
     cursor = conn.cursor()
-
     sp_exec_id = None
     total_success = 0
     total_errors = 0
 
     try:
-        # 1. Open an SP_Execution row for this run
-        cursor.execute(
-            """
-            INSERT INTO SP_Execution (Name, Environment, StartDateTime, Source, BatchCount, IsFinalBatch)
-            OUTPUT INSERTED.Id
-            VALUES (?, ?, ?, ?, 0, 0)
-            """,
-            "backfillLatestHourPoleVitals",
-            ENVIRONMENT,
-            start_time,
-            SOURCE_NAME,
-        )
-        sp_exec_id = cursor.fetchone()[0]
+        sp_exec_id = _open_sp_execution(cursor, "backfillLatestHourPoleVitals", SOURCE_NAME)
         conn.commit()
 
-        # 2. The single, set-based MERGE covering every pole's own
-        # latest-hour bucket at once.
         params = (_MISSING_LAST_UPLOAD_SENTINEL, _MISSING_LAST_UPLOAD_SENTINEL, SOURCE_NAME, sp_exec_id)
         try:
             cursor.execute(_BACKFILL_LATEST_HOUR_PER_POLE_MERGE_SQL, *params)
             total_success = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
             conn.commit()
             logging.info(
-                "backfillLatestHourPoleVitals: %d pole(s)' latest Hour vitals recomputed and committed.",
+                "backfillLatestHourPoleVitals: %d pole(s)' latest Hour vitals recomputed.",
                 total_success,
             )
         except Exception as merge_error:
             if _is_benign_null_aggregate_warning(merge_error):
-                # SQLSTATE 01003 -- see _is_benign_null_aggregate_warning's
-                # own docstring. The MERGE itself completed, so this
-                # still commits -- only pyodbc's exception-raising made
-                # it look like a failure.
                 total_success = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
                 conn.commit()
                 logging.info(
-                    "backfillLatestHourPoleVitals: %d pole(s)' latest Hour vitals recomputed and "
-                    "committed -- some reading(s) had a PoleModels row explicitly recording zero "
-                    "SunboardPower or LightPower and were excluded from that specific average, "
-                    "which is expected, not an error.",
+                    "backfillLatestHourPoleVitals: %d pole(s)' latest Hour vitals recomputed "
+                    "-- null aggregate warning (expected, not an error).",
                     total_success,
                 )
             else:
                 _safe_rollback(conn, "backfillLatestHourPoleVitals")
                 total_errors = 1
-                logging.error(
-                    "backfillLatestHourPoleVitals: MERGE failed (rolled back): %s", merge_error
-                )
+                logging.error("backfillLatestHourPoleVitals: MERGE failed: %s", merge_error)
                 raise
 
-        # 3. Close out the SP_Execution row with final counts
-        cursor.execute(
-            """
-            UPDATE SP_Execution
-            SET EndDateTime = ?,
-                TotalSuccessfulRecords = ?,
-                TotalErrorRecords = ?,
-                BatchCount = ?,
-                IsFinalBatch = 1
-            WHERE Id = ?
-            """,
-            _to_dto_string(_now_eastern()),
-            total_success,
-            total_errors,
-            1,
-            sp_exec_id,
-        )
+        _close_sp_execution(cursor, sp_exec_id, total_success, total_errors, 1)
         conn.commit()
 
     except Exception as ex:
         logging.error("backfillLatestHourPoleVitals: run failed: %s", ex)
         if sp_exec_id:
-            # Fresh connection for recording the failure -- the
-            # exception that got us here might BE a connection-level
-            # failure (e.g. a genuine "Communication link failure"), in
-            # which case reusing the same connection/cursor to record it
-            # would just raise a SECOND time, masking the original,
-            # more useful error with a less useful one about recording
-            # it. Same fix, same reasoning, as
-            # pole_daylight_flags_loader.py/pole_timezones_loader.py's
-            # own equivalent.
-            try:
-                recovery_conn = get_connection()
-                recovery_cursor = recovery_conn.cursor()
-                try:
-                    recovery_cursor.execute(
-                        """
-                        UPDATE SP_Execution
-                        SET EndDateTime = ?, ErrorMessage = ?, TotalSuccessfulRecords = ?, TotalErrorRecords = ?
-                        WHERE Id = ?
-                        """,
-                        _to_dto_string(_now_eastern()),
-                        str(ex),
-                        total_success,
-                        total_errors,
-                        sp_exec_id,
-                    )
-                    recovery_conn.commit()
-                finally:
-                    recovery_cursor.close()
-                    recovery_conn.close()
-            except Exception as recording_error:
-                logging.error(
-                    "backfillLatestHourPoleVitals: additionally failed to record this run's "
-                    "failure in SP_Execution (Id=%s): %s -- that row will be left with "
-                    "EndDateTime still NULL. The ORIGINAL failure (%s) is what's actually "
-                    "raised below, not this one.",
-                    sp_exec_id,
-                    recording_error,
-                    ex,
-                )
+            _record_sp_execution_failure(sp_exec_id, ex, total_success, total_errors)
         raise
     finally:
         cursor.close()
@@ -1687,181 +871,76 @@ def backfill_latest_hour_for_all_poles() -> None:
 
 def backfill_last_48_hours_of_hour_for_all_poles() -> None:
     """
-    One-off operation: ensures EVERY pole has up to 48 hourly "Hour"
-    PoleVitals rows -- every hour that has telemetry within a 48-hour
-    window ending at THAT POLE'S OWN latest reading, REGARDLESS of how
-    old that reading is.
+    Recomputes up to 48 hourly Hour rows per Leadsun pole, each pole using
+    its own last 48 hours of activity ending at its own MaxLastUpload.
 
-    A broader relative of backfill_latest_hour_for_all_poles() above,
-    not a replacement for it: that one only ever touches a pole's single
-    newest hour. This one exists for a specific, related need:
-    pole_vitals_api.py's GetPoleVitalsByPeriod now anchors its own
-    48-hour display window to each pole's latest telemetry too (see
-    _POLE_VITALS_HOUR_HISTORY_SQL_TEMPLATE there) -- but that only shows
-    something useful for an offline pole if PoleVitals rows genuinely
-    exist across that pole's own last 48 hours of activity in the first
-    place. A pole that went offline before this project's Hour-vitals
-    logic existed, or whose Hour rows from that window were never
-    successfully computed for some other reason, needs this fuller
-    backfill.
-
-    See _BACKFILL_LAST_48_HOURS_OF_HOUR_PER_POLE_MERGE_SQL's own comment
-    for the full reasoning and exactly how each pole's own scope is
-    determined (its own MAX(LastUpload), then every reading within 48
-    hours before that moment, each bucketed into its own local hour --
-    same bucketing logic as the normal, scheduled _HOUR_MERGE_SQL, just
-    scoped per-pole instead of by a global cutoff relative to "now").
-
-    A single set-based MERGE covering every pole's entire 48-hour window
-    at once, not a per-pole Python loop -- SQL Server resolves each
-    pole's own MAX(LastUpload), its own 48-hour range, and every bucket
-    within it together, in one pass.
-
-    Intended to be run manually, as a one-off catch-up (e.g. after
-    correcting a batch of poles' data, after deploying the
-    GetPoleVitalsByPeriod anchor change, or after noticing a specific
-    offline pole showing an incomplete history) -- NOT part of the
-    normal, scheduled loadDeviceData cycle. See
-    scripts/backfill_last_48_hours_hour_pole_vitals.py for how to invoke
-    it.
-
-    Only touches the "Hour" period type -- Day and Last48Hours are
-    unaffected, same as backfill_latest_hour_for_all_poles() above.
+    Run after formula changes to correct the recent hourly history for all
+    poles at once. Only touches Hour.
     """
     start_time = _to_dto_string(_now_eastern())
     conn = get_connection()
     cursor = conn.cursor()
-
     sp_exec_id = None
     total_success = 0
     total_errors = 0
 
     try:
-        # 1. Open an SP_Execution row for this run
-        cursor.execute(
-            """
-            INSERT INTO SP_Execution (Name, Environment, StartDateTime, Source, BatchCount, IsFinalBatch)
-            OUTPUT INSERTED.Id
-            VALUES (?, ?, ?, ?, 0, 0)
-            """,
-            "backfillLast48HoursOfHourPoleVitals",
-            ENVIRONMENT,
-            start_time,
-            SOURCE_NAME,
-        )
-        sp_exec_id = cursor.fetchone()[0]
+        sp_exec_id = _open_sp_execution(cursor, "backfillLast48HoursOfHourPoleVitals", SOURCE_NAME)
         conn.commit()
 
-        # 2. The single, set-based MERGE covering every pole's entire
-        # 48-hour window at once.
         params = (_MISSING_LAST_UPLOAD_SENTINEL, _MISSING_LAST_UPLOAD_SENTINEL, SOURCE_NAME, sp_exec_id)
         try:
             cursor.execute(_BACKFILL_LAST_48_HOURS_OF_HOUR_PER_POLE_MERGE_SQL, *params)
             total_success = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
             conn.commit()
             logging.info(
-                "backfillLast48HoursOfHourPoleVitals: %d Hour vitals row(s) recomputed and committed "
-                "across every pole's own last 48 hours of activity.",
+                "backfillLast48HoursOfHourPoleVitals: %d Hour vitals row(s) recomputed.",
                 total_success,
             )
         except Exception as merge_error:
             if _is_benign_null_aggregate_warning(merge_error):
-                # SQLSTATE 01003 -- see _is_benign_null_aggregate_warning's
-                # own docstring. The MERGE itself completed, so this
-                # still commits -- only pyodbc's exception-raising made
-                # it look like a failure.
                 total_success = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
                 conn.commit()
                 logging.info(
-                    "backfillLast48HoursOfHourPoleVitals: %d Hour vitals row(s) recomputed and "
-                    "committed -- some reading(s) had a PoleModels row explicitly recording zero "
-                    "SunboardPower or LightPower and were excluded from that specific average, "
-                    "which is expected, not an error.",
+                    "backfillLast48HoursOfHourPoleVitals: %d Hour vitals row(s) recomputed "
+                    "-- null aggregate warning (expected, not an error).",
                     total_success,
                 )
             else:
                 _safe_rollback(conn, "backfillLast48HoursOfHourPoleVitals")
                 total_errors = 1
                 logging.error(
-                    "backfillLast48HoursOfHourPoleVitals: MERGE failed (rolled back): %s", merge_error
+                    "backfillLast48HoursOfHourPoleVitals: MERGE failed: %s", merge_error
                 )
                 raise
 
-        # 3. Close out the SP_Execution row with final counts
-        cursor.execute(
-            """
-            UPDATE SP_Execution
-            SET EndDateTime = ?,
-                TotalSuccessfulRecords = ?,
-                TotalErrorRecords = ?,
-                BatchCount = ?,
-                IsFinalBatch = 1
-            WHERE Id = ?
-            """,
-            _to_dto_string(_now_eastern()),
-            total_success,
-            total_errors,
-            1,
-            sp_exec_id,
-        )
+        _close_sp_execution(cursor, sp_exec_id, total_success, total_errors, 1)
         conn.commit()
 
     except Exception as ex:
         logging.error("backfillLast48HoursOfHourPoleVitals: run failed: %s", ex)
         if sp_exec_id:
-            # Fresh connection for recording the failure -- same fix,
-            # same reasoning, as backfill_latest_hour_for_all_poles()'s
-            # own equivalent above.
-            try:
-                recovery_conn = get_connection()
-                recovery_cursor = recovery_conn.cursor()
-                try:
-                    recovery_cursor.execute(
-                        """
-                        UPDATE SP_Execution
-                        SET EndDateTime = ?, ErrorMessage = ?, TotalSuccessfulRecords = ?, TotalErrorRecords = ?
-                        WHERE Id = ?
-                        """,
-                        _to_dto_string(_now_eastern()),
-                        str(ex),
-                        total_success,
-                        total_errors,
-                        sp_exec_id,
-                    )
-                    recovery_conn.commit()
-                finally:
-                    recovery_cursor.close()
-                    recovery_conn.close()
-            except Exception as recording_error:
-                logging.error(
-                    "backfillLast48HoursOfHourPoleVitals: additionally failed to record this run's "
-                    "failure in SP_Execution (Id=%s): %s -- that row will be left with "
-                    "EndDateTime still NULL. The ORIGINAL failure (%s) is what's actually "
-                    "raised below, not this one.",
-                    sp_exec_id,
-                    recording_error,
-                    ex,
-                )
+            _record_sp_execution_failure(sp_exec_id, ex, total_success, total_errors)
         raise
     finally:
         cursor.close()
         conn.close()
 
+
 # ---------------------------------------------------------------------------
-# Provisioned-pole vitals computation
+# Provisioned-pole vitals SQL
 # ---------------------------------------------------------------------------
 #
-# Mirrors load_leadsun_pole_vitals() exactly, with one difference:
-# the Hour MERGE joins PoleTimeZones on t.PoleId = ptz.ProvisionedPoleId
-# rather than ptz.VendorPoleId. Provisioned telemetry stores ProvisionedPoleId
-# as its PoleTelemetry.PoleId (see provisioned_telemetry_loader.py),
-# and PoleTimeZones rows for provisioned poles are keyed on ProvisionedPoleId
-# (PoleId is NULL for those rows -- see pole_timezones_loader.py's
-# load_provisioned_pole_timezones()). The Last48Hours MERGE and all cleanup
-# SQL are reused directly from the Leadsun path -- Last48Hours has no
-# PoleTimeZones join at all (no timezone bucketing needed), and the stale-
-# row prune matches on PoleTelemetry.PoleId = PoleVitals.PoleId,
-# which is correct for both sources.
+# Uses device-reported columns (BatterySoC, LightRatio, PanelPercentage,
+# BatteryFault, LEDFault, ControllerFault) instead of derived expressions
+# from raw current/power readings -- the device pre-computes these.
+#
+# Hour MERGE difference from Leadsun: joins PoleTimeZones on ProvisionedPoleId
+# (not VendorPoleId) since provisioned rows use ProvisionedPoleId as their
+# PoleTelemetry.PoleId. No PoleModels join needed (no SunboardPower/LightPower).
+#
+# Last48Hours MERGE: written as a standalone string (not generated from
+# _LAST_48_HOURS_MERGE_SQL via .replace()) -- easier to read and maintain.
 
 PROVISIONED_SOURCE_NAME = "Provisioned"
 
@@ -1872,34 +951,16 @@ SET ANSI_WARNINGS OFF;
         t.PoleId,
         CAST(t.LastUpload AT TIME ZONE ISNULL(ptz.WindowsTimeZone, 'Eastern Standard Time') AS DATETIME2(3)) AS LocalTime,
         ISNULL(ptz.WindowsTimeZone, 'Eastern Standard Time') AS TimeZoneName,
-        -- Use device-reported percentages and fault flags directly from the
-        -- dedicated columns populated at ingestion time, instead of deriving
-        -- them from raw current/power readings (which don't map cleanly for
-        -- this hardware -- BatteryElecCurrent1 is charging amps, not SoC %).
-        -- BatterySoC / LightRatio / PanelPercentage are already 0–100 values.
         t.BatterySoC       AS BatteryPercentage,
         t.PanelPercentage  AS PanelPercentage,
         t.LightRatio       AS LightPercentage,
         CASE WHEN t.IsOnline = 1 THEN 1 ELSE 0 END AS IsOnlineFlag,
-        -- Fault flags: daylight guards come first (same as Leadsun path),
-        -- then fall through to the device's own reported fault flag.
-        -- IsDaylightForLedFault = 1 means it's (near) sunrise/sunset so a
-        -- lamp being off is expected -- not a fault regardless of LEDFault.
         CASE
             WHEN ISNULL(t.IsDaylightForLedFault, 0) = 1 THEN 0
             WHEN t.LEDFault = 1 THEN 1
             ELSE 0
         END AS IsLedFaultFlag,
-        -- IsBatteryFault: device's own BatteryFault flag directly -- no
-        -- current-threshold math needed.
         CASE WHEN t.BatteryFault = 1 THEN 1 ELSE 0 END AS IsBatteryFaultFlag,
-        -- IsPanelFault: IsDaylightForPanelFault = 0 means it's nighttime
-        -- IsDaylightForPanelFault = 0 means nighttime (with grace) -- panel
-        -- output = 0 is expected. Otherwise use device's ControllerFault
-        -- flag directly. BatterySoC = 100 (fully charged) is NOT a bypass
-        -- here: a full battery just means the panel did its job, not that
-        -- the panel is exempt from fault detection. ControllerFault is
-        -- authoritative for this device.
         CASE
             WHEN t.IsDaylightForPanelFault = 0 THEN 0
             WHEN t.ControllerFault = 1 THEN 1
@@ -1910,13 +971,6 @@ SET ANSI_WARNINGS OFF;
         t.IsDaylightForLedFault,
         t.LastUpload
     FROM PoleTelemetry t
-    -- PoleModels join no longer needed (no SunboardPower/LightPower math),
-    -- kept commented out for reference.
-    -- LEFT JOIN PoleModels pm ON t.ModelId = pm.ModelId
-    -- KEY DIFFERENCE from _HOUR_MERGE_SQL: join on ProvisionedPoleId, not
-    -- PoleId -- provisioned telemetry stores ProvisionedPoleId as its
-    -- PoleId, and PoleTimeZones rows for provisioned poles are keyed on
-    -- ProvisionedPoleId (ptz.VendorPoleId is NULL for those rows).
     LEFT JOIN PoleTimeZones ptz ON t.PoleId = ptz.ProvisionedPoleId
     WHERE t.Source = 'Provisioned'
       AND t.LastUpload >= ?
@@ -1942,10 +996,8 @@ Aggregated AS (
         TimeZoneName,
         BucketStart,
         AVG(BatteryPercentage) AS AvgBatteryPercentage,
-        -- Provisioned poles: device reports pre-computed percentages directly,
-        -- no daylight filtering needed -- average all readings unconditionally.
-        AVG(PanelPercentage) AS AvgPanelPercentage,
-        AVG(LightPercentage) AS AvgLightPercentage,
+        AVG(PanelPercentage)   AS AvgPanelPercentage,
+        AVG(LightPercentage)   AS AvgLightPercentage,
         MAX(IsOnlineFlag)       AS IsOnlineAgg,
         MAX(IsLedFaultFlag)     AS IsLedFaultAgg,
         MAX(IsBatteryFaultFlag) AS IsBatteryFaultAgg,
@@ -2009,81 +1061,98 @@ WHEN NOT MATCHED THEN
 SET ANSI_WARNINGS ON;
 """
 
-# _PROVISIONED_LAST_48_HOURS_MERGE_SQL: same structure as
-# _LAST_48_HOURS_MERGE_SQL but uses device-reported columns (BatterySoC,
-# LightRatio, PanelPercentage, BatteryFault, LEDFault, ControllerFault)
-# instead of derived expressions from raw current/power readings.
-# No PoleTimeZones join (Last48Hours doesn't bucket by local hour) and
-# no PoleModels join (no SunboardPower/LightPower math needed).
-_PROVISIONED_LAST_48_HOURS_MERGE_SQL = (
-    _LAST_48_HOURS_MERGE_SQL
-    # Source filter
-    .replace(
-        "WHERE t.Source = 'Leadsun'",
-        "WHERE t.Source = 'Provisioned'",
-    )
-    # BatteryPercentage: device BatterySoC directly
-    .replace(
-        "CASE WHEN t.BatteryElecCurrent2 IS NULL\n             THEN t.BatteryElecCurrent1\n             ELSE (t.BatteryElecCurrent1 + t.BatteryElecCurrent2) / 2.0\n        END AS BatteryPercentage,",
-        "t.BatterySoC AS BatteryPercentage,",
-    )
-    # LightPercentage: device LightRatio directly
-    .replace(
-        "CASE WHEN t.LampPower2 IS NULL THEN t.LampPower1\n             ELSE t.LampPower1 + t.LampPower2\n        END / NULLIF(ISNULL(pm.LightPower, 30), 0) * 100.0 AS LightPercentage,",
-        "t.LightRatio AS LightPercentage,",
-    )
-    # BatteryElecCurrentTotal: BatterySoC for fully-charged exclusion in AvgPanel
-    .replace(
-        "CASE WHEN t.BatteryElecCurrent2 IS NULL\n             THEN t.BatteryElecCurrent1\n             ELSE t.BatteryElecCurrent1 + t.BatteryElecCurrent2\n        END AS BatteryElecCurrentTotal,",
-        "t.BatterySoC AS BatteryElecCurrentTotal,",
-    )
-    # PanelPercentage: device PanelPercentage directly
-    .replace(
-        "        (t.SolarBoardVoltage * t.SolarBoardElecCurrent) / NULLIF(ISNULL(pm.SunboardPower, 80), 0) * 100.0 AS PanelPercentage,",
-        "        t.PanelPercentage AS PanelPercentage,",
-    )
-    # IsLedFaultFlag: daylight guard then device LEDFault
-    .replace(
-        "            WHEN (CASE WHEN t.LampPower2 IS NULL THEN t.LampPower1 ELSE t.LampPower1 + t.LampPower2 END) = 0 THEN 1\n            ELSE 0\n        END AS IsLedFaultFlag,",
-        "            WHEN t.LEDFault = 1 THEN 1\n            ELSE 0\n        END AS IsLedFaultFlag,",
-    )
-    # IsBatteryFaultFlag: device BatteryFault directly
-    .replace(
-        "CASE WHEN (CASE WHEN t.BatteryElecCurrent2 IS NULL THEN t.BatteryElecCurrent1 ELSE (t.BatteryElecCurrent1 + t.BatteryElecCurrent2) / 2.0 END) < 10 THEN 1 ELSE 0 END AS IsBatteryFaultFlag,",
-        "CASE WHEN t.BatteryFault = 1 THEN 1 ELSE 0 END AS IsBatteryFaultFlag,",
-    )
-    # IsPanelFaultFlag: daylight guard then ControllerFault -- no BatterySoC=100
-    # bypass: a full battery means the panel worked, ControllerFault is authoritative
-    .replace(
-        "CASE\n            WHEN t.IsDaylightForPanelFault = 0 THEN 0\n            WHEN (CASE WHEN t.BatteryElecCurrent2 IS NULL THEN t.BatteryElecCurrent1 ELSE t.BatteryElecCurrent1 + t.BatteryElecCurrent2 END) = (CASE WHEN t.BatteryElecCurrent2 IS NULL THEN 100 ELSE 200 END) THEN 0\n            WHEN (t.SolarBoardVoltage * t.SolarBoardElecCurrent) = 0 THEN 1\n            ELSE 0\n        END AS IsPanelFaultFlag,",
-        "CASE WHEN t.IsDaylightForPanelFault = 0 THEN 0 WHEN t.ControllerFault = 1 THEN 1 ELSE 0 END AS IsPanelFaultFlag,",
-    )
-    # AvgPanelPercentage and AvgLightPercentage: unconditional -- device reports
-    # pre-computed values directly, no daylight filtering needed
-    .replace(
-        "AVG(CASE WHEN ISNULL(IsDaylightForPanelFault, 1) = 1 AND BatteryElecCurrentTotal <> 200 THEN PanelPercentage END) AS AvgPanelPercentage,",
-        "AVG(PanelPercentage) AS AvgPanelPercentage,",
-    )
-    .replace(
-        "        AVG(CASE WHEN ISNULL(IsDaylightForLedFault, 0) = 0 THEN LightPercentage END) AS AvgLightPercentage,",
-        "        AVG(LightPercentage) AS AvgLightPercentage,",
-    )
-    # Remove BatteryElecCurrentTotal alias -- no longer used in Aggregated CTE
-    .replace(
-        "        t.BatterySoC AS BatteryElecCurrentTotal,\n",
-        "",
-    )
-    # Remove BatteryElecCurrentTotal from Bucketed SELECT list
-    .replace(
-        "        IsDaylightForPanelFault, IsDaylightForLedFault, BatteryElecCurrentTotal,\n",
-        "        IsDaylightForPanelFault, IsDaylightForLedFault,\n",
-    )
-    # Remove PoleModels join -- no longer needed
-    .replace(
-        "    LEFT JOIN PoleModels pm ON t.ModelId = pm.ModelId\n",
-        "",
-    )
+# Provisioned Last48Hours: device pre-computes percentages and fault flags,
+# so no raw-current math, no PoleModels join, no daylight filtering on averages.
+# Written as a standalone string (not derived from _LAST_48_HOURS_MERGE_SQL).
+_PROVISIONED_LAST_48_HOURS_MERGE_SQL = """
+SET ANSI_WARNINGS OFF;
+;WITH TelemetryWithVitals AS (
+    SELECT
+        t.PoleId,
+        t.BatterySoC      AS BatteryPercentage,
+        t.PanelPercentage AS PanelPercentage,
+        t.LightRatio      AS LightPercentage,
+        t.IsDaylightForPanelFault,
+        t.IsDaylightForLedFault,
+        CASE WHEN t.IsOnline = 1 THEN 1 ELSE 0 END AS IsOnlineFlag,
+        CASE
+            WHEN ISNULL(t.IsDaylightForLedFault, 0) = 1 THEN 0
+            WHEN t.LEDFault = 1 THEN 1
+            ELSE 0
+        END AS IsLedFaultFlag,
+        CASE WHEN t.BatteryFault = 1 THEN 1 ELSE 0 END AS IsBatteryFaultFlag,
+        CASE
+            WHEN t.IsDaylightForPanelFault = 0 THEN 0
+            WHEN t.ControllerFault = 1 THEN 1
+            ELSE 0
+        END AS IsPanelFaultFlag,
+        t.IsOpenIssueFault,
+        ROW_NUMBER() OVER (PARTITION BY t.PoleId ORDER BY t.LastUpload DESC) AS LatestOverall
+    FROM PoleTelemetry t
+    WHERE t.Source = 'Provisioned'
+      AND t.LastUpload >= ?
+      AND t.LastUpload <> ?
+),
+Aggregated AS (
+    SELECT
+        PoleId,
+        AVG(BatteryPercentage) AS AvgBatteryPercentage,
+        AVG(PanelPercentage)   AS AvgPanelPercentage,
+        AVG(LightPercentage)   AS AvgLightPercentage,
+        MAX(IsOnlineFlag)       AS IsOnlineAgg,
+        MAX(IsLedFaultFlag)     AS IsLedFaultAgg,
+        MAX(IsBatteryFaultFlag) AS IsBatteryFaultAgg,
+        MAX(IsPanelFaultFlag)   AS IsPanelFaultAgg,
+        MAX(CASE WHEN LatestOverall = 1 THEN CAST(IsOpenIssueFault AS TINYINT) END) AS IsOpenIssueFaultAgg,
+        COUNT(*)                AS RecordCount
+    FROM TelemetryWithVitals
+    GROUP BY PoleId
 )
+MERGE PoleVitals AS target
+USING (
+    SELECT
+        PoleId,
+        'Last48Hours' AS PeriodType,
+        DATEADD(HOUR, -48, SYSDATETIMEOFFSET() AT TIME ZONE 'Eastern Standard Time') AS PeriodStart,
+        SYSDATETIMEOFFSET() AT TIME ZONE 'Eastern Standard Time' AS PeriodEnd,
+        AvgBatteryPercentage, AvgPanelPercentage, AvgLightPercentage,
+        IsOnlineAgg AS IsOnline,
+        CAST(IsLedFaultAgg AS BIT) AS IsLedFault,
+        CAST(IsBatteryFaultAgg AS BIT) AS IsBatteryFault,
+        CAST(IsPanelFaultAgg AS BIT) AS IsPanelFault,
+        CAST(ISNULL(IsOpenIssueFaultAgg, 0) AS BIT) AS IsOpenIssueFault,
+        CAST(
+            CASE WHEN IsLedFaultAgg = 1 OR IsBatteryFaultAgg = 1 OR IsPanelFaultAgg = 1
+                      OR ISNULL(IsOpenIssueFaultAgg, 0) = 1
+                 THEN 1 ELSE 0 END
+        AS BIT) AS IsPoleFault,
+        RecordCount,
+        ? AS Source,
+        ? AS SP_ExecId
+    FROM Aggregated
+) AS source
+ON target.PoleId = source.PoleId
+   AND target.PeriodType = source.PeriodType
+WHEN MATCHED THEN UPDATE SET
+    PeriodStart           = source.PeriodStart,
+    PeriodEnd             = source.PeriodEnd,
+    AvgBatteryPercentage  = source.AvgBatteryPercentage,
+    AvgPanelPercentage    = source.AvgPanelPercentage,
+    AvgLightPercentage    = source.AvgLightPercentage,
+    IsOnline              = source.IsOnline,
+    IsLedFault            = source.IsLedFault,
+    IsBatteryFault        = source.IsBatteryFault,
+    IsPanelFault          = source.IsPanelFault,
+    IsOpenIssueFault      = source.IsOpenIssueFault,
+    IsPoleFault           = source.IsPoleFault,
+    RecordCount           = source.RecordCount,
+    Source                = source.Source,
+    SP_ExecId             = source.SP_ExecId
+WHEN NOT MATCHED THEN
+    INSERT (PoleId, PeriodType, PeriodStart, PeriodEnd, AvgBatteryPercentage, AvgPanelPercentage, AvgLightPercentage, IsOnline, IsLedFault, IsBatteryFault, IsPanelFault, IsOpenIssueFault, IsPoleFault, RecordCount, Source, SP_ExecId)
+    VALUES (source.PoleId, source.PeriodType, source.PeriodStart, source.PeriodEnd, source.AvgBatteryPercentage, source.AvgPanelPercentage, source.AvgLightPercentage, source.IsOnline, source.IsLedFault, source.IsBatteryFault, source.IsPanelFault, source.IsOpenIssueFault, source.IsPoleFault, source.RecordCount, source.Source, source.SP_ExecId);
+SET ANSI_WARNINGS ON;
+"""
 
 _PROVISIONED_MERGE_SQL_BY_PERIOD_TYPE = {
     "Hour": _PROVISIONED_HOUR_MERGE_SQL,
@@ -2093,143 +1162,16 @@ _PROVISIONED_MERGE_SQL_BY_PERIOD_TYPE = {
 
 def load_provisioned_pole_vitals(backfill: bool = False) -> None:
     """
-    Recomputes PoleVitals for provisioned poles from PoleTelemetry +
-    PoleModels + PoleTimeZones, using PROVISIONED_SOURCE_NAME as Source.
+    Recomputes PoleVitals for provisioned poles using device-reported
+    percentages and fault flags (BatterySoC, LightRatio, PanelPercentage,
+    BatteryFault, LEDFault, ControllerFault). Hour MERGE joins PoleTimeZones
+    on ProvisionedPoleId; Last48Hours needs no timezone join.
 
-    Identical to load_leadsun_pole_vitals() in all respects except:
-    - SP_Execution.Source = 'Provisioned' (not 'Leadsun')
-    - The Hour MERGE joins PoleTimeZones on t.PoleId = ptz.ProvisionedPoleId
-      (not ptz.VendorPoleId) -- provisioned telemetry stores ProvisionedPoleId
-      as its PoleId, and PoleTimeZones keys provisioned rows on
-      ProvisionedPoleId.
-    - The Last48Hours MERGE is shared directly (no PoleTimeZones join at all).
-
-    Must run after load_provisioned_pole_daylight_flags() -- same load-order
-    dependency as load_leadsun_pole_vitals() has on load_leadsun_pole_daylight_flags().
+    Must run after load_provisioned_pole_daylight_flags().
     """
-    start_time = _to_dto_string(_now_eastern())
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    sp_exec_id = None
-    total_success = 0
-    total_errors = 0
-
-    try:
-        cursor.execute(
-            """
-            INSERT INTO SP_Execution (Name, Environment, StartDateTime, Source, BatchCount, IsFinalBatch)
-            OUTPUT INSERTED.Id
-            VALUES (?, ?, ?, ?, 0, 0)
-            """,
-            "loadProvisionedPoleVitals",
-            ENVIRONMENT,
-            start_time,
-            PROVISIONED_SOURCE_NAME,
-        )
-        sp_exec_id = cursor.fetchone()[0]
-        conn.commit()
-
-        upsert_start = time.perf_counter()
-        now = _now_eastern()
-        for period_type in PERIOD_TYPES:
-            merge_sql = _PROVISIONED_MERGE_SQL_BY_PERIOD_TYPE[period_type]
-            cutoff = _compute_cutoff(now, period_type, backfill)
-            params = (cutoff, _MISSING_LAST_UPLOAD_SENTINEL, PROVISIONED_SOURCE_NAME, sp_exec_id)
-
-            try:
-                cursor.execute(merge_sql, *params)
-                affected = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
-
-                pruned = _run_cleanup_for_period_type(cursor, period_type, cutoff)
-
-                conn.commit()
-                total_success += affected
-                logging.info(
-                    "loadProvisionedPoleVitals: %s period recomputed and committed, %d row(s) "
-                    "affected, %d stale row(s) pruned (since %s).",
-                    period_type, affected, pruned, cutoff,
-                )
-            except Exception as period_error:
-                if _is_benign_null_aggregate_warning(period_error):
-                    affected = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
-                    pruned = _run_cleanup_for_period_type(cursor, period_type, cutoff)
-                    conn.commit()
-                    total_success += affected
-                    logging.info(
-                        "loadProvisionedPoleVitals: %s period recomputed and committed, %d row(s) "
-                        "affected, %d stale row(s) pruned (since %s) -- some reading(s) had a "
-                        "PoleModels row explicitly recording zero SunboardPower or LightPower and "
-                        "were excluded from that specific average, which is expected, not an error.",
-                        period_type, affected, pruned, cutoff,
-                    )
-                else:
-                    _safe_rollback(conn, f"loadProvisionedPoleVitals ({period_type})")
-                    total_errors += 1
-                    logging.error(
-                        "loadProvisionedPoleVitals: failed to recompute %s period (rolled back, "
-                        "other period types unaffected): %s",
-                        period_type, period_error,
-                    )
-
-        logging.info(
-            "loadProvisionedPoleVitals: recompute phase took %.1fs.",
-            time.perf_counter() - upsert_start,
-        )
-
-        cursor.execute(
-            """
-            UPDATE SP_Execution
-            SET EndDateTime = ?,
-                TotalSuccessfulRecords = ?,
-                TotalErrorRecords = ?,
-                BatchCount = ?,
-                IsFinalBatch = 1
-            WHERE Id = ?
-            """,
-            _to_dto_string(_now_eastern()),
-            total_success,
-            total_errors,
-            len(PERIOD_TYPES),
-            sp_exec_id,
-        )
-        conn.commit()
-
-    except Exception as ex:
-        logging.error("loadProvisionedPoleVitals: run failed: %s", ex)
-        if sp_exec_id:
-            try:
-                recovery_conn = get_connection()
-                recovery_cursor = recovery_conn.cursor()
-                try:
-                    recovery_cursor.execute(
-                        """
-                        UPDATE SP_Execution
-                        SET EndDateTime = ?, ErrorMessage = ?,
-                            TotalSuccessfulRecords = ?, TotalErrorRecords = ?
-                        WHERE Id = ?
-                        """,
-                        _to_dto_string(_now_eastern()),
-                        str(ex),
-                        total_success,
-                        total_errors,
-                        sp_exec_id,
-                    )
-                    recovery_conn.commit()
-                finally:
-                    recovery_cursor.close()
-                    recovery_conn.close()
-            except Exception as recording_error:
-                logging.error(
-                    "loadProvisionedPoleVitals: additionally failed to record this run's "
-                    "failure in SP_Execution (Id=%s): %s -- that row will be left with "
-                    "EndDateTime still NULL. The ORIGINAL failure (%s) is what's actually "
-                    "raised below, not this one.",
-                    sp_exec_id,
-                    recording_error,
-                    ex,
-                )
-        raise
-    finally:
-        cursor.close()
-        conn.close()
+    _run_vitals_for_source(
+        "loadProvisionedPoleVitals",
+        PROVISIONED_SOURCE_NAME,
+        _PROVISIONED_MERGE_SQL_BY_PERIOD_TYPE,
+        backfill,
+    )

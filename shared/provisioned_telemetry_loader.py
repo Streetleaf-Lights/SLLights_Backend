@@ -91,10 +91,10 @@ downstream calculation yet. Revisit if these should drive PoleVitals'
 own fault flags for provisioned poles specifically, once that's wanted.
 
 Also worth flagging: LampPower2/BatteryElecCurrent2 being permanently
-None for every provisioned-sourced row is safe for lightStatusLabel
+None for every provisioned-sourced row is safe for lightStatusText
 (api_utils.compute_pole_status_labels() already treats a None
 individual reading as 0 when summing LampPower1+LampPower2), but NOT
-safe for batteryStatusLabel/panelIdleReason's own "Full"/"Battery Full"
+safe for batteryStatusText/panelIdleReason's own "Full"/"Battery Full"
 branch -- that threshold checks for BatteryElecCurrent1+
 BatteryElecCurrent2 EXACTLY EQUAL TO 200, calibrated to Leadsun's own
 two-battery-bank hardware (100+100). A provisioned pole's single-battery

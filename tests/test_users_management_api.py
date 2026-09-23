@@ -114,7 +114,7 @@ class TestInviteUser:
         """The privilege-escalation guard: a Customer Admin can't create
         a role with MORE privilege than their own."""
         with pytest.raises(
-            auth_utils.AuthError, match="a Customer Admin cannot invite a Streetleaf Admin"
+            auth_utils.AuthError, match="a Customer Admin can only invite a Customer Admin or User"
         ) as exc_info:
             users_management_api.invite_user(
                 CUSTOMER_ADMIN, "Jane Doe", "jane@example.com", "Streetleaf Admin"
@@ -418,7 +418,7 @@ class TestRegisterUser:
         self, patch_get_connection_users_management, mock_cursor
     ):
         user_id = _uuid()
-        mock_cursor.fetchone.return_value = (user_id, "Customer Admin", "cust1", "Jane Doe", "jane@example.com")
+        mock_cursor.fetchone.return_value = (user_id, "Customer Admin", "cust1", "Jane Doe", "jane@example.com", None)
 
         result = users_management_api.register_user(str(_uuid()), "newpassword123")
 
@@ -433,7 +433,7 @@ class TestRegisterUser:
     def test_password_is_hashed_not_stored_plain(
         self, patch_get_connection_users_management, mock_cursor
     ):
-        mock_cursor.fetchone.return_value = (_uuid(), "Customer Admin", "cust1", "Jane Doe", "jane@example.com")
+        mock_cursor.fetchone.return_value = (_uuid(), "Customer Admin", "cust1", "Jane Doe", "jane@example.com", None)
 
         users_management_api.register_user(str(_uuid()), "newpassword123")
 
@@ -508,6 +508,7 @@ class TestSignOut:
         sql, revoked_at, session_id = mock_cursor.execute.call_args.args
         assert "UPDATE UserSessions" in sql
         assert "RevokedAt IS NULL" in sql
+        assert "Id" in sql
         assert session_id == "the-session-id"
         mock_conn.commit.assert_called_once()
 
@@ -784,21 +785,21 @@ class TestDeleteUser:
 
 class TestToggleRole:
     def test_streetleaf_admin_toggles_to_user(self):
-        assert users_management_api._toggle_role("Streetleaf Admin", None) == "User"
+        assert users_management_api._new_role_after_toggle("Streetleaf Admin", None) == "User"
 
     def test_customer_admin_toggles_to_user(self):
-        assert users_management_api._toggle_role("Customer Admin", "cust1") == "User"
+        assert users_management_api._new_role_after_toggle("Customer Admin", "cust1") == "User"
 
     def test_streetleaf_user_toggles_to_streetleaf_admin(self):
         """A "Streetleaf User" -- role='User', customerId=None -- toggles
         back to 'Streetleaf Admin', staying unscoped either way."""
-        assert users_management_api._toggle_role("User", None) == "Streetleaf Admin"
+        assert users_management_api._new_role_after_toggle("User", None) == "Streetleaf Admin"
 
     def test_customer_user_toggles_to_customer_admin(self):
         """A customer-side User -- role='User', a real customerId --
         toggles to 'Customer Admin', staying within that SAME customer
         either way."""
-        assert users_management_api._toggle_role("User", "cust1") == "Customer Admin"
+        assert users_management_api._new_role_after_toggle("User", "cust1") == "Customer Admin"
 
 
 class TestChangeRole:
@@ -991,3 +992,181 @@ class TestChangeRole:
         assert "Name" not in update_sql
         assert "Email" not in update_sql
         assert "CustomerId" not in update_sql
+
+
+# ---------------------------------------------------------------------------
+# Customer Owner role tests
+# ---------------------------------------------------------------------------
+
+class TestCustomerOwnerInvite:
+    def test_streetleaf_admin_can_invite_customer_owner(
+        self, patch_get_connection_users_management, mock_conn, mock_cursor, mocker
+    ):
+        mocker.patch("shared.users_management_api._send_invite_email", return_value=True)
+        mock_cursor.fetchone.return_value = None  # no duplicate email, no existing owner
+        caller = _Ctx("Streetleaf Admin")
+
+        result = users_management_api.invite_user(
+            caller, "Alice Owner", "alice@co.com", "Customer Owner", customer_id="cust1"
+        )
+        assert result["email"] == "alice@co.com"
+
+    def test_inviting_second_customer_owner_auto_initiates_transfer(
+        self, patch_get_connection_users_management, mock_conn, mock_cursor, mocker
+    ):
+        mocker.patch("shared.users_management_api._send_ownership_transfer_email", return_value=True)
+        # First fetchone (email check) → None; second (existing owner check) → existing owner
+        mock_cursor.fetchone.side_effect = [None, ("existing-owner-id",)]
+        caller = _Ctx("Streetleaf Admin")
+
+        result = users_management_api.invite_user(
+            caller, "Bob", "bob@co.com", "Customer Owner", customer_id="cust1"
+        )
+        assert result["ownershipTransfer"] is True
+        assert "transfer" in result["message"].lower()
+        assert result["email"] == "bob@co.com"
+
+    def test_customer_owner_can_invite_another_customer_owner_as_transfer(
+        self, patch_get_connection_users_management, mock_conn, mock_cursor, mocker
+    ):
+        mocker.patch("shared.users_management_api._send_ownership_transfer_email", return_value=True)
+        # email check → None; existing owner check → current owner
+        mock_cursor.fetchone.side_effect = [None, ("existing-owner-id",)]
+        caller = _Ctx("Customer Owner", customer_id="cust1")
+
+        result = users_management_api.invite_user(
+            caller, "Bob", "bob@co.com", "Customer Owner", customer_id="cust1"
+        )
+        assert result["ownershipTransfer"] is True
+        assert result["email"] == "bob@co.com"
+
+    def test_customer_admin_cannot_invite_customer_owner(
+        self, patch_get_connection_users_management, mock_cursor, mocker
+    ):
+        mocker.patch("shared.users_management_api._send_invite_email", return_value=True)
+        caller = _Ctx("Customer Admin", customer_id="cust1")
+
+        with pytest.raises(auth_utils.AuthError, match="can only invite a Customer Admin or User"):
+            users_management_api.invite_user(
+                caller, "Bob", "bob@co.com", "Customer Owner", customer_id="cust1"
+            )
+
+    def test_customer_owner_can_invite_customer_admin(
+        self, patch_get_connection_users_management, mock_conn, mock_cursor, mocker
+    ):
+        mocker.patch("shared.users_management_api._send_invite_email", return_value=True)
+        mock_cursor.fetchone.return_value = None
+        caller = _Ctx("Customer Owner", customer_id="cust1")
+
+        result = users_management_api.invite_user(
+            caller, "Carol Admin", "carol@co.com", "Customer Admin", customer_id="cust1"
+        )
+        assert result["email"] == "carol@co.com"
+
+    def test_customer_admin_cannot_invite_customer_owner(
+        self, patch_get_connection_users_management, mock_cursor, mocker
+    ):
+        mocker.patch("shared.users_management_api._send_invite_email", return_value=True)
+        caller = _Ctx("Customer Admin", customer_id="cust1")
+
+        with pytest.raises(auth_utils.AuthError, match="can only invite a Customer Admin or User"):
+            users_management_api.invite_user(
+                caller, "Bob", "bob@co.com", "Customer Owner", customer_id="cust1"
+            )
+
+
+class TestCustomerOwnerDeleteAndChangeRole:
+    def test_customer_owner_can_delete_customer_admin(
+        self, patch_get_connection_users_management, mock_conn, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = ("Customer Admin", "cust1")
+        caller = _Ctx("Customer Owner", customer_id="cust1")
+
+        users_management_api.delete_user(caller, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+        assert mock_conn.commit.called
+
+    def test_customer_admin_cannot_delete_customer_owner(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = ("Customer Owner", "cust1")
+        caller = _Ctx("Customer Admin", customer_id="cust1")
+
+        with pytest.raises(auth_utils.AuthError, match="cannot delete a Customer Owner"):
+            users_management_api.delete_user(caller, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+
+    def test_customer_owner_can_change_role_of_customer_admin(
+        self, patch_get_connection_users_management, mock_conn, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = ("Customer Admin", "cust1")
+        caller = _Ctx("Customer Owner", customer_id="cust1")
+
+        result = users_management_api.change_role(caller, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+        assert result["role"] == "User"
+
+    def test_customer_admin_cannot_change_role_of_customer_owner(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = ("Customer Owner", "cust1")
+        caller = _Ctx("Customer Admin", customer_id="cust1")
+
+        with pytest.raises(auth_utils.AuthError, match="cannot change the role of a Customer Owner"):
+            users_management_api.change_role(caller, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+
+
+class TestOwnershipTransfer:
+    def test_non_owner_cannot_initiate_transfer(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        caller = _Ctx("Customer Admin", customer_id="cust1")
+        with pytest.raises(auth_utils.AuthError):
+            users_management_api.initiate_ownership_transfer(
+                caller, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+            )
+
+    def test_owner_cannot_transfer_to_themselves(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        caller = _Ctx("Customer Owner", customer_id="cust1",
+                      user_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+        with pytest.raises(auth_utils.AuthError, match="cannot transfer ownership to yourself"):
+            users_management_api.initiate_ownership_transfer(
+                caller, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+            )
+
+    def test_nominee_must_be_in_same_customer(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = (
+            "Carol", "carol@co.com", "Customer Admin", "Active", "OTHER_CUSTOMER"
+        )
+        caller = _Ctx("Customer Owner", customer_id="cust1")
+
+        with pytest.raises(auth_utils.AuthError, match="same customer"):
+            users_management_api.initiate_ownership_transfer(
+                caller, "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+            )
+
+    def test_accept_promotes_nominee_and_deletes_previous_owner(
+        self, patch_get_connection_users_management, mock_conn, mock_cursor, mocker
+    ):
+        nominee_id = uuid.UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+        prev_owner_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        mock_cursor.fetchone.return_value = (
+            nominee_id, "Carol", "carol@co.com", "Customer Admin",
+            "cust1", prev_owner_id,
+        )
+        mocker.patch(
+            "shared.users_management_api.create_session",
+            return_value="new-session-token",
+        )
+
+        result = users_management_api.accept_ownership_transfer(
+            "cccccccc-cccc-cccc-cccc-cccccccccccc"
+        )
+
+        assert result["token"] == "new-session-token"
+        assert result["user"]["role"] == "Customer Owner"
+
+        execute_calls = [c.args[0] for c in mock_cursor.execute.call_args_list]
+        assert any("UPDATE Users" in s and "Customer Owner" in s for s in execute_calls)
+        assert any("DELETE FROM Users" in s for s in execute_calls)

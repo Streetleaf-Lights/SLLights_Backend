@@ -433,14 +433,14 @@ class TestPoleRowToDict:
             "avgBatteryPercentage": 89.0,
             "avgPanelPercentage": 45.0,
             "avgLightPercentage": 0.0,
-            "lightStatusLabel": "ON",
-            "panelStatusLabel": "Charging",
+            "lightStatusText": "ON",
+            "panelStatusText": "Charging",
             "panelIdleReason": None,
-            "batteryStatusLabel": "Discharging",
+            "batteryStatusText": "Discharging",
             "electricCurrentAverage": 15.1,
             "sunsetTime": "2026-08-28 19:47:58.596527-04:00",
-            "connectedLabel": "Online",
-            "overallStatusLabel": "OK",
+            "connectedText": "Online",
+            "overallStatusText": "OK",
         }
 
     def test_discards_project_id_and_customer_id(self):
@@ -492,13 +492,13 @@ class TestPoleRowToDict:
         assert result["batteryElecCurrent2"] is None
         assert result["solarBoardVoltage"] is None
         assert result["solarBoardElecCurrent"] is None
-        assert result["lightStatusLabel"] == "Not Reporting"
-        assert result["panelStatusLabel"] == "Not Reporting"
+        assert result["lightStatusText"] == "Not Reporting"
+        assert result["panelStatusText"] == "Not Reporting"
         assert result["panelIdleReason"] is None
-        assert result["batteryStatusLabel"] == "Not Reporting"
+        assert result["batteryStatusText"] == "Not Reporting"
         assert result["electricCurrentAverage"] is None
-        assert result["connectedLabel"] == "Online"  # is_online=True (default, from a separate join than lastUpdate)
-        assert result["overallStatusLabel"] == "Not Reporting"
+        assert result["connectedText"] == "Online"  # is_online=True (default, from a separate join than lastUpdate)
+        assert result["overallStatusText"] == "Not Reporting"
 
     def test_no_telemetry_nulls_four_fault_fields_but_not_open_issue_fault(self):
         """Per explicit request (and a later correction):
@@ -786,11 +786,11 @@ class TestGetPoleVitalsUnfiltered:
         assert project["poles"][0]["userName"] == "jdoe"
         assert project["poles"][0]["solarBoardVoltage"] == 18.0
         assert project["poles"][0]["active"] is True
-        assert project["poles"][0]["lightStatusLabel"] == "ON"
-        assert project["poles"][0]["panelStatusLabel"] == "Charging"
+        assert project["poles"][0]["lightStatusText"] == "ON"
+        assert project["poles"][0]["panelStatusText"] == "Charging"
         assert project["poles"][0]["sunsetTime"] == "2026-08-28 19:47:58.596527-04:00"
-        assert project["poles"][0]["connectedLabel"] == "Online"
-        assert project["poles"][0]["overallStatusLabel"] == "Fault"  # isPoleFault=True, not stale
+        assert project["poles"][0]["connectedText"] == "Online"
+        assert project["poles"][0]["overallStatusText"] == "Fault"  # isPoleFault=True, not stale
         assert project["leadsunProject"] == '{"ProjectId": "482"}'
 
     def test_customer_with_zero_projects_gets_empty_projects_and_zeroed_rollup(

@@ -330,7 +330,7 @@ class TestLoadPoleTelemetrySuccessFlow:
         calls = mock_cursor.execute.call_args_list
         # insert SP_Execution, open-issues lookup, staging create,
         # merge-from-staging, truncate, retention purge, final update
-        assert len(calls) == 7
+        assert len(calls) == 8
 
         insert_sql, name, env, start_time, source = calls[0].args
         assert "INSERT INTO SP_Execution" in insert_sql
@@ -339,19 +339,22 @@ class TestLoadPoleTelemetrySuccessFlow:
 
         assert "JOIN PoleOpenIssues" in calls[1].args[0]
         assert "CREATE TABLE #PoleTelemetryStaging" in calls[2].args[0]
-        assert "MERGE PoleTelemetry" in calls[3].args[0]
-        assert calls[4].args[0] == "TRUNCATE TABLE #PoleTelemetryStaging"
-        assert "DELETE FROM PoleTelemetry" in calls[5].args[0]
+        assert "CREATE CLUSTERED INDEX" in calls[3].args[0]
+        assert "MERGE PoleTelemetry" in calls[4].args[0]
+        assert calls[5].args[0] == "TRUNCATE TABLE #PoleTelemetryStaging"
+        assert "DELETE FROM PoleTelemetry" in calls[6].args[0]
 
+        # Staging INSERT now uses cursor.execute() with multi-row VALUES, not executemany
+        # Staging INSERT now uses fast_executemany via cursor.executemany()
         assert mock_cursor.executemany.call_count == 1
-        staging_sql, batch = mock_cursor.executemany.call_args.args
+        staging_sql = mock_cursor.executemany.call_args.args[0]
         assert "INSERT INTO #PoleTelemetryStaging" in staging_sql
-        assert len(batch) == 2
+        batch = mock_cursor.executemany.call_args.args[1]
         assert batch[0][0] == "POLE-1"
-        assert batch[0][3] == 11  # SP_ExecId position
+        assert batch[0][3] == 11
         assert batch[1][0] == "POLE-2"
 
-        update_sql, end_time, success, errors, batch_count, sp_exec_id = calls[6].args
+        update_sql, end_time, success, errors, batch_count, sp_exec_id = calls[7].args
         assert "UPDATE SP_Execution" in update_sql
         assert (success, errors, batch_count, sp_exec_id) == (2, 0, 1, 11)
         assert DTO_PATTERN.match(end_time)
@@ -375,7 +378,10 @@ class TestLoadPoleTelemetrySuccessFlow:
         assert "DELETE FROM PoleTelemetry" in calls[2].args[0]
         _, _end_time, success, errors, batch_count, _sp_exec_id = calls[3].args
         assert (success, errors, batch_count) == (0, 0, 1)
-        mock_cursor.executemany.assert_not_called()
+        # No staging INSERT should be called (zero valid rows)
+        staging_calls = [c for c in mock_cursor.execute.call_args_list
+                         if "INSERT INTO #PoleTelemetryStaging" in str(c.args[0])]
+        assert staging_calls == []
 
     def test_records_missing_pole_id_or_last_upload_are_counted_as_errors(
         self, patch_get_connection_pole_telemetry, patch_fetch_lamps, mock_cursor, make_lamp_record
@@ -407,7 +413,9 @@ class TestLoadPoleTelemetrySuccessFlow:
         success, errors = final_update_args[2], final_update_args[3]
         assert (success, errors) == (1, 0)
 
-        staging_sql, batch = mock_cursor.executemany.call_args.args
+        staging_calls = [c for c in mock_cursor.execute.call_args_list
+                         if "INSERT INTO #PoleTelemetryStaging" in c.args[0]]
+        batch = mock_cursor.executemany.call_args.args[1]
         assert batch[0][0] == "POLE-NEVER-UPLOADED"
         assert batch[0][1] == pole_telemetry_loader._MISSING_LAST_UPLOAD_SENTINEL
 
@@ -437,10 +445,19 @@ class TestLoadPoleTelemetryPartialFailure:
             make_lamp_record(product_name="POLE-2"),
         ]
         mock_cursor.executemany.side_effect = RuntimeError("chunk failed")
-        # insert, open-issues lookup, staging create, truncate-after-failure,
-        # row1, row2 (fails), retention purge, final update
+        # Sequence: SP insert, open-issues, staging CREATE, staging INDEX,
+        # TRUNCATE (after executemany fails), POLE-1 row upsert (ok),
+        # POLE-2 row upsert (fails), retention purge, final SP update
         mock_cursor.execute.side_effect = [
-            None, None, None, None, None, RuntimeError("bad row"), None, None,
+            None,  # SP_Execution insert
+            None,  # open-issues lookup
+            None,  # staging CREATE
+            None,  # staging INDEX
+            None,  # TRUNCATE after executemany failure
+            None,  # row-by-row: POLE-1 succeeds
+            RuntimeError("bad row"),  # row-by-row: POLE-2 fails
+            None,  # retention purge
+            None,  # final SP_Execution update
         ]
 
         pole_telemetry_loader.load_leadsun_pole_telemetry()  # must not raise

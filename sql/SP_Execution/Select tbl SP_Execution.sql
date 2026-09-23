@@ -12,9 +12,9 @@ SELECT TOP 1000
     ErrorMessage
 FROM SP_Execution
 WHERE 1 = 1
-AND Name <> 'loadProvisionedPoleTelemetry'
+-- AND Name <> 'loadProvisionedPoleTelemetry'
 -- AND Environment = 'Prod'
--- AND Name = 'loadPoleVitals'
--- AND Name = 'loadProvisionedPoleVitals'
+AND Name = 'loadPoleTelemetry'
+-- AND Source = 'AirTable'
 -- AND ErrorMessage IS NOT NULL
 ORDER BY StartDateTime DESC;

@@ -63,7 +63,7 @@ def _clamp_summary_limit(limit) -> int:
 # BatteryElecCurrent1/2, SolarBoardVoltage/SolarBoardElecCurrent, and
 # IsDaylightForPanelFault -- the raw inputs
 # api_utils.compute_pole_status_labels() needs to compute
-# lightStatusLabel/panelStatusLabel/panelIdleReason/batteryStatusLabel
+# lightStatusText/panelStatusText/panelIdleReason/batteryStatusText
 # for summary mode too (see _summary_row_to_dict()'s own comment for
 # why electricCurrentAverage specifically is NOT one of the four
 # exposed here, even though its own inputs are now being fetched
@@ -189,8 +189,8 @@ def _summary_row_to_dict(row) -> dict:
     genuinely different (missing batteryVoltage1/2), not just a subset
     of the exact same shape.
 
-    lightStatusLabel/panelStatusLabel/panelIdleReason/batteryStatusLabel/
-    connectedLabel/overallStatusLabel: computed via the exact same
+    lightStatusText/panelStatusText/panelIdleReason/batteryStatusText/
+    connectedText/overallStatusText: computed via the exact same
     shared pole_vitals_api._compute_pole_vitals_status_fields() helper
     pole_vitals_api.py's own _pole_row_to_dict() uses -- reused directly
     here (rather than reimplementing the same staleness-override logic a
@@ -200,9 +200,9 @@ def _summary_row_to_dict(row) -> dict:
     null or >48h old) gets the exact same treatment here as it does in
     getPoleVitals: isLedFault/isBatteryFault/isPanelFault/isPoleFault/
     lampPower1/2/batteryElecCurrent1/2/solarBoardVoltage/
-    solarBoardElecCurrent all null, lightStatusLabel/panelStatusLabel/
-    batteryStatusLabel/overallStatusLabel showing "Not Reporting"/"Not
-    Reporting 48H" as appropriate, and connectedLabel reflecting
+    solarBoardElecCurrent all null, lightStatusText/panelStatusText/
+    batteryStatusText/overallStatusText showing "Not Reporting"/"Not
+    Reporting 48H" as appropriate, and connectedText reflecting
     isOnline/lastUpdate per its own independent rules.
 
     electricCurrentAverage is popped back out before merging into this
@@ -251,8 +251,8 @@ def _summary_row_to_dict(row) -> dict:
     # applies to its own four fault fields and raw sensor fields --
     # replicated here (rather than assuming _compute_pole_vitals_
     # status_fields() below does it) since that helper only computes
-    # the LABEL fields (lightStatusLabel/panelStatusLabel/
-    # batteryStatusLabel/connectedLabel/overallStatusLabel/
+    # the LABEL fields (lightStatusText/panelStatusText/
+    # batteryStatusText/connectedText/overallStatusText/
     # electricCurrentAverage/panelIdleReason) -- isLedFault/
     # isBatteryFault/isPanelFault/isPoleFault and the raw
     # lampPower/batteryElecCurrent/solarBoard readings are this
@@ -330,8 +330,8 @@ def get_poles(
     lat, long, lastUpdate, batteryVoltage1, batteryVoltage2, isOnline,
     isLedFault, isBatteryFault, isPanelFault, isOpenIssueFault,
     isPoleFault, avgBatteryPercentage, avgPanelPercentage,
-    avgLightPercentage, lightStatusLabel, panelStatusLabel,
-    panelIdleReason, batteryStatusLabel, electricCurrentAverage,
+    avgLightPercentage, lightStatusText, panelStatusText,
+    panelIdleReason, batteryStatusText, electricCurrentAverage,
     sunsetTime -- see
     pole_vitals_api.get_pole_vitals()'s own docstring for what each of
     these means and where it comes from), plus two additions beyond
@@ -362,8 +362,8 @@ def get_poles(
     batteryVoltage1 and batteryVoltage2 are simply absent from each
     returned pole, and so is electricCurrentAverage specifically (one
     of the five calculated fields above; the other four --
-    lightStatusLabel/panelStatusLabel/panelIdleReason/
-    batteryStatusLabel -- ARE included here too, per explicit request,
+    lightStatusText/panelStatusText/panelIdleReason/
+    batteryStatusText -- ARE included here too, per explicit request,
     even though electricCurrentAverage's own underlying inputs are now
     fetched regardless) -- but still includes lastUpdate, via that same
     template's own PoleTelemetry lookup (see

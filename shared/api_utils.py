@@ -105,15 +105,15 @@ def compute_pole_status_labels(
     LampPower/BatteryElecCurrent pairs elsewhere (e.g.
     pole_vitals_loader.py's own IsPanelFault formula).
 
-    lightStatusLabel: "ON" if LampPower1+LampPower2 > 0, else "OFF".
+    lightStatusText: "ON" if LampPower1+LampPower2 > 0, else "OFF".
 
-    panelStatusLabel: "Charging" if SolarBoardVoltage *
+    panelStatusText: "Charging" if SolarBoardVoltage *
     SolarBoardElecCurrent > 0, else "Idle".
 
-    panelIdleReason: only computed when panelStatusLabel is actually
+    panelIdleReason: only computed when panelStatusText is actually
     "Idle" -- None otherwise (including for "Charging"), per explicit
     correction (an earlier version computed this unconditionally,
-    alongside panelStatusLabel rather than gated by it). "Sundown" if
+    alongside panelStatusText rather than gated by it). "Sundown" if
     IsDaylightForPanelFault = 0 (using pole_vitals_loader.py's own
     established daylight signal for panel-fault purposes, not a
     separate day/night calculation); else "Battery Full" if
@@ -126,7 +126,7 @@ def compute_pole_status_labels(
     battery-current check, same as an explicit non-zero value would --
     NULL is not equal to 0.
 
-    batteryStatusLabel: "Full" if BatteryElecCurrent1+
+    batteryStatusText: "Full" if BatteryElecCurrent1+
     BatteryElecCurrent2 = 200 (same threshold as panelIdleReason's own
     "Battery Full" case); else "Discharging" if LampPower1+LampPower2 >
     0 (drawing from the battery to power the lamp); else "Charging".
@@ -142,10 +142,10 @@ def compute_pole_status_labels(
     """
     if not has_telemetry:
         return {
-            "lightStatusLabel": None,
-            "panelStatusLabel": None,
+            "lightStatusText": None,
+            "panelStatusText": None,
             "panelIdleReason": None,
-            "batteryStatusLabel": None,
+            "batteryStatusText": None,
             "electricCurrentAverage": None,
         }
 
@@ -173,16 +173,16 @@ def compute_pole_status_labels(
         battery_status_label = "Charging"
 
     return {
-        "lightStatusLabel": light_status_label,
-        "panelStatusLabel": panel_status_label,
+        "lightStatusText": light_status_label,
+        "panelStatusText": panel_status_label,
         "panelIdleReason": panel_idle_reason,
-        "batteryStatusLabel": battery_status_label,
+        "batteryStatusText": battery_status_label,
         "electricCurrentAverage": battery_current_sum / 2,
     }
 
 
-# How far back "still reporting" reaches before lightStatusLabel/
-# panelStatusLabel/batteryStatusLabel/overallStatusLabel all switch to
+# How far back "still reporting" reaches before lightStatusText/
+# panelStatusText/batteryStatusText/overallStatusText all switch to
 # their own "Not Reporting 48H" state, per explicit request -- a pole
 # whose last known reading is older than this is treated as silent
 # going forward, regardless of what that stale reading's own values
@@ -229,7 +229,7 @@ def compute_pole_connectivity_labels(is_online, is_pole_fault, last_update) -> d
     is unchanged; these two are computed and added on separately, only
     where requested.
 
-    connectedLabel:
+    connectedText:
       "Online"       if is_online is True
       "Offline"      if is_online is False
       "Disconnected" if is_online is None AND last_update is not None
@@ -238,7 +238,7 @@ def compute_pole_connectivity_labels(is_online, is_pole_fault, last_update) -> d
       "Unknown"      otherwise (is_online is None AND last_update is
                         also None -- no telemetry at all to judge from)
 
-    overallStatusLabel: compute_reporting_staleness_label(last_update)'s
+    overallStatusText: compute_reporting_staleness_label(last_update)'s
       own "Not Reporting"/"Not Reporting 48H" takes priority when it
       applies; otherwise "Fault" if is_pole_fault is truthy, else "OK".
     """
@@ -260,8 +260,8 @@ def compute_pole_connectivity_labels(is_online, is_pole_fault, last_update) -> d
         overall_status_label = "OK"
 
     return {
-        "connectedLabel": connected_label,
-        "overallStatusLabel": overall_status_label,
+        "connectedText": connected_label,
+        "overallStatusText": overall_status_label,
     }
 
 
