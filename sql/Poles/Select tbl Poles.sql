@@ -4,6 +4,7 @@ SELECT --TOP (1000)
       ,[VendorPoleId]
       ,[ControllerId]
       ,ProvisionedPoleId
+      ,LinkedPoleId
       ,PoleModelId
       ,CountyFips
       ,Active
@@ -60,8 +61,3 @@ SELECT --TOP (1000)
 --   AND ctz.FIPS IS NULL
 -- GROUP BY p.CountyFips
 -- ORDER BY PoleCount DESC;
-
-SELECT a.PoleNumber
-FROM Poles a
-LEFT JOIN PoleTelemetry b ON a.VendorPoleId = b.PoleId
-WHERE b.PoleId IS NULL;

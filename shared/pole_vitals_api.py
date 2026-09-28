@@ -233,7 +233,7 @@ SELECT
     rps.IsLedFault AS IsLedFault,
     rps.IsBatteryFault AS IsBatteryFault,
     rps.IsPanelFault AS IsPanelFault,
-    -- Reads directly from PoleOpenIssues, NOT rps -- deliberately
+    -- Reads directly from PoleIssues, NOT rps -- deliberately
     -- decoupled from the Last48Hours join (and therefore from telemetry
     -- recency entirely), per explicit request: whether a pole has an
     -- open issue is a current fact about the POLE, unrelated to whether
@@ -242,13 +242,29 @@ SELECT
     -- matching row -- unlike every other field on this line, which
     -- comes back NULL for a pole with no current Last48Hours row.
     CASE WHEN EXISTS (
-        SELECT 1 FROM PoleOpenIssues poi WHERE poi.PoleId = p.Id
+        SELECT 1 FROM PoleIssues poi WHERE poi.PoleId = p.Id AND poi.Status = 'Open'
     ) THEN CAST(1 AS BIT) ELSE CAST(0 AS BIT) END AS IsOpenIssueFault,
     rps.IsPoleFault AS IsPoleFault,
     rps.AvgBatteryPercentage AS BatteryPercentage,
     rps.AvgPanelPercentage AS PanelPercentage,
     rps.AvgLightPercentage AS LightPercentage,
-    c.Id AS CustomerId
+    c.Id AS CustomerId,
+    -- Concatenated issue list for this pole: pipe-delimited rows of
+    -- Status|PoleStatus|DateReported|ProblemDetails, split in Python.
+    -- Scalar subquery with STRING_AGG keeps it one row per pole
+    -- with no cartesian product, returning NULL when no issues exist.
+    (
+        SELECT STRING_AGG(
+            ISNULL(poi.IssueId, '') + '|' +
+            ISNULL(poi.Status, '') + '|' +
+            ISNULL(poi.PoleStatus, '') + '|' +
+            ISNULL(CONVERT(NVARCHAR(50), poi.DateReported), '') + '|' +
+            ISNULL(poi.ProblemDetails, ''),
+            '~~'
+        )
+        FROM PoleIssues poi
+        WHERE poi.PoleId = p.Id
+    ) AS IssuesRaw
 FROM Poles p
 JOIN Projects proj ON p.ProjectId = proj.Id
 JOIN Customers c ON proj.CustomerId = c.Id
@@ -301,6 +317,28 @@ def _percent_working(total_connected: int, total_faults: int) -> float:
     if total_connected == 0:
         return 0.0
     return round(((total_connected - total_faults) / total_connected) * 100, 2)
+
+
+def _parse_issues_raw(issues_raw: str | None) -> list:
+    """
+    Parses the pipe/tilde-delimited STRING_AGG result from the SQL query
+    into a list of issue dicts. Returns an empty list when no issues exist.
+    Format: 'Status|PoleStatus|DateReported|ProblemDetails~~Status|...'
+    """
+    if not issues_raw:
+        return []
+    issues = []
+    for row in issues_raw.split("~~"):
+        parts = row.split("|", 4)
+        if len(parts) == 5:
+            issues.append({
+                "issueId": parts[0] or None,
+                "status": parts[1] or None,
+                "poleStatus": parts[2] or None,
+                "dateReported": parts[3] or None,
+                "problemDetails": parts[4] or None,
+            })
+    return issues
 
 
 def _pole_row_to_dict(row) -> dict:
@@ -389,6 +427,7 @@ def _pole_row_to_dict(row) -> dict:
         panel_percentage,
         light_percentage,
         _,  # CustomerId -- see docstring above for why this is discarded here
+        issues_raw,
     ) = row
 
     # Per explicit request: these four fault-related fields go null
@@ -401,7 +440,7 @@ def _pole_row_to_dict(row) -> dict:
     #                    own logic already reads is_online directly
     #                    regardless of staleness (see
     #                    api_utils.compute_pole_connectivity_labels()).
-    #   isOpenIssueFault -- sourced directly from PoleOpenIssues via its
+    #   isOpenIssueFault -- sourced directly from PoleIssues via its
     #                    own independent EXISTS check in the SQL query
     #                    itself (see _POLE_DETAILS_SQL_TEMPLATE's own
     #                    comment), not from the rps/Last48Hours join at
@@ -476,6 +515,7 @@ def _pole_row_to_dict(row) -> dict:
         "avgBatteryPercentage": json_safe(battery_percentage),
         "avgPanelPercentage": json_safe(panel_percentage),
         "avgLightPercentage": json_safe(light_percentage),
+        "poleIssues": _parse_issues_raw(issues_raw),
         "sunsetTime": json_safe(
             compute_pole_local_sunset(timezone_latitude, timezone_longitude, iana_timezone)
         ),

@@ -117,12 +117,12 @@ SELECT
     rps.IsBatteryFault AS IsBatteryFault,
     rps.IsPanelFault AS IsPanelFault,
     -- Same as pole_vitals_api.py's own _POLE_DETAILS_SQL_TEMPLATE:
-    -- reads directly from PoleOpenIssues, decoupled from the Last48Hours
+    -- reads directly from PoleIssues, decoupled from the Last48Hours
     -- join and therefore from telemetry recency entirely -- always TRUE
     -- or FALSE, never NULL, regardless of whether rps itself has a
     -- matching row.
     CASE WHEN EXISTS (
-        SELECT 1 FROM PoleOpenIssues poi WHERE poi.PoleId = p.Id
+        SELECT 1 FROM PoleIssues poi WHERE poi.PoleId = p.Id AND poi.Status = 'Open'
     ) THEN CAST(1 AS BIT) ELSE CAST(0 AS BIT) END AS IsOpenIssueFault,
     rps.IsPoleFault AS IsPoleFault,
     rps.AvgBatteryPercentage AS BatteryPercentage,
@@ -211,7 +211,7 @@ def _summary_row_to_dict(row) -> dict:
     simple and total, with "which fields to actually expose" left
     entirely up to each caller. (isOpenIssueFault is untouched by any of
     this -- see _POLE_SUMMARY_SQL_TEMPLATE's own comment: it's read
-    directly from PoleOpenIssues, independent of lastUpdate/telemetry
+    directly from PoleIssues, independent of lastUpdate/telemetry
     staleness entirely, same as pole_vitals_api.py's own per-pole detail
     query.)
     """
@@ -259,7 +259,7 @@ def _summary_row_to_dict(row) -> dict:
     # function's own separate local variables, nulled directly here.
     # isOpenIssueFault is untouched, same reasoning as
     # pole_vitals_api.py's own version: sourced independently from
-    # PoleOpenIssues (see _POLE_SUMMARY_SQL_TEMPLATE's own comment), not
+    # PoleIssues (see _POLE_SUMMARY_SQL_TEMPLATE's own comment), not
     # from PoleTelemetry, so telemetry staleness says nothing about it.
     if compute_reporting_staleness_label(last_update) is not None:
         is_led_fault = None

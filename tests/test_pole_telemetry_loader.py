@@ -337,7 +337,7 @@ class TestLoadPoleTelemetrySuccessFlow:
         assert (name, env, source) == ("loadPoleTelemetry", "Dev", "Leadsun")
         assert DTO_PATTERN.match(start_time)
 
-        assert "JOIN PoleOpenIssues" in calls[1].args[0]
+        assert "JOIN PoleIssues" in calls[1].args[0]
         assert "CREATE TABLE #PoleTelemetryStaging" in calls[2].args[0]
         assert "CREATE CLUSTERED INDEX" in calls[3].args[0]
         assert "MERGE PoleTelemetry" in calls[4].args[0]
@@ -374,7 +374,7 @@ class TestLoadPoleTelemetrySuccessFlow:
         # insert, open-issues lookup, retention purge, final update -- no
         # staging table needed
         assert len(calls) == 4
-        assert "JOIN PoleOpenIssues" in calls[1].args[0]
+        assert "JOIN PoleIssues" in calls[1].args[0]
         assert "DELETE FROM PoleTelemetry" in calls[2].args[0]
         _, _end_time, success, errors, batch_count, _sp_exec_id = calls[3].args
         assert (success, errors, batch_count) == (0, 0, 1)
@@ -492,7 +492,7 @@ class TestLoadPoleTelemetryTopLevelFailure:
 # --------------------------------------------------------------------------
 # backfill_is_open_issue_fault_for_all_poles() -- one-off correction for
 # IsOpenIssueFault values already written wrong on existing PoleTelemetry
-# rows, before PoleOpenIssues.PoleId was fixed to source from Airtable's
+# rows, before PoleIssues.PoleId was fixed to source from Airtable's
 # "PoleRecordID" field.
 # --------------------------------------------------------------------------
 
@@ -530,7 +530,7 @@ class TestBackfillIsOpenIssueFaultPerPoleSqlStructure:
         _fetch_pole_ids_with_open_issues() does, not some
         independently-written path that could disagree with it."""
         sql = pole_telemetry_loader._BACKFILL_IS_OPEN_ISSUE_FAULT_PER_POLE_SQL
-        assert "JOIN PoleOpenIssues poi ON poi.PoleId = p.Id" in sql
+        assert "JOIN PoleIssues poi ON poi.PoleId = p.Id" in sql
 
     def test_only_updates_rows_where_the_value_would_actually_change(self):
         """Avoids rewriting rows that already have the correct non-NULL value,

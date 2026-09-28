@@ -1,5 +1,5 @@
 """
-Tests for shared/pole_open_issues_loader.py, plus the fetch_all_records()
+Tests for shared/pole_issues_loader.py, plus the fetch_all_records()
 extension in shared/airtable_client.py that this loader relies on.
 """
 
@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from shared import airtable_client, pole_open_issues_loader as m
+from shared import airtable_client, pole_issues_loader as m
 
 
 def _sample_record(record_id="rec1", issue_id="ISSUE-1", pole_id="recPole1", status="Open", pole_status="Electrical Issue"):
@@ -132,6 +132,9 @@ class TestMapRecordToIssue:
             "PoleId": "recC8GYNmkJDei0PV",
             "Status": "Open",
             "PoleStatus": "Electrical Issue",
+            "DateReported": None,
+            "ProblemDetails": None,
+            "IssueSource": None,
         }
 
     def test_pole_status_extracts_a_plain_string_not_a_record_id(self):
@@ -144,54 +147,53 @@ class TestMapRecordToIssue:
         assert not result["PoleStatus"].startswith("rec")
 
 
-class TestMatchesOpenIssueFilter:
+class TestMatchesIssueFilter:
     def test_open_electrical_issue_matches(self):
         issue = m._map_record_to_issue(_sample_record(status="Open", pole_status="Electrical Issue"))
-        assert m._matches_open_issue_filter(issue) is True
+        assert m._has_valid_pole_status(issue) is True
 
     def test_open_structural_issue_matches(self):
         issue = m._map_record_to_issue(_sample_record(status="Open", pole_status="Structural Issue"))
-        assert m._matches_open_issue_filter(issue) is True
+        assert m._has_valid_pole_status(issue) is True
 
-    def test_resolved_issue_does_not_match(self):
-        """The actual reason load_pole_open_issues() also has to prune
-        stale rows -- an issue can flip from matching to not matching
-        between runs."""
+    def test_closed_issue_passes_filter(self):
+        """Closed issues now pass the filter -- only PoleStatus is validated.
+        IsOpenIssueFault uses WHERE Status = 'Open' at ingestion time."""
         issue = m._map_record_to_issue(_sample_record(status="Closed", pole_status="Electrical Issue"))
-        assert m._matches_open_issue_filter(issue) is False
+        assert m._has_valid_pole_status(issue) is True
 
     def test_other_pole_status_does_not_match(self):
         issue = m._map_record_to_issue(_sample_record(status="Open", pole_status="Cosmetic Issue"))
-        assert m._matches_open_issue_filter(issue) is False
+        assert m._has_valid_pole_status(issue) is False
 
     def test_missing_pole_status_does_not_match(self):
         issue = m._map_record_to_issue(_sample_record(status="Open", pole_status=None))
-        assert m._matches_open_issue_filter(issue) is False
+        assert m._has_valid_pole_status(issue) is False
 
 
-class TestLoadPoleOpenIssues:
+class TestLoadPoleIssues:
     def _setup(self, mocker, records):
         mock_cursor = MagicMock()
         mock_conn = MagicMock()
         mock_conn.cursor.return_value = mock_cursor
         mock_cursor.fetchone.return_value = (1,)  # SP_Execution.Id
         mocker.patch(
-            "shared.pole_open_issues_loader.fetch_all_records",
+            "shared.pole_issues_loader.fetch_all_records",
             return_value=(records, []),
         )
-        mocker.patch("shared.pole_open_issues_loader.get_connection", return_value=mock_conn)
+        mocker.patch("shared.pole_issues_loader.get_connection", return_value=mock_conn)
         return mock_conn, mock_cursor
 
     def test_fetches_from_the_dedicated_base_and_view(self, mocker):
         mock_fetch = mocker.patch(
-            "shared.pole_open_issues_loader.fetch_all_records",
+            "shared.pole_issues_loader.fetch_all_records",
             return_value=([], []),
         )
         mock_conn = MagicMock()
         mock_conn.cursor.return_value.fetchone.return_value = (1,)
-        mocker.patch("shared.pole_open_issues_loader.get_connection", return_value=mock_conn)
+        mocker.patch("shared.pole_issues_loader.get_connection", return_value=mock_conn)
 
-        m.load_pole_open_issues()
+        m.load_pole_issues()
 
         mock_fetch.assert_called_once_with(
             m.AIRTABLE_POLE_ISSUES_TABLE,
@@ -202,24 +204,24 @@ class TestLoadPoleOpenIssues:
     def test_only_upserts_matching_records(self, mocker):
         records = [
             _sample_record(record_id="rec-match", status="Open", pole_status="Electrical Issue"),
-            _sample_record(record_id="rec-resolved", status="Closed", pole_status="Electrical Issue"),
+            _sample_record(record_id="rec-invalid", status="Open", pole_status="Unknown Type"),
             _sample_record(record_id="rec-other-status", status="Open", pole_status="Cosmetic Issue"),
         ]
         mock_conn, mock_cursor = self._setup(mocker, records)
 
-        m.load_pole_open_issues()
+        m.load_pole_issues()
 
-        upsert_calls = [c for c in mock_cursor.execute.call_args_list if "MERGE PoleOpenIssues" in c.args[0]]
+        upsert_calls = [c for c in mock_cursor.execute.call_args_list if "MERGE PoleIssues" in c.args[0]]
         assert len(upsert_calls) == 1
-        assert upsert_calls[0].args[1] == "rec-match"
+        assert upsert_calls[0].args[1] == "rec-match"  # rec-invalid fails PoleStatus check
 
     def test_deletes_rows_no_longer_matching(self, mocker):
         records = [_sample_record(record_id="rec-still-open", status="Open", pole_status="Electrical Issue")]
         mock_conn, mock_cursor = self._setup(mocker, records)
 
-        m.load_pole_open_issues()
+        m.load_pole_issues()
 
-        delete_calls = [c for c in mock_cursor.execute.call_args_list if c.args[0].strip().upper().startswith("DELETE FROM POLEOPENISSUES")]
+        delete_calls = [c for c in mock_cursor.execute.call_args_list if "DELETE FROM POLEISSUES" in c.args[0].strip().upper()]
         assert len(delete_calls) == 1
         assert "NOT IN (?)" in delete_calls[0].args[0]
         assert delete_calls[0].args[1] == "rec-still-open"
@@ -229,27 +231,27 @@ class TestLoadPoleOpenIssues:
         unconditionally (a bare "WHERE Id NOT IN ()" is invalid SQL, so
         this has to be a genuinely separate code path, not just an empty
         parameter list)."""
-        records = [_sample_record(record_id="rec-resolved", status="Closed")]
+        records = [_sample_record(record_id="rec-invalid", status="Open", pole_status="Unknown Type")]
         mock_conn, mock_cursor = self._setup(mocker, records)
 
-        m.load_pole_open_issues()
+        m.load_pole_issues()
 
-        delete_calls = [c for c in mock_cursor.execute.call_args_list if c.args[0].strip().upper().startswith("DELETE FROM POLEOPENISSUES")]
+        delete_calls = [c for c in mock_cursor.execute.call_args_list if "DELETE FROM POLEISSUES" in c.args[0].strip().upper()]
         assert len(delete_calls) == 1
-        assert delete_calls[0].args[0].strip() == "DELETE FROM PoleOpenIssues"
+        assert delete_calls[0].args[0].strip() == "DELETE FROM PoleIssues"
 
     def test_commits_once_after_upserts_and_delete(self, mocker):
         records = [_sample_record(record_id="rec-match")]
         mock_conn, mock_cursor = self._setup(mocker, records)
 
-        m.load_pole_open_issues()
+        m.load_pole_issues()
 
         mock_conn.commit.assert_called()  # at least once; exact count isn't the point here
 
     def test_sp_execution_source_is_airtable(self, mocker):
         mock_conn, mock_cursor = self._setup(mocker, [])
 
-        m.load_pole_open_issues()
+        m.load_pole_issues()
 
         sp_exec_call = mock_cursor.execute.call_args_list[0]
         assert sp_exec_call.args[4] == "AirTable"

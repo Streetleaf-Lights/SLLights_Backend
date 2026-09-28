@@ -28,21 +28,19 @@ def make_http_request():
 
 def patch_all_loaders(mocker):
     """
-    Patches load_poles, load_projects, and load_customers, tracking call
-    order via a shared list so tests can assert Poles -> Projects -> Customers.
+    Patches load_poles, load_linked_poles, load_projects, and load_customers,
+    tracking call order via a shared list so tests can assert
+    Poles -> LinkedPoles -> Projects -> Customers.
 
-    Also patches load_pole_open_issues -- added to loadAirTableData/
-    loadAirTableDataManual after this helper was first written, so every
-    existing call site here already unpacks a 4-tuple; this is patched
-    silently (not returned) rather than changing that signature and
-    touching all 14 call sites for a mock nothing here currently needs to
-    inspect directly. Without this, every test using this helper would
-    invoke the REAL load_pole_open_issues(), which tries to open a real
-    database connection.
+    Also patches load_pole_issues silently -- not returned since no test
+    currently needs to inspect it directly.
     """
     call_order = []
     mock_poles = mocker.patch(
         "function_app.load_poles", side_effect=lambda: call_order.append("poles")
+    )
+    mocker.patch(
+        "function_app.load_linked_poles", side_effect=lambda: call_order.append("linked_poles")
     )
     mock_projects = mocker.patch(
         "function_app.load_projects", side_effect=lambda: call_order.append("projects")
@@ -50,7 +48,7 @@ def patch_all_loaders(mocker):
     mock_customers = mocker.patch(
         "function_app.load_customers", side_effect=lambda: call_order.append("customers")
     )
-    mocker.patch("function_app.load_pole_open_issues")
+    mocker.patch("function_app.load_pole_issues")
     return mock_poles, mock_projects, mock_customers, call_order
 
 
@@ -134,11 +132,12 @@ class TestLoadAirTableDataTimer:
     def test_poles_runs_before_projects_before_customers(self, mocker):
         _, _, _, call_order = patch_all_loaders(mocker)
         function_app.loadAirTableData(make_timer_request())
-        assert call_order == ["poles", "projects", "customers"]
+        assert call_order == ["poles", "linked_poles", "projects", "customers"]
 
     @freeze_time("2026-07-13 10:00:00")
     def test_propagates_exception_from_load_customers(self, mocker):
         mocker.patch("function_app.load_poles")
+        mocker.patch("function_app.load_linked_poles")
         mocker.patch("function_app.load_projects")
         mocker.patch("function_app.load_customers", side_effect=RuntimeError("db down"))
         with pytest.raises(RuntimeError, match="db down"):
@@ -165,6 +164,7 @@ class TestLoadAirTableDataTimer:
     @freeze_time("2026-07-13 10:00:00")
     def test_load_customers_not_called_if_load_projects_fails(self, mocker):
         mocker.patch("function_app.load_poles")
+        mocker.patch("function_app.load_linked_poles")
         mocker.patch("function_app.load_projects", side_effect=RuntimeError("projects failed"))
         mock_customers = mocker.patch("function_app.load_customers")
 
@@ -190,6 +190,7 @@ class TestLoadAirTableDataTimer:
         gets logged or inspected."""
         monkeypatch.setattr(function_app, "ENVIRONMENT", "Dev")
         mocker.patch("function_app.load_poles")
+        mocker.patch("function_app.load_linked_poles")
         mocker.patch("function_app.load_projects")
         mocker.patch("function_app.load_customers")
 
@@ -226,7 +227,7 @@ class TestLoadAirTableDataManual:
         response = function_app.loadAirTableDataManual(make_http_request())
 
         assert response.status_code == 200
-        assert response.get_body() == b"loadPoles + loadProjects + loadCustomers + loadPoleOpenIssues run complete."
+        assert response.get_body() == b"loadPoles + loadProjects + loadCustomers + loadPoleIssues run complete."
         mock_poles.assert_called_once()
         mock_projects.assert_called_once()
         mock_customers.assert_called_once()
@@ -237,7 +238,7 @@ class TestLoadAirTableDataManual:
 
         function_app.loadAirTableDataManual(make_http_request())
 
-        assert call_order == ["poles", "projects", "customers"]
+        assert call_order == ["poles", "linked_poles", "projects", "customers"]
 
     def test_runs_when_environment_unset_defaults_to_dev_behavior(self, mocker, monkeypatch):
         # ENVIRONMENT defaults to "Dev" for any value other than "Prod"
@@ -261,6 +262,7 @@ class TestLoadAirTableDataManual:
         """
         monkeypatch.setattr(function_app, "ENVIRONMENT", "Dev")
         mocker.patch("function_app.load_poles")
+        mocker.patch("function_app.load_linked_poles")
         mocker.patch("function_app.load_projects")
         mocker.patch("function_app.load_customers", side_effect=RuntimeError("db down"))
 
@@ -282,6 +284,7 @@ class TestLoadAirTableDataManual:
     def test_load_customers_not_called_if_load_projects_fails(self, mocker, monkeypatch):
         monkeypatch.setattr(function_app, "ENVIRONMENT", "Dev")
         mocker.patch("function_app.load_poles")
+        mocker.patch("function_app.load_linked_poles")
         mocker.patch("function_app.load_projects", side_effect=RuntimeError("projects failed"))
         mock_customers = mocker.patch("function_app.load_customers")
 

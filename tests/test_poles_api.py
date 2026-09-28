@@ -65,7 +65,7 @@ class TestPoleSummarySqlStructure:
         recency -- never null, unlike every other fault field."""
         sql = m._POLE_SUMMARY_SQL_TEMPLATE
         assert "rps.IsOpenIssueFault" not in sql
-        assert "SELECT 1 FROM PoleOpenIssues poi WHERE poi.PoleId = p.Id" in sql
+        assert "SELECT 1 FROM PoleIssues poi WHERE poi.PoleId = p.Id AND poi.Status = 'Open'" in sql
         assert "THEN CAST(1 AS BIT) ELSE CAST(0 AS BIT) END AS IsOpenIssueFault" in sql
 
 

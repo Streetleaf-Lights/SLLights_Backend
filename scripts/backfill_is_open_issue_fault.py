@@ -3,9 +3,9 @@ One-off script to run
 pole_telemetry_loader.backfill_is_open_issue_fault_for_all_poles() --
 corrects IsOpenIssueFault on EXISTING PoleTelemetry rows (within each
 pole's own last 48 hours of activity, ending at that pole's own latest
-reading) using the now-corrected PoleOpenIssues.PoleId -> Poles.Id join.
+reading) using the now-corrected PoleIssues.PoleId -> Poles.Id join.
 
-Background: PoleOpenIssues.PoleId used to be sourced from Airtable's
+Background: PoleIssues.PoleId used to be sourced from Airtable's
 "PoleId" field, which links to a synced/mirror table, NOT the real Poles
 table this project's own Poles.Id comes from -- so the join
 _fetch_location_ids_with_open_issues() depends on never matched
@@ -13,12 +13,12 @@ correctly, meaning IsOpenIssueFault has likely been 0/False for
 essentially every pole regardless of whether it actually had an open
 issue, since pole_telemetry_loader.py was first built. Fixed by sourcing
 from Airtable's "PoleRecordID" field instead (see
-pole_open_issues_loader.py's own comments).
+pole_issues_loader.py's own comments).
 
 Run this AFTER:
-  1. Deploying the corrected pole_open_issues_loader.py.
-  2. Running loadPoleOpenIssues at least once with that fix in place
-     (so PoleOpenIssues.PoleId in SQL is actually corrected).
+  1. Deploying the corrected pole_issues_loader.py.
+  2. Running loadPoleIssues at least once with that fix in place
+     (so PoleIssues.PoleId in SQL is actually corrected).
 
 Run this BEFORE re-running
 scripts/backfill_last_48_hours_hour_pole_vitals.py -- that one only ever

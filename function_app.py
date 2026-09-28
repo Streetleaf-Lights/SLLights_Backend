@@ -10,7 +10,8 @@ import azure.functions as func
 from shared.customers_loader import load_customers
 from shared.projects_loader import load_projects
 from shared.poles_loader import load_poles
-from shared.pole_open_issues_loader import load_pole_open_issues
+from shared.linked_poles_loader import load_linked_poles
+from shared.pole_issues_loader import load_pole_issues
 from shared.pole_models_loader import load_leadsun_pole_models
 from shared.pole_telemetry_loader import load_leadsun_pole_telemetry, update_leadsun_project_details
 from shared.pole_timezones_loader import load_leadsun_pole_timezones, load_provisioned_pole_timezones
@@ -103,16 +104,17 @@ def loadAirTableData(myTimer: func.TimerRequest) -> None:
     # referential-integrity error even though a Pole's Project/Customer, or
     # a Project's Customer, might not exist in the target table yet.
     load_poles()
+    load_linked_poles()
     load_projects()
     load_customers()
 
-    # PoleOpenIssues comes from a genuinely separate Airtable base (see
-    # shared/pole_open_issues_loader.py's own AIRTABLE_POLE_ISSUES_BASE_ID
+    # PoleIssues comes from a genuinely separate Airtable base (see
+    # shared/pole_issues_loader.py's own AIRTABLE_POLE_ISSUES_BASE_ID
     # notes) with no load-order dependency on the three above (no FK,
     # enforced or otherwise, from Poles/Projects/Customers pointing at it)
-    # -- placed last here since PoleOpenIssues.PoleId is logically meant to
+    # -- placed last here since PoleIssues.PoleId is logically meant to
     # line up with Poles.Id, even though that's not FK-enforced either.
-    load_pole_open_issues()
+    load_pole_issues()
 
     logging.info("loadAirTableData: run complete.")
 
@@ -133,13 +135,14 @@ def loadAirTableDataManual(req: func.HttpRequest) -> func.HttpResponse:
 
     logging.info("loadAirTableDataManual: manual run triggered.")
     load_poles()
+    load_linked_poles()
     load_projects()
     load_customers()
-    load_pole_open_issues()
+    load_pole_issues()
     logging.info("loadAirTableDataManual: run complete.")
 
     return func.HttpResponse(
-        "loadPoles + loadProjects + loadCustomers + loadPoleOpenIssues run complete.",
+        "loadPoles + loadProjects + loadCustomers + loadPoleIssues run complete.",
         status_code=200,
     )
 
@@ -158,7 +161,7 @@ def loadAirTableDataManual(req: func.HttpRequest) -> func.HttpResponse:
 # is a device-model reference table needed by PoleVitals' Panel/Light
 # percentage formulas (SunboardPower/LightPower), PoleTelemetry is the raw
 # readings PoleVitals aggregates (now also computing IsOpenIssueFault per
-# reading, joining against PoleOpenIssues/Poles -- see
+# reading, joining against PoleIssues/Poles -- see
 # pole_telemetry_loader.py), PoleTimeZones resolves each pole's own
 # timezone (from that same fresh telemetry's Longitude/Latitude) so
 # PoleVitals can bucket in each pole's local time instead of assuming

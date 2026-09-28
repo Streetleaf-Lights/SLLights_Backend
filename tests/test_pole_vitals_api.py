@@ -240,7 +240,7 @@ class TestPoleDetailsSqlStructure:
         """One seek into PoleTelemetry already returns the latest row --
         no reason to query it twice for the same row."""
         sql = m._POLE_DETAILS_SQL_TEMPLATE
-        assert sql.count("OUTER APPLY") == 1
+        assert sql.count("OUTER APPLY") == 1  # telemetry OUTER APPLY only; issues use STRING_AGG subquery
         apply_block = sql.split("OUTER APPLY (")[1].split(") AS latest_pt")[0]
         for col in (
             "pt.LampPower1", "pt.LampPower2",
@@ -269,15 +269,15 @@ class TestPoleDetailsIsOpenIssueFaultIndependence:
     def test_reads_from_pole_open_issues_not_rps(self):
         sql = m._POLE_DETAILS_SQL_TEMPLATE
         assert "rps.IsOpenIssueFault" not in sql
-        assert "PoleOpenIssues" in sql
+        assert "PoleIssues" in sql
 
     def test_uses_exists_check_against_poles_own_id(self):
-        """PoleOpenIssues.PoleId matches Poles.Id, not PoleId --
+        """PoleIssues.PoleId matches Poles.Id, not PoleId --
         same join key pole_telemetry_loader.py's own
         _fetch_pole_ids_with_open_issues() uses."""
         sql = m._POLE_DETAILS_SQL_TEMPLATE
         assert "EXISTS (" in sql
-        assert "SELECT 1 FROM PoleOpenIssues poi WHERE poi.PoleId = p.Id" in sql
+        assert "SELECT 1 FROM PoleIssues poi WHERE poi.PoleId = p.Id AND poi.Status = 'Open'" in sql
 
     def test_always_a_definite_bit_never_left_as_a_bare_join_column(self):
         """CAST(...AS BIT) on both branches -- this must always resolve
@@ -318,7 +318,7 @@ class TestPoleDetailsIsOpenIssueFaultIndependence:
             None, None, None, None, None, None, None, None, None,
             28.2, -80.7, "America/New_York",
             is_online, None, None, None, is_open_issue_fault, is_pole_fault,
-            None, None, None, "cust1",
+            None, None, None, "cust1", None,
         )
 
     def test_pole_time_zone_columns_added_for_sunset_time(self):
@@ -387,6 +387,7 @@ class TestPoleRowToDict:
         panel_percentage=45.0,
         light_percentage=0.0,
         customer_id="cust1",
+        issues_raw=None,
     ):
         return (
             project_id, pole_id, pole_number, vendor_pole_id, install_date, lat, long_,
@@ -397,7 +398,7 @@ class TestPoleRowToDict:
             solar_board_voltage, solar_board_elec_current, is_daylight_for_panel_fault,
             timezone_latitude, timezone_longitude, iana_timezone,
             is_online, is_led_fault, is_battery_fault, is_panel_fault, is_open_issue_fault, is_pole_fault,
-            battery_percentage, panel_percentage, light_percentage, customer_id,
+            battery_percentage, panel_percentage, light_percentage, customer_id, issues_raw,
         )
 
     def test_maps_every_field_correctly(self):
@@ -433,6 +434,7 @@ class TestPoleRowToDict:
             "avgBatteryPercentage": 89.0,
             "avgPanelPercentage": 45.0,
             "avgLightPercentage": 0.0,
+            "poleIssues": [],
             "lightStatusText": "ON",
             "panelStatusText": "Charging",
             "panelIdleReason": None,
@@ -758,7 +760,7 @@ class TestGetPoleVitalsUnfiltered:
                 8.7, 8.6, 15.0, 15.2, 18.0, 2.0, 1,
                 28.2, -80.7, "America/New_York",
                 True, False, True, False, False, True,
-                89.0, 45.0, 0.0, "cust1",
+                89.0, 45.0, 0.0, "cust1", None,
             )
         ]
         mock_cursor.fetchall.side_effect = [agg_rows, pole_rows]

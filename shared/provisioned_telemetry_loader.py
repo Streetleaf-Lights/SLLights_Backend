@@ -105,7 +105,7 @@ these two fields will likely never show a provisioned pole as "Full"/
 wasn't part of what was asked; worth a follow-up if accurate
 battery-full detection matters for these poles.
 
-IsOpenIssueFault is computed via a PoleOpenIssues join through
+IsOpenIssueFault is computed via a PoleIssues join through
 Poles.ProvisionedPoleId (same pattern as load_leadsun_pole_telemetry()
 uses via Poles.PoleId) -- fetched once per invocation and checked
 via set membership when building each row.
@@ -278,18 +278,18 @@ def _map_event_to_telemetry_row(event: dict) -> dict:
 def _fetch_provisioned_pole_ids_with_open_issues(cursor) -> set:
     """
     Every ProvisionedPoleId whose pole has at least one row in
-    PoleOpenIssues -- mirrors pole_telemetry_loader's own
+    PoleIssues -- mirrors pole_telemetry_loader's own
     _fetch_pole_ids_with_open_issues() but joins via ProvisionedPoleId
     rather than PoleId, since that's the identifier provisioned poles
     use. Fetched once per process_provisioned_telemetry_events() invocation
-    (cheap -- PoleOpenIssues only holds currently-open issues) and checked
+    (cheap -- PoleIssues only holds currently-open issues) and checked
     via set membership when building each row.
     """
     cursor.execute(
         """
         SELECT DISTINCT p.ProvisionedPoleId
         FROM Poles p
-        JOIN PoleOpenIssues poi ON poi.PoleId = p.Id
+        JOIN PoleIssues poi ON poi.PoleId = p.Id AND poi.Status = 'Open'
         WHERE p.ProvisionedPoleId IS NOT NULL
         """
     )
@@ -442,7 +442,7 @@ def process_provisioned_telemetry_events(events: list) -> None:
         upsert_start = time.perf_counter()
         valid_mapped_rows = []
 
-        # Fetch once per invocation -- cheap, PoleOpenIssues is small
+        # Fetch once per invocation -- cheap, PoleIssues is small
         # (only currently-open issues). Same pattern as load_leadsun_pole_telemetry().
         open_issue_provisioned_pole_ids = _fetch_provisioned_pole_ids_with_open_issues(cursor)
 

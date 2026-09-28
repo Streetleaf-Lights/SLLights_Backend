@@ -213,20 +213,19 @@ def _build_row(mapped: dict, sp_exec_id, is_open_issue_fault: bool) -> tuple:
 
 def _fetch_pole_ids_with_open_issues(cursor) -> set:
     """
-    Every PoleId whose pole has at least one row in PoleOpenIssues --
-    PoleOpenIssues.PoleId matches Poles.Id, not PoleId directly, so
-    this needs the join through Poles. Fetched once per
-    load_leadsun_pole_telemetry() run (a single, cheap query -- PoleOpenIssues
-    only ever holds currently-open issues, not the full issue history,
-    so this stays small) rather than a per-row lookup, then checked via
-    simple set membership when mapping each lamp record below.
+    Every PoleId whose pole has at least one Open issue in PoleIssues.
+    PoleIssues.PoleId matches Poles.Id (not PoleTelemetry.PoleId directly),
+    so this joins through Poles. Filters to Status = 'Open' -- Closed issues
+    in PoleIssues do not contribute to IsOpenIssueFault. Fetched once per
+    load_leadsun_pole_telemetry() run then checked via set membership.
     """
     cursor.execute(
         """
         SELECT DISTINCT p.VendorPoleId
         FROM Poles p
-        JOIN PoleOpenIssues poi ON poi.PoleId = p.Id
+        JOIN PoleIssues poi ON poi.PoleId = p.Id
         WHERE p.VendorPoleId IS NOT NULL
+          AND poi.Status = 'Open'
         """
     )
     return {row[0] for row in cursor.fetchall()}
@@ -530,9 +529,9 @@ def load_leadsun_pole_telemetry() -> None:
 
 # One-off backfill for a real production bug: IsOpenIssueFault was
 # written incorrectly for every PoleTelemetry row ingested before
-# PoleOpenIssues.PoleId got fixed to source from Airtable's
+# PoleIssues.PoleId got fixed to source from Airtable's
 # "PoleRecordID" field instead of "PoleId" (see
-# pole_open_issues_loader.py's own comments on _map_record_to_issue for
+# pole_issues_loader.py's own comments on _map_record_to_issue for
 # the full history) -- "PoleId" links to a synced/mirror table, not the
 # real Poles table, so the JOIN this value depends on
 # (_fetch_pole_ids_with_open_issues() above) never matched
@@ -541,9 +540,9 @@ def load_leadsun_pole_telemetry() -> None:
 # issue, since this loader was first built.
 #
 # load_leadsun_pole_telemetry() itself needs NO fix -- _fetch_pole_ids_with_
-# open_issues() already re-queries PoleOpenIssues/Poles fresh on every
-# single run, so any NEW telemetry ingested after PoleOpenIssues.PoleId
-# is corrected (i.e. after loadPoleOpenIssues runs again with that fix
+# open_issues() already re-queries PoleIssues/Poles fresh on every
+# single run, so any NEW telemetry ingested after PoleIssues.PoleId
+# is corrected (i.e. after loadPoleIssues runs again with that fix
 # deployed) will automatically get the right IsOpenIssueFault value with
 # no further action needed. This backfill exists ONLY for EXISTING rows,
 # already ingested with the wrong value baked in, which nothing else
@@ -561,20 +560,21 @@ def load_leadsun_pole_telemetry() -> None:
 # backfill would end up re-aggregating the SAME stale, uncorrected
 # values for exactly the poles that backfill was built to help.
 #
-# PoleOpenIssues only ever holds CURRENTLY open issues, not a historical
+# PoleIssues only ever holds CURRENTLY open issues, not a historical
 # log of when each issue opened/closed -- there is no way to reconstruct
 # whether a GIVEN past reading's pole genuinely had an open issue AT
 # THAT EXACT MOMENT. This backfill applies TODAY's known open-issue
 # state to each pole's own recent window as the best available
 # correction, not a claim of full historical accuracy -- a real,
-# accepted limitation of PoleOpenIssues' own data model, not an
+# accepted limitation of PoleIssues' own data model, not an
 # oversight here.
 _BACKFILL_IS_OPEN_ISSUE_FAULT_PER_POLE_SQL = """
 WITH PoleIdsWithOpenIssues AS (
     SELECT DISTINCT p.VendorPoleId
     FROM Poles p
-    JOIN PoleOpenIssues poi ON poi.PoleId = p.Id
+    JOIN PoleIssues poi ON poi.PoleId = p.Id
     WHERE p.VendorPoleId IS NOT NULL
+      AND poi.Status = 'Open'
 ),
 MaxReadingPerPole AS (
     SELECT
@@ -603,22 +603,22 @@ def backfill_is_open_issue_fault_for_all_poles() -> None:
     One-off operation: corrects IsOpenIssueFault on EXISTING PoleTelemetry
     rows within each pole's own last 48 hours of activity (ending at that
     SAME pole's own latest reading, regardless of how old it is), using
-    the NOW-corrected PoleOpenIssues.PoleId -> Poles.Id join. See
+    the NOW-corrected PoleIssues.PoleId -> Poles.Id join. See
     _BACKFILL_IS_OPEN_ISSUE_FAULT_PER_POLE_SQL's own comment for the full
     reasoning, including why this was needed at all (a real, confirmed
     production bug) and this backfill's own real limitation (it can only
-    ever apply TODAY's known open-issue state, since PoleOpenIssues holds
+    ever apply TODAY's known open-issue state, since PoleIssues holds
     no history of past open/closed status).
 
-    NOT needed for any telemetry ingested AFTER loadPoleOpenIssues runs
+    NOT needed for any telemetry ingested AFTER loadPoleIssues runs
     with the corrected field mapping -- load_leadsun_pole_telemetry() itself
     already re-resolves this fresh on every single run, so new readings
     get the right value automatically. This is purely for rows already
     written with the wrong value baked in before that point.
 
     Intended to be run manually, once, as a one-off correction after
-    deploying the PoleOpenIssues.PoleId fix (and after running
-    loadPoleOpenIssues at least once with that fix in place) -- NOT part
+    deploying the PoleIssues.PoleId fix (and after running
+    loadPoleIssues at least once with that fix in place) -- NOT part
     of the normal, scheduled loadDeviceData cycle. See
     scripts/backfill_is_open_issue_fault.py for how to invoke it.
 

@@ -72,3 +72,28 @@ def airtable_created_time_to_eastern(created_time: str | None) -> str | None:
     utc_dt = datetime.fromisoformat(created_time.replace("Z", "+00:00"))
     eastern_dt = utc_dt.astimezone(EASTERN)
     return to_dto_string(eastern_dt)
+
+
+def airtable_date_to_eastern(value: str | None) -> str | None:
+    """
+    Converts an Airtable date or datetime field to an Eastern-time
+    DATETIMEOFFSET string.
+
+    Airtable date fields return a plain date string ('2026-09-01');
+    datetime fields return an ISO 8601 UTC string ('2026-09-01T14:30:00.000Z').
+    Plain dates are treated as midnight UTC before conversion.
+    Returns None for null/empty values.
+    """
+    if not value:
+        return None
+
+    # Datetime string (has 'T') -- parse as UTC
+    if "T" in value:
+        utc_dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    else:
+        # Plain date -- treat as midnight UTC
+        from datetime import timezone
+        utc_dt = datetime.fromisoformat(value).replace(tzinfo=timezone.utc)
+
+    eastern_dt = utc_dt.astimezone(EASTERN)
+    return to_dto_string(eastern_dt)
