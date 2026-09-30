@@ -12,7 +12,7 @@ SELECT TOP 1000
     ErrorMessage
 FROM SP_Execution
 WHERE 1 = 1
--- AND Name = 'loadProvisionedPoleTelemetry'
+-- AND Name = 'loadPoleDaylightFlags'
 -- AND Name = 'loadPoleTelemetry'
 -- AND Environment = 'Prod'
 -- AND Source = 'AirTable'

@@ -12,6 +12,7 @@ from shared.projects_loader import load_projects
 from shared.poles_loader import load_poles
 from shared.linked_poles_loader import load_linked_poles
 from shared.pole_issues_loader import load_pole_issues
+from shared.pole_issue_api import create_pole_issue
 from shared.pole_models_loader import load_leadsun_pole_models
 from shared.pole_telemetry_loader import load_leadsun_pole_telemetry, update_leadsun_project_details
 from shared.pole_timezones_loader import load_leadsun_pole_timezones, load_provisioned_pole_timezones
@@ -888,6 +889,47 @@ def registerUser(req: func.HttpRequest) -> func.HttpResponse:
 
     return func.HttpResponse(
         json.dumps(result), status_code=200, mimetype="application/json"
+    )
+
+
+@app.route(route="createPoleIssue", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def createPoleIssue(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Creates a new pole issue. Body: {poleNumber, status, problemDetails}.
+    Steps: patches the Airtable Poles record Status, creates a new Open
+    PoleIssues record (Source=\'Web\'), then syncs via loadPoleIssues.
+    Requires Customer Owner or higher.
+    """
+    try:
+        body = req.get_json()
+        result = create_pole_issue(
+            pole_number=body.get("poleNumber"),
+            status=body.get("status"),
+            problem_details=body.get("problemDetails"),
+        )
+    except ValueError as ex:
+        return func.HttpResponse(
+            json.dumps({"error": str(ex)}),
+            status_code=400,
+            mimetype="application/json",
+        )
+    except RuntimeError as ex:
+        logging.error("createPoleIssue: failed: %s", ex)
+        return func.HttpResponse(
+            json.dumps({"error": str(ex)}),
+            status_code=500,
+            mimetype="application/json",
+        )
+    except Exception as ex:
+        logging.error("createPoleIssue: failed: %s", ex)
+        return func.HttpResponse(
+            json.dumps({"error": "internal error"}),
+            status_code=500,
+            mimetype="application/json",
+        )
+
+    return func.HttpResponse(
+        json.dumps(result), status_code=201, mimetype="application/json"
     )
 
 

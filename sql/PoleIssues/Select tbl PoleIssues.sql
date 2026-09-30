@@ -18,7 +18,7 @@ AND p.PoleNumber LIKE '%TESTSL1%'
 -- AND pi.[Id] = 'recXUFnjXiVszvreV'
 -- AND pi.[PoleId] = 'reccrYpcKacWPvsvL'
 -- AND pi.[IssueId] LIKE '%BRE-1014%'
-ORDER BY p.PoleNumber;
+ORDER BY p.PoleNumber, DateReported;
 
 -- -- Quick summary: how many poles currently have an open issue vs
 -- -- how many correctly show IsOpenIssueFault=1 in recent telemetry.

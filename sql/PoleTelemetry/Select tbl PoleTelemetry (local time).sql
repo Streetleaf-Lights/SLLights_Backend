@@ -31,20 +31,6 @@ SELECT TOP 1000
     BatteryVoltage2,
     BatteryElecCurrent1,
     BatteryElecCurrent2,
-    DcInVoltage,
-    BatteryOutElecCurrent,
-    BatteryTemperature1,
-    BatteryTemperature2,
-    McuTemperature,
-    EnvTemperature,
-    LightingState,
-    DcInState,
-    DcOutState,
-    SolarBoardState,
-    Battery1State,
-    Battery2State,
-    Lamp1State,
-    Lamp2State,
     ControllerCode,
     ProductId,
     -- CreateTime,
@@ -58,11 +44,8 @@ SELECT TOP 1000
     LeadsunProjectId,
     LeadsunProjectName,
     ModelId,
-    TimeoutFlag,
     t.Latitude,
     t.Longitude,
-    ControlModelCode,
-    ControlModelName,
     ExtraFieldsJson
 FROM PoleTelemetry t
 LEFT JOIN Poles p ON t.PoleId = p.VendorPoleId
@@ -72,8 +55,8 @@ WHERE 1 = 1
 -- AND t.PoleId LIKE '%TESTSL1-100%'
 -- AND p.PoleNumber LIKE '%HIL-4509%'
 -- AND t.SP_ExecId = 442
--- AND t.IsDaylight IS NULL
--- AND t.IsDaylight = 1
+AND t.IsDaylight IS NULL
+-- AND t.IsDaylight = 0
 -- AND t.IsDaylightForPanelFault IS NULL
     -- AND t.IsOnline = 0
     -- AND t.LampPower1 > 0
@@ -81,7 +64,7 @@ WHERE 1 = 1
     -- AND t.GatewayCode = 'GT12L94A22082467'
     -- AND t.ProductId = 'AEXSAM2324122936'
     -- AND t.LeadsunProjectId = 389
-    AND t.Source = 'Provisioned' -- 'Leadsun' rows are a different join key, see comment above
+    -- AND t.Source = 'Provisioned' -- 'Leadsun' rows are a different join key, see comment above
 ORDER BY t.LastUpload DESC;
 
 -- SELECT

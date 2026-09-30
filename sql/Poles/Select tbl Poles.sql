@@ -22,7 +22,7 @@ SELECT --TOP (1000)
 --   AND [VendorPoleId] = 'WREC-1044'
     -- AND VendorPoleId LIKE '%jacks%'
     -- AND PoleNumber = 'TESTSL1-1001'
-    -- AND PoleNumber LIKE '%TESTSL1-100%'
+    AND PoleNumber LIKE '%TESTSL1-100%'
     -- AND (Long IS NULL OR Lat IS NULL)
     -- AND CountyFips IS NULL
     -- AND ControllerId IS NULL

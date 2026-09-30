@@ -49,7 +49,7 @@ SELECT TOP 1000  -- ← change row limit here
     ) AS LastUpload,
     -- IsOnline,
     -- IsOpenIssueFault,
-    -- IsDaylight,
+    IsDaylight,
     -- IsDaylightForLedFault,
     -- IsDaylightForPanelFault,
     -- t.Source,

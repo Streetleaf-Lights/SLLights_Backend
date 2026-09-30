@@ -12,7 +12,7 @@ SELECT TOP (1000) [Id]
       ,[AirTableCreatedDateTime]
   FROM [dbo].[Projects]
   WHERE 1 = 1
-    AND [Id] = 'recagXKKY76we25Zw'
+    -- AND [Id] = 'recagXKKY76we25Zw'
 --   AND [CustomerId] = 'recLWjsXN8vskXZbm'
   -- AND PoleNumbers LIKE '%HIL-1333%'
     -- AND Name LIKE '%acacia%'
