@@ -57,7 +57,7 @@ from shared.datetime_utils import to_dto_string as _to_dto_string
 from shared.email_client import EmailSendError, send_email
 from shared.sql_client import get_connection
 
-_VALID_ROLES = ("Streetleaf Admin", "Customer Owner", "Customer Admin", "User")
+_VALID_ROLES = ("Streetleaf Admin", "Customer Owner", "Customer Admin", "User", "Streetleaf Crew")
 
 # Roles that are scoped to a specific customer (vs. Streetleaf-wide)
 _CUSTOMER_SCOPED_ROLES = ("Customer Owner", "Customer Admin", "User")
@@ -65,6 +65,7 @@ _CUSTOMER_SCOPED_ROLES = ("Customer Owner", "Customer Admin", "User")
 # Role precedence for permission checks -- higher index = higher privilege
 _ROLE_RANK = {
     "User": 0,
+    "Streetleaf Crew": 0,  # same privilege level as User, different data scope
     "Customer Admin": 1,
     "Customer Owner": 2,
     "Streetleaf Admin": 3,

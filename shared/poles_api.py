@@ -323,6 +323,7 @@ def get_poles(
     limit: int = None,
     summary: bool = False,
     active: bool = None,
+    crew_assigned_only: bool = False,
 ):
     """
     Returns Poles, each with the exact same fields a pole carries inside
@@ -422,6 +423,8 @@ def get_poles(
         if active is not None and not pole_id:
             conditions.append("p.Active = ?")
             params.append(1 if active else 0)
+        if crew_assigned_only:
+            conditions.append("c.CrewAssigned = 1")
         where_clause = "WHERE " + " AND ".join(conditions)
         params = tuple(params)
     else:
@@ -440,6 +443,14 @@ def get_poles(
         if active is not None:
             where_clause += " AND p.Active = ?"
             params.append(1 if active else 0)
+        if crew_assigned_only:
+            where_clause += (
+                " AND EXISTS ("
+                "SELECT 1 FROM Projects proj"
+                " JOIN Customers c ON proj.CustomerId = c.Id"
+                " WHERE proj.Id = p.ProjectId AND c.CrewAssigned = 1"
+                ")"
+            )
         params = tuple(params)
 
     sql_template = _POLE_SUMMARY_SQL_TEMPLATE if summary else _POLE_DETAILS_SQL_TEMPLATE

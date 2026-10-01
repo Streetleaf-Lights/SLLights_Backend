@@ -394,10 +394,21 @@ def getCustomers(req: func.HttpRequest) -> func.HttpResponse:
             )
 
     try:
+        try:
+            ctx = require_auth(req)
+            crew_assigned_only = ctx.role == "Streetleaf Crew"
+            logging.info(
+                "getCustomers: caller role=%s, crew_assigned_only=%s",
+                ctx.role, crew_assigned_only,
+            )
+        except AuthError as auth_ex:
+            crew_assigned_only = False
+            logging.info("getCustomers: no valid JWT (%s), crew_assigned_only=False", auth_ex)
         customers = get_customers(
             customer_id=customer_id,
             limit=int(limit_param) if limit_param else None,
             active=active,
+            crew_assigned_only=crew_assigned_only,
         )
     except Exception as ex:
         logging.error("getCustomers: query failed: %s", ex)
@@ -660,6 +671,11 @@ def getPoles(req: func.HttpRequest) -> func.HttpResponse:
             )
 
     try:
+        try:
+            ctx = require_auth(req)
+            crew_assigned_only = ctx.role == "Streetleaf Crew"
+        except AuthError:
+            crew_assigned_only = False
         result = get_poles(
             pole_id=pole_id,
             project_id=project_id,
@@ -667,6 +683,7 @@ def getPoles(req: func.HttpRequest) -> func.HttpResponse:
             limit=int(limit_param) if limit_param else None,
             summary=summary,
             active=active,
+            crew_assigned_only=crew_assigned_only,
         )
     except Exception as ex:
         logging.error("getPoles: query failed: %s", ex)

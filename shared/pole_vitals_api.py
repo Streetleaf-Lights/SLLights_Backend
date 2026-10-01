@@ -658,7 +658,7 @@ def _customer_rollup_fields(rows) -> dict:
     }
 
 
-def get_pole_vitals(customer_id: str = None, project_id: str = None, limit: int = None):
+def get_pole_vitals(customer_id: str = None, project_id: str = None, limit: int = None, crew_assigned_only: bool = False):
     """
     Returns each Customer's Projects, each annotated with pole-health
     rollup stats (totalLights, connectedLights, totalFaults,
@@ -765,14 +765,15 @@ def get_pole_vitals(customer_id: str = None, project_id: str = None, limit: int 
     projects within a customer). Defaults to DEFAULT_LIMIT, capped at
     MAX_LIMIT (see shared/api_utils.py). Ignored when either id is given.
     """
+    crew_filter = " AND c.CrewAssigned = 1" if crew_assigned_only else ""
     if project_id and customer_id:
-        where_clause = "WHERE proj.Id = ? AND c.Id = ?"
+        where_clause = f"WHERE proj.Id = ? AND c.Id = ?{crew_filter}"
         params = (_ROLLUP_PERIOD_TYPE, project_id, customer_id)
     elif project_id:
-        where_clause = "WHERE proj.Id = ?"
+        where_clause = f"WHERE proj.Id = ?{crew_filter}"
         params = (_ROLLUP_PERIOD_TYPE, project_id)
     elif customer_id:
-        where_clause = "WHERE c.Id = ?"
+        where_clause = f"WHERE c.Id = ?{crew_filter}"
         params = (_ROLLUP_PERIOD_TYPE, customer_id)
     else:
         # limit applies to CUSTOMERS, the top-level entity here -- can't
@@ -781,7 +782,8 @@ def get_pole_vitals(customer_id: str = None, project_id: str = None, limit: int 
         # dropping whole customers), so this filters to the first N
         # distinct customer Ids first via a subquery, then fetches every
         # project row for those.
-        where_clause = "WHERE c.Id IN (SELECT TOP (?) Id FROM Customers ORDER BY Name)"
+        crew_subfilter = " AND CrewAssigned = 1" if crew_assigned_only else ""
+        where_clause = f"WHERE c.Id IN (SELECT TOP (?) Id FROM Customers{crew_subfilter} ORDER BY Name)"
         params = (_ROLLUP_PERIOD_TYPE, clamp_limit(limit))
 
     conn = get_connection()

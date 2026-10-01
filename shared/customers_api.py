@@ -18,10 +18,11 @@ _COLUMN_TO_JSON_KEY = [
     ("Phone", "phone"),
     ("Active", "active"),
     ("AirTableCreatedDateTime", "createdAt"),
+    ("CrewAssigned", "crewAssigned"),
 ]
 
 
-def get_customers(customer_id: str = None, limit: int = None, active: bool = None) -> list:
+def get_customers(customer_id: str = None, limit: int = None, active: bool = None, crew_assigned_only: bool = False) -> list:
     """
     Queries Customers and returns a list of JSON-serializable dicts
     (camelCase keys -- see _COLUMN_TO_JSON_KEY).
@@ -51,6 +52,17 @@ def get_customers(customer_id: str = None, limit: int = None, active: bool = Non
             cursor.execute(
                 f"SELECT {columns_sql} FROM Customers WHERE Id = ?",
                 customer_id,
+            )
+        elif crew_assigned_only and active is not None:
+            cursor.execute(
+                f"SELECT TOP (?) {columns_sql} FROM Customers WHERE CrewAssigned = 1 AND Active = ? ORDER BY Name",
+                clamp_limit(limit),
+                1 if active else 0,
+            )
+        elif crew_assigned_only:
+            cursor.execute(
+                f"SELECT TOP (?) {columns_sql} FROM Customers WHERE CrewAssigned = 1 ORDER BY Name",
+                clamp_limit(limit),
             )
         elif active is not None:
             cursor.execute(
