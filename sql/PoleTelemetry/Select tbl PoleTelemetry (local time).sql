@@ -52,10 +52,10 @@ LEFT JOIN Poles p ON t.PoleId = p.VendorPoleId
 LEFT JOIN PoleTimeZones ptz ON t.PoleId = ptz.VendorPoleId
 WHERE 1 = 1
 -- AND t.PoleId = 'DRH-Orl'
--- AND t.PoleId LIKE '%TESTSL1-100%'
--- AND p.PoleNumber LIKE '%HIL-4509%'
+AND t.PoleId LIKE '%12071-2091%'
+-- AND p.PoleNumber LIKE '%12071-209%'
 -- AND t.SP_ExecId = 442
-AND t.IsDaylight IS NULL
+-- AND t.IsDaylight IS NULL
 -- AND t.IsDaylight = 0
 -- AND t.IsDaylightForPanelFault IS NULL
     -- AND t.IsOnline = 0

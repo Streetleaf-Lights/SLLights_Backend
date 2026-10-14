@@ -47,7 +47,7 @@ SELECT TOP 1000  -- ← change row limit here
         COALESCE(ptz_l.WindowsTimeZone, ptz_p.WindowsTimeZone),
         'Eastern Standard Time'
     ) AS LastUpload,
-    -- IsOnline,
+    IsOnline,
     -- IsOpenIssueFault,
     IsDaylight,
     -- IsDaylightForLedFault,
@@ -55,7 +55,7 @@ SELECT TOP 1000  -- ← change row limit here
     -- t.Source,
     SolarBoardVoltage,
     SolarBoardElecCurrent,
-    -- LampPower1,
+    LampPower1,
     -- LampPower2,
     BatteryVoltage1,
     BatteryVoltage2,
@@ -94,3 +94,26 @@ WHERE 1 = 1
     -- AND t.Source = 'Provisioned'
     -- AND t.IsOpenIssueFault = 1
 ORDER BY t.LastUpload DESC;
+
+-- SELECT
+--     p.PoleNumber,
+--     p.ControllerId,
+--     COUNT(*) AS TotalReadings,
+--     MIN(t.LastUpload) AT TIME ZONE ISNULL(ptz.WindowsTimeZone, 'Eastern Standard Time') AS FirstReadingLocal,
+--     MAX(t.LastUpload) AT TIME ZONE ISNULL(ptz.WindowsTimeZone, 'Eastern Standard Time') AS LastReadingLocal
+-- FROM Poles p
+-- JOIN PoleTimeZones ptz ON p.VendorPoleId = ptz.VendorPoleId
+-- JOIN PoleTelemetry t ON t.PoleId = p.VendorPoleId
+--     AND t.IsOnline = 1
+--     AND t.LampPower1 = 0
+--     AND t.LastUpload >= '2026-10-02 20:00:00 -04:00'
+--     AND t.LastUpload <> '9999-12-31 23:59:59.999 +00:00'
+-- WHERE NOT EXISTS (
+--     SELECT 1 FROM PoleTelemetry t2
+--     WHERE t2.PoleId = p.VendorPoleId
+--       AND t2.LampPower1 > 0
+--       AND t2.LastUpload >= '2026-10-02 20:00:00 -04:00'
+--       AND t2.LastUpload <> '9999-12-31 23:59:59.999 +00:00'
+-- )
+-- GROUP BY p.PoleNumber, p.ControllerId, ptz.WindowsTimeZone
+-- ORDER BY p.PoleNumber;

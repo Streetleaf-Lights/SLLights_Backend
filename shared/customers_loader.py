@@ -45,7 +45,7 @@ USING (
     SELECT
         ? AS Id, ? AS Name, CAST(? AS NVARCHAR(MAX)) AS ProjectNames, CAST(? AS NVARCHAR(MAX)) AS ProjectIds, ? AS SP_ExecId,
         ? AS Address, ? AS City, ? AS State, ? AS Zip, ? AS Phone,
-        ? AS AirTableCreatedDateTime, ? AS CrewAssigned
+        ? AS AirTableCreatedDateTime
 ) AS source
 ON target.Id = source.Id
 WHEN MATCHED AND (
@@ -56,8 +56,7 @@ WHEN MATCHED AND (
     ISNULL(target.City, '')         <> ISNULL(source.City, '')         OR
     ISNULL(target.State, '')        <> ISNULL(source.State, '')        OR
     ISNULL(target.Zip, '')          <> ISNULL(source.Zip, '')          OR
-    ISNULL(target.Phone, '')        <> ISNULL(source.Phone, '')      OR
-    ISNULL(CAST(target.CrewAssigned AS TINYINT), 0) <> ISNULL(CAST(source.CrewAssigned AS TINYINT), 0)
+    ISNULL(target.Phone, '')        <> ISNULL(source.Phone, '')
 )
 THEN UPDATE SET
     Name         = source.Name,
@@ -68,13 +67,12 @@ THEN UPDATE SET
     City         = source.City,
     State        = source.State,
     Zip          = source.Zip,
-    Phone        = source.Phone,
-    CrewAssigned = source.CrewAssigned
+    Phone        = source.Phone
 WHEN NOT MATCHED THEN
-    INSERT (Id, Name, ProjectNames, ProjectIds, SP_ExecId, Address, City, State, Zip, Phone, AirTableCreatedDateTime, CrewAssigned)
+    INSERT (Id, Name, ProjectNames, ProjectIds, SP_ExecId, Address, City, State, Zip, Phone, AirTableCreatedDateTime)
     VALUES (source.Id, source.Name, source.ProjectNames, source.ProjectIds, source.SP_ExecId,
             source.Address, source.City, source.State, source.Zip, source.Phone,
-            source.AirTableCreatedDateTime, source.CrewAssigned);
+            source.AirTableCreatedDateTime);
 """
 
 
@@ -103,7 +101,6 @@ def _map_record_to_customer(record: dict) -> dict:
         "AirTableCreatedDateTime": _airtable_created_time_to_eastern(
             record.get("createdTime")
         ),
-        "CrewAssigned": bool(fields.get("CrewAssigned")) if fields.get("CrewAssigned") is not None else False,
     }
 
 
@@ -178,7 +175,6 @@ def load_customers() -> None:
                     customer["Zip"],
                     customer["Phone"],
                     customer["AirTableCreatedDateTime"],
-                    customer["CrewAssigned"],
                 )
                 total_success += 1
             except Exception as row_error:

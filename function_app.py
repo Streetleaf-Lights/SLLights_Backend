@@ -9,10 +9,10 @@ import azure.functions as func
 
 from shared.customers_loader import load_customers
 from shared.projects_loader import load_projects
+from shared.installation_schedule_loader import load_installation_schedule
 from shared.poles_loader import load_poles
 from shared.linked_poles_loader import load_linked_poles
 from shared.pole_issues_loader import load_pole_issues
-from shared.pole_issue_api import create_pole_issue
 from shared.pole_models_loader import load_leadsun_pole_models
 from shared.pole_telemetry_loader import load_leadsun_pole_telemetry, update_leadsun_project_details
 from shared.pole_timezones_loader import load_leadsun_pole_timezones, load_provisioned_pole_timezones
@@ -107,6 +107,7 @@ def loadAirTableData(myTimer: func.TimerRequest) -> None:
     load_poles()
     load_linked_poles()
     load_projects()
+    load_installation_schedule()
     load_customers()
 
     # PoleIssues comes from a genuinely separate Airtable base (see
@@ -138,14 +139,35 @@ def loadAirTableDataManual(req: func.HttpRequest) -> func.HttpResponse:
     load_poles()
     load_linked_poles()
     load_projects()
+    load_installation_schedule()
     load_customers()
     load_pole_issues()
     logging.info("loadAirTableDataManual: run complete.")
 
     return func.HttpResponse(
-        "loadPoles + loadProjects + loadCustomers + loadPoleIssues run complete.",
+        "loadPoles + loadProjects + loadInstallationSchedule + loadCustomers + loadPoleIssues run complete.",
         status_code=200,
     )
+
+
+@app.route(
+    route="loadInstallationSchedule", methods=["POST"], auth_level=func.AuthLevel.FUNCTION
+)
+def loadInstallationScheduleManual(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    On-demand trigger for loadInstallationSchedule. Fetches the Installation
+    Schedule Airtable view and updates Projects.StickerNumbers.
+    Projects no longer in the view have StickerNumbers cleared.
+    """
+    logging.info("loadInstallationSchedule: manual run triggered.")
+    try:
+        load_installation_schedule()
+    except Exception as ex:
+        logging.error("loadInstallationSchedule: manual run failed: %s", ex)
+        return func.HttpResponse(
+            f"loadInstallationSchedule failed: {ex}", status_code=500
+        )
+    return func.HttpResponse("loadInstallationSchedule run complete.", status_code=200)
 
 
 # Separate from loadAirTableData on purpose -- different source (Leadsun,
@@ -394,21 +416,10 @@ def getCustomers(req: func.HttpRequest) -> func.HttpResponse:
             )
 
     try:
-        try:
-            ctx = require_auth(req)
-            crew_assigned_only = ctx.role == "Streetleaf Crew"
-            logging.info(
-                "getCustomers: caller role=%s, crew_assigned_only=%s",
-                ctx.role, crew_assigned_only,
-            )
-        except AuthError as auth_ex:
-            crew_assigned_only = False
-            logging.info("getCustomers: no valid JWT (%s), crew_assigned_only=False", auth_ex)
         customers = get_customers(
             customer_id=customer_id,
             limit=int(limit_param) if limit_param else None,
             active=active,
-            crew_assigned_only=crew_assigned_only,
         )
     except Exception as ex:
         logging.error("getCustomers: query failed: %s", ex)
@@ -671,11 +682,6 @@ def getPoles(req: func.HttpRequest) -> func.HttpResponse:
             )
 
     try:
-        try:
-            ctx = require_auth(req)
-            crew_assigned_only = ctx.role == "Streetleaf Crew"
-        except AuthError:
-            crew_assigned_only = False
         result = get_poles(
             pole_id=pole_id,
             project_id=project_id,
@@ -683,7 +689,6 @@ def getPoles(req: func.HttpRequest) -> func.HttpResponse:
             limit=int(limit_param) if limit_param else None,
             summary=summary,
             active=active,
-            crew_assigned_only=crew_assigned_only,
         )
     except Exception as ex:
         logging.error("getPoles: query failed: %s", ex)
@@ -906,47 +911,6 @@ def registerUser(req: func.HttpRequest) -> func.HttpResponse:
 
     return func.HttpResponse(
         json.dumps(result), status_code=200, mimetype="application/json"
-    )
-
-
-@app.route(route="createPoleIssue", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
-def createPoleIssue(req: func.HttpRequest) -> func.HttpResponse:
-    """
-    Creates a new pole issue. Body: {poleNumber, status, problemDetails}.
-    Steps: patches the Airtable Poles record Status, creates a new Open
-    PoleIssues record (Source=\'Web\'), then syncs via loadPoleIssues.
-    Requires Customer Owner or higher.
-    """
-    try:
-        body = req.get_json()
-        result = create_pole_issue(
-            pole_number=body.get("poleNumber"),
-            status=body.get("status"),
-            problem_details=body.get("problemDetails"),
-        )
-    except ValueError as ex:
-        return func.HttpResponse(
-            json.dumps({"error": str(ex)}),
-            status_code=400,
-            mimetype="application/json",
-        )
-    except RuntimeError as ex:
-        logging.error("createPoleIssue: failed: %s", ex)
-        return func.HttpResponse(
-            json.dumps({"error": str(ex)}),
-            status_code=500,
-            mimetype="application/json",
-        )
-    except Exception as ex:
-        logging.error("createPoleIssue: failed: %s", ex)
-        return func.HttpResponse(
-            json.dumps({"error": "internal error"}),
-            status_code=500,
-            mimetype="application/json",
-        )
-
-    return func.HttpResponse(
-        json.dumps(result), status_code=201, mimetype="application/json"
     )
 
 

@@ -9,7 +9,10 @@
       "isBackground": true,
       "dependsOn": "pip install (functions)",
       "options": {
-        "cwd": "${workspaceFolder}"
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "DYLD_LIBRARY_PATH": "/opt/homebrew/opt/openssl@3/lib"
+        }
       }
     },
     {

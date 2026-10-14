@@ -18,6 +18,7 @@ _COLUMN_TO_JSON_KEY = [
     ("LeadsunProject", "leadsunProject"),
     ("Active", "active"),
     ("AirTableCreatedDateTime", "createdAt"),
+    ("StickerNumbers", "stickerNumbers"),
 ]
 
 

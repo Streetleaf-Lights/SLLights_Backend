@@ -13,7 +13,7 @@ SELECT TOP (1000) [Id]
       ,[AirTableCreatedDateTime]
   FROM [dbo].[Customers]
   WHERE 1 = 1
---   AND [Id] = 'recEKgOsGbo5LtZpa'
-  and name LIKE '%Streetleaf%'
+--   AND [Id] = 'recEyhvnc11VrvqQj'
+  and name LIKE '%merit%'
     -- AND Active = 0
   ORDER BY [Name];
