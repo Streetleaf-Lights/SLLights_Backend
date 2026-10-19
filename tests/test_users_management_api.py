@@ -678,23 +678,19 @@ class TestDeleteUser:
         assert exc_info.value.status_code == 400
         mock_cursor.execute.assert_not_called()
 
-    def test_streetleaf_admin_cannot_delete_itself(
-        self, patch_get_connection_users_management, mock_cursor
+    def test_streetleaf_admin_can_self_delete(
+        self, patch_get_connection_users_management, mock_conn, mock_cursor
     ):
-        """Checked before any database round trip -- a pure comparison
-        of already-known values, so no query should even run."""
-        with pytest.raises(auth_utils.AuthError, match="cannot delete your own account") as exc_info:
-            users_management_api.delete_user(STREETLEAF_ADMIN, STREETLEAF_ADMIN.user_id)
-        assert exc_info.value.status_code == 403
-        mock_cursor.execute.assert_not_called()
+        mock_cursor.fetchone.return_value = ("Streetleaf Admin", None)
+        users_management_api.delete_user(STREETLEAF_ADMIN, STREETLEAF_ADMIN.user_id)
+        assert mock_conn.commit.called
 
-    def test_customer_admin_cannot_delete_itself(
-        self, patch_get_connection_users_management, mock_cursor
+    def test_customer_admin_can_self_delete(
+        self, patch_get_connection_users_management, mock_conn, mock_cursor
     ):
-        with pytest.raises(auth_utils.AuthError, match="cannot delete your own account") as exc_info:
-            users_management_api.delete_user(CUSTOMER_ADMIN, CUSTOMER_ADMIN.user_id)
-        assert exc_info.value.status_code == 403
-        mock_cursor.execute.assert_not_called()
+        mock_cursor.fetchone.return_value = ("Customer Admin", "cust1")
+        users_management_api.delete_user(CUSTOMER_ADMIN, CUSTOMER_ADMIN.user_id)
+        assert mock_conn.commit.called
 
     def test_streetleaf_admin_can_delete_another_streetleaf_admin(
         self, patch_get_connection_users_management, mock_cursor
@@ -1216,3 +1212,50 @@ class TestOwnershipTransfer:
         execute_calls = [c.args[0] for c in mock_cursor.execute.call_args_list]
         assert any("UPDATE Users" in s and "Customer Owner" in s for s in execute_calls)
         assert any("DELETE FROM Users" in s for s in execute_calls)
+
+
+class TestSelfDelete:
+    def test_any_user_can_delete_their_own_account(
+        self, patch_get_connection_users_management, mock_conn, mock_cursor
+    ):
+        user_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        mock_cursor.fetchone.return_value = ("User", "cust1")
+        caller = _Ctx("User", customer_id="cust1", user_id=user_id)
+
+        users_management_api.delete_user(caller, user_id)
+
+        assert mock_conn.commit.called
+
+    def test_customer_admin_can_self_delete(
+        self, patch_get_connection_users_management, mock_conn, mock_cursor
+    ):
+        user_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        mock_cursor.fetchone.return_value = ("Customer Admin", "cust1")
+        caller = _Ctx("Customer Admin", customer_id="cust1", user_id=user_id)
+
+        users_management_api.delete_user(caller, user_id)
+
+        assert mock_conn.commit.called
+
+    def test_customer_owner_can_self_delete(
+        self, patch_get_connection_users_management, mock_conn, mock_cursor
+    ):
+        user_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        mock_cursor.fetchone.return_value = ("Customer Owner", "cust1")
+        caller = _Ctx("Customer Owner", customer_id="cust1", user_id=user_id)
+
+        users_management_api.delete_user(caller, user_id)
+
+        assert mock_conn.commit.called
+
+    def test_user_still_cannot_delete_someone_else(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = ("User", "cust1")
+        caller = _Ctx("User", customer_id="cust1",
+                      user_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+
+        with pytest.raises(auth_utils.AuthError):
+            users_management_api.delete_user(
+                caller, "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+            )

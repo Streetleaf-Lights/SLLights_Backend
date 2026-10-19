@@ -57,7 +57,7 @@ from shared.datetime_utils import to_dto_string as _to_dto_string
 from shared.email_client import EmailSendError, send_email
 from shared.sql_client import get_connection
 
-_VALID_ROLES = ("Streetleaf Admin", "Customer Owner", "Customer Admin", "User", "Streetleaf Crew")
+_VALID_ROLES = ("Streetleaf Admin", "Customer Owner", "Customer Admin", "User")
 
 # Roles that are scoped to a specific customer (vs. Streetleaf-wide)
 _CUSTOMER_SCOPED_ROLES = ("Customer Owner", "Customer Admin", "User")
@@ -65,7 +65,6 @@ _CUSTOMER_SCOPED_ROLES = ("Customer Owner", "Customer Admin", "User")
 # Role precedence for permission checks -- higher index = higher privilege
 _ROLE_RANK = {
     "User": 0,
-    "Streetleaf Crew": 0,  # same privilege level as User, different data scope
     "Customer Admin": 1,
     "Customer Owner": 2,
     "Streetleaf Admin": 3,
@@ -545,20 +544,19 @@ def delete_user(caller: AuthContext, target_user_id: str) -> None:
     """
     Permanently removes a user and revokes their active sessions.
 
+    Any authenticated user can delete their own account (self-delete).
+
+    For deleting OTHER users:
     Streetleaf Admin  can delete anyone except themselves.
     Customer Owner    can delete Customer Admin / User in their own customer.
     Customer Admin    can delete User in their own customer only.
-    User              cannot delete anyone.
-
-    No caller can delete a user with equal or higher privilege
-    (Customer Admin cannot delete Customer Owner; Customer Owner cannot
-    delete Streetleaf Admin). No caller can self-delete.
+    User              cannot delete anyone else.
     """
-    require_role(caller, ["Streetleaf Admin", "Customer Owner", "Customer Admin"])
     target_user_id_uuid = _parse_uuid(target_user_id, "user not found")
+    is_self_delete = target_user_id_uuid == uuid.UUID(caller.user_id)
 
-    if target_user_id_uuid == uuid.UUID(caller.user_id):
-        raise AuthError("cannot delete your own account", status_code=403)
+    if not is_self_delete:
+        require_role(caller, ["Streetleaf Admin", "Customer Owner", "Customer Admin"])
 
     conn = get_connection()
     cursor = conn.cursor()
@@ -572,7 +570,7 @@ def delete_user(caller: AuthContext, target_user_id: str) -> None:
             raise AuthError("user not found", status_code=404)
         target_role, target_customer_id = row
 
-        if caller.role != "Streetleaf Admin":
+        if not is_self_delete and caller.role != "Streetleaf Admin":
             if target_role == "Streetleaf Admin":
                 raise AuthError(
                     f"a {caller.role} cannot delete a Streetleaf Admin",
