@@ -24,6 +24,7 @@ from shared.customers_api import get_customers
 from shared.projects_api import get_projects
 from shared.pole_vitals_api import get_pole_vitals, get_pole_vitals_by_period
 from shared.poles_api import get_poles
+from shared.pole_issue_api import create_pole_issue
 from shared.api_utils import parse_bool_param
 from shared.pole_remote_control import (
     set_pole_lights,
@@ -168,6 +169,47 @@ def loadInstallationScheduleManual(req: func.HttpRequest) -> func.HttpResponse:
             f"loadInstallationSchedule failed: {ex}", status_code=500
         )
     return func.HttpResponse("loadInstallationSchedule run complete.", status_code=200)
+
+
+@app.route(route="createPoleIssue", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def createPoleIssue(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Creates a new pole issue. Body: {poleNumber, status, problemDetails}.
+    Steps: patches the Airtable Poles record Status, creates a new Open
+    PoleIssues record (Source='Web'), then syncs via loadPoleIssues.
+    Uses Ocp-Apim-Subscription-Key auth (same as setPoleLights).
+    """
+    try:
+        body = req.get_json()
+        result = create_pole_issue(
+            pole_number=body.get("poleNumber"),
+            status=body.get("status"),
+            problem_details=body.get("problemDetails"),
+        )
+    except ValueError as ex:
+        return func.HttpResponse(
+            json.dumps({"error": str(ex)}),
+            status_code=400,
+            mimetype="application/json",
+        )
+    except RuntimeError as ex:
+        logging.error("createPoleIssue: failed: %s", ex)
+        return func.HttpResponse(
+            json.dumps({"error": str(ex)}),
+            status_code=500,
+            mimetype="application/json",
+        )
+    except Exception as ex:
+        logging.error("createPoleIssue: failed: %s", ex)
+        return func.HttpResponse(
+            json.dumps({"error": "internal error"}),
+            status_code=500,
+            mimetype="application/json",
+        )
+
+    return func.HttpResponse(
+        json.dumps(result), status_code=201, mimetype="application/json"
+    )
 
 
 # Separate from loadAirTableData on purpose -- different source (Leadsun,

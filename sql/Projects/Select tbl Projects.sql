@@ -16,7 +16,7 @@ SELECT TOP (1000) [Id]
     -- AND [Id] = 'recagXKKY76we25Zw'
 --   AND [CustomerId] = 'recLWjsXN8vskXZbm'
   -- AND PoleNumbers LIKE '%HIL-1333%'
-    AND Name LIKE '%babcock%'
+    AND Name LIKE '%streetleaf%'
     -- AND LeadsunProject IS NOT NULL
     -- AND Active = 1
   ORDER BY [AirTableCreatedDateTime] DESC;
