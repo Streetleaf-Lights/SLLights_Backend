@@ -154,7 +154,7 @@ def loadAirTableDataManual(req: func.HttpRequest) -> func.HttpResponse:
 @app.route(
     route="loadInstallationSchedule", methods=["POST"], auth_level=func.AuthLevel.FUNCTION
 )
-def loadInstallationScheduleManual(req: func.HttpRequest) -> func.HttpResponse:
+def loadInstallationSchedule(req: func.HttpRequest) -> func.HttpResponse:
     """
     On-demand trigger for loadInstallationSchedule. Fetches the Installation
     Schedule Airtable view and updates Projects.StickerNumbers.
@@ -177,8 +177,11 @@ def createPoleIssue(req: func.HttpRequest) -> func.HttpResponse:
     Creates a new pole issue. Body: {poleNumber, status, problemDetails}.
     Steps: patches the Airtable Poles record Status, creates a new Open
     PoleIssues record (Source='Web'), then syncs via loadPoleIssues.
-    Uses Ocp-Apim-Subscription-Key auth (same as setPoleLights).
     """
+    try:
+        require_auth(req)
+    except AuthError as ex:
+        return _auth_error_response(ex)
     try:
         body = req.get_json()
         result = create_pole_issue(
@@ -435,6 +438,10 @@ def getCustomers(req: func.HttpRequest) -> func.HttpResponse:
         resource, not a filtered list). Omitted entirely -> no filter,
         same as before this param existed.
     """
+    try:
+        ctx = require_auth(req)
+    except AuthError as ex:
+        return _auth_error_response(ex)
     customer_id = req.params.get("customerId")
     limit_param = req.params.get("limit")
     active_param = req.params.get("active")
@@ -521,6 +528,10 @@ def getProjects(req: func.HttpRequest) -> func.HttpResponse:
         same as before this param existed.
     """
     project_id = req.params.get("projectId")
+    try:
+        ctx = require_auth(req)
+    except AuthError as ex:
+        return _auth_error_response(ex)
     customer_id = req.params.get("customerId")
     limit_param = req.params.get("limit")
     active_param = req.params.get("active")
@@ -603,6 +614,10 @@ def getPoleVitals(req: func.HttpRequest) -> func.HttpResponse:
         case -- each returned customer still includes every one of their
         projects. Ignored if either id is given.
     """
+    try:
+        ctx = require_auth(req)
+    except AuthError as ex:
+        return _auth_error_response(ex)
     project_id = req.params.get("projectId")
     customer_id = req.params.get("customerId")
     limit_param = req.params.get("limit")
@@ -614,11 +629,13 @@ def getPoleVitals(req: func.HttpRequest) -> func.HttpResponse:
             mimetype="application/json",
         )
 
+    crew_assigned_only = ctx.role == "Streetleaf Crew"
     try:
         result = get_pole_vitals(
             project_id=project_id,
             customer_id=customer_id,
             limit=int(limit_param) if limit_param else None,
+            crew_assigned_only=crew_assigned_only,
         )
     except Exception as ex:
         logging.error("getPoleVitals: query failed: %s", ex)
@@ -698,6 +715,10 @@ def getPoles(req: func.HttpRequest) -> func.HttpResponse:
         the fully unfiltered list; ignored if poleId is given. Omitted
         entirely -> no filter, same as before this param existed.
     """
+    try:
+        ctx = require_auth(req)
+    except AuthError as ex:
+        return _auth_error_response(ex)
     pole_id = req.params.get("poleId")
     project_id = req.params.get("projectId")
     customer_id = req.params.get("customerId")
@@ -723,6 +744,7 @@ def getPoles(req: func.HttpRequest) -> func.HttpResponse:
                 mimetype="application/json",
             )
 
+    crew_assigned_only = ctx.role == "Streetleaf Crew"
     try:
         result = get_poles(
             pole_id=pole_id,
@@ -731,6 +753,7 @@ def getPoles(req: func.HttpRequest) -> func.HttpResponse:
             limit=int(limit_param) if limit_param else None,
             summary=summary,
             active=active,
+            crew_assigned_only=crew_assigned_only,
         )
     except Exception as ex:
         logging.error("getPoles: query failed: %s", ex)

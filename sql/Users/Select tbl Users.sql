@@ -2,7 +2,7 @@ SELECT TOP 100
     Id,
     Name,
     Email,
-    PasswordHash,
+    -- PasswordHash,
     Role,
     Status,
     CustomerId,
