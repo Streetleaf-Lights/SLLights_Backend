@@ -1351,8 +1351,10 @@ reference for a from-scratch project, not as the LightsApp deploy runbook.
   existing "poles" list against the wider row shape. `poles_api.py`'s
   `_pole_row_to_dict_with_parents()` (renamed from
   `_pole_row_to_dict_with_project`, since it now adds both parents, not
-  just one) reads `row[-1]` for it directly, the same way it already
-  read `row[0]` for `projectId`.
+  just one) reads `row[-2]` for it directly (`row[-1]` is now
+  `IssuesRaw`, appended after `CustomerId` when `poleIssues` was added --
+  reading `row[-1]` returned the issues string, or `null`, as
+  `customerId`), the same way it reads `row[0]` for `projectId`.
 
   **Deliberately reuses `pole_vitals_api.py`'s own SQL and field-mapping
   directly** (`_POLE_DETAILS_SQL_TEMPLATE`, `_pole_row_to_dict()`,
@@ -1377,6 +1379,46 @@ reference for a from-scratch project, not as the LightsApp deploy runbook.
   project belongs to that customer, same as `projects_api.get_projects()`),
   and either or both can *also* combine with `poleId` (verifies the pole
   belongs to that project/customer).
+
+  **Pagination: `page` / `pageSize` / `faults`** (opt-in). Either of the
+  first two switches the response from a bare array to
+  `{"total", "page", "pageSize", "items"}`; without them nothing changes,
+  so existing consumers (e.g. the all-poles map via `summary=true`) are
+  unaffected. `get_poles_page()` makes it cheap: it (1) counts matching
+  poles with a query that touches none of the per-pole machinery (no
+  telemetry, timezone or issue joins), and (2) selects just the page's
+  pole Ids in a subquery (`ORDER BY PoleNumber, Id OFFSET ? ROWS FETCH
+  NEXT ? ROWS ONLY`) before running the same per-pole SQL
+  templates for at most `pageSize` rows -- so the latest-telemetry lookup
+  and the Python sunset calculation happen for a screenful, not ~14K
+  poles. **Order**: a page is sorted by `PoleNumber` across the whole
+  result (then pole `Id`, so paging never repeats or skips a pole) --
+  not grouped by project like the unpaginated list. `PoleNumber` sorts
+  as text under the database collation, so `…-1000` precedes `…-999`.
+  The two shared per-pole templates keep their project-first
+  `ORDER BY` (they also serve `getPoleVitals` and the plain list);
+  `get_poles_page()` swaps it on its own copy of the SQL and raises
+  if a template ever stops ending the expected way. The count and the
+  page are filtered by one shared string, so
+  `total` cannot disagree with the items; scope (`shared/data_scope.py`)
+  applies to both. `pageSize` defaults to 50 and is capped at 1000 (the
+  effective value is echoed back); `page` is 1-based; a page past the end
+  returns empty `items` with the real `total`. `faults=1` keeps only poles
+  the `getPoleVitals` rollup counts as faults --
+  `(IsOnline = 1 OR IsOpenIssueFault = 1) AND IsPoleFault = 1` on the
+  Last48Hours vitals row -- so its `total` reconciles with that rollup's
+  `TotalFaults`; it is only accepted together with `page`/`pageSize`
+  (otherwise `400`, rather than quietly returning every pole).
+  `poleNumber` is a *contains* search on `Poles.PoleNumber` (`LIKE ?
+  ESCAPE '\'`, with `%`, `_`, `[` and `\` in the typed text escaped so
+  they match literally; always a bound parameter). Case sensitivity
+  follows the database collation (Azure SQL's default is
+  case-insensitive); there is no index for a leading-wildcard match,
+  so it scans the narrow `Poles` rows inside the Id-only subquery, never
+  the expensive per-pole joins. It is trimmed, a blank value means no
+  search, it combines with `customerId`/`projectId`/`faults`/`active`,
+  and like `faults` it is rejected (`400`) without `page`/`pageSize`.
+  `poleId` is always a single-pole lookup and ignores all of these.
 
   **A real bug, found by writing the tests for this, not a hypothetical
   edge case**: the first version built the `WHERE` clause with an

@@ -5,6 +5,13 @@ from shared import pole_issue_api as m
 from shared.auth_utils import AuthError
 
 
+@pytest.fixture(autouse=True)
+def no_real_sleep(mocker):
+    """create_pole_issue() waits 2s (and 5s on retry) for Airtable to
+    propagate -- never really sleep in tests."""
+    return mocker.patch("shared.pole_issue_api.time.sleep")
+
+
 class TestCreatePoleIssue:
     def _patch_db(self, mocker, pole_id="recABC", linked_pole_id="recLINKED"):
         conn = MagicMock()
@@ -103,3 +110,41 @@ class TestCreatePoleIssue:
 
         with pytest.raises(RuntimeError, match="Airtable POST failed"):
             m.create_pole_issue("POLE-001", "Electrical Issue", "detail")
+
+
+class TestSyncBackRetry:
+    """Airtable's new record can take a moment to appear in the view
+    loadPoleIssues reads, so the first sync may miss it."""
+
+    def _cursor_returning(self, mocker, *fetchone_results):
+        conn = MagicMock()
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = list(fetchone_results)
+        conn.cursor.return_value = cursor
+        mocker.patch("shared.pole_issue_api.get_connection", return_value=conn)
+        return cursor
+
+    def test_single_sync_when_new_issue_already_landed(self, mocker, no_real_sleep):
+        # 1st fetchone = pole lookup, 2nd = "is the new issue in PoleIssues?" -> yes
+        self._cursor_returning(mocker, ("recABC", "recLINKED"), (1,))
+        mocker.patch("shared.pole_issue_api._patch_pole_status")
+        mocker.patch("shared.pole_issue_api._post_pole_issue", return_value="recNEW")
+        mock_load = mocker.patch("shared.pole_issue_api.load_pole_issues")
+
+        m.create_pole_issue("POLE-001", "Electrical Issue", "Lamp flickering")
+
+        assert mock_load.call_count == 1
+        no_real_sleep.assert_called_once_with(2)
+
+    def test_waits_and_syncs_again_when_new_issue_not_there_yet(self, mocker, no_real_sleep):
+        # ... 2nd fetchone = not found yet
+        self._cursor_returning(mocker, ("recABC", "recLINKED"), None)
+        mocker.patch("shared.pole_issue_api._patch_pole_status")
+        mocker.patch("shared.pole_issue_api._post_pole_issue", return_value="recNEW")
+        mock_load = mocker.patch("shared.pole_issue_api.load_pole_issues")
+
+        result = m.create_pole_issue("POLE-001", "Electrical Issue", "Lamp flickering")
+
+        assert mock_load.call_count == 2
+        assert [c.args[0] for c in no_real_sleep.call_args_list] == [2, 5]
+        assert result["issueId"] == "recNEW"

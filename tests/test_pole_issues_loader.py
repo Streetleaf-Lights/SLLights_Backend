@@ -132,7 +132,8 @@ class TestMapRecordToIssue:
             "PoleId": "recC8GYNmkJDei0PV",
             "Status": "Open",
             "PoleStatus": "Electrical Issue",
-            "DateReported": None,
+            "DateReported": None,  # filled in per pole timezone by load_pole_issues()
+            "DateReportedRaw": None,
             "ProblemDetails": None,
             "IssueSource": None,
         }
@@ -255,3 +256,89 @@ class TestLoadPoleIssues:
 
         sp_exec_call = mock_cursor.execute.call_args_list[0]
         assert sp_exec_call.args[4] == "AirTable"
+
+
+class TestDateReportedInPoleLocalTime:
+    """DateReported is shown in the POLE's own timezone, not one fixed zone."""
+
+    def _record(self, pole="recPole1", raw="2026-09-01T14:30:00.000Z", record_id="rec1"):
+        r = _sample_record(record_id=record_id)
+        r["fields"]["OriginalPoleRecordID"] = [pole]
+        r["fields"]["DateReportedF"] = raw
+        return r
+
+    def _setup(self, mocker, records, timezones):
+        cursor = MagicMock()
+        conn = MagicMock()
+        conn.cursor.return_value = cursor
+        cursor.fetchone.return_value = (1,)
+        cursor.fetchall.return_value = timezones
+        mocker.patch("shared.pole_issues_loader.fetch_all_records", return_value=(records, []))
+        mocker.patch("shared.pole_issues_loader.get_connection", return_value=conn)
+        return cursor
+
+    def _upserted_date(self, cursor, record_id="rec1"):
+        calls = [c.args for c in cursor.execute.call_args_list if "MERGE PoleIssues" in c.args[0]]
+        return next(a[6] for a in calls if a[1] == record_id)  # (sql, Id, IssueId, PoleId, Status, PoleStatus, DateReported, ...)
+
+    def test_mapper_keeps_the_raw_value_for_later_conversion(self):
+        issue = m._map_record_to_issue(self._record(raw="2026-09-01T14:30:00.000Z"))
+        assert issue["DateReported"] is None
+        assert issue["DateReportedRaw"] == "2026-09-01T14:30:00.000Z"
+
+    def test_each_issue_is_converted_to_its_own_poles_timezone(self, mocker):
+        records = [
+            self._record(pole="recChicago", record_id="rec-chi"),
+            self._record(pole="recPhoenix", record_id="rec-phx"),
+        ]
+        cursor = self._setup(mocker, records, [("recChicago", "America/Chicago"), ("recPhoenix", "America/Phoenix")])
+
+        m.load_pole_issues()
+
+        assert self._upserted_date(cursor, "rec-chi") == "2026-09-01 09:30:00.000 -05:00"
+        assert self._upserted_date(cursor, "rec-phx") == "2026-09-01 07:30:00.000 -07:00"
+
+    def test_pole_without_a_resolved_timezone_falls_back_to_eastern(self, mocker):
+        cursor = self._setup(mocker, [self._record(pole="recNoTz")], [("recNoTz", None)])
+        m.load_pole_issues()
+        assert self._upserted_date(cursor) == "2026-09-01 10:30:00.000 -04:00"
+
+    def test_missing_date_stays_null(self, mocker):
+        cursor = self._setup(mocker, [self._record(raw=None)], [("recPole1", "America/Chicago")])
+        m.load_pole_issues()
+        assert self._upserted_date(cursor) is None
+
+
+class TestFetchPoleIanaTimezones:
+    def test_maps_pole_id_to_timezone(self):
+        cursor = MagicMock()
+        cursor.fetchall.return_value = [("p1", "America/Chicago"), ("p2", None)]
+        assert m._fetch_pole_iana_timezones(cursor, ["p1", "p2"]) == {"p1": "America/Chicago", "p2": None}
+
+    def test_dedupes_and_skips_empty_ids(self):
+        cursor = MagicMock()
+        cursor.fetchall.return_value = []
+        m._fetch_pole_iana_timezones(cursor, ["p1", "p1", None, "", "p2"])
+        sql, *params = cursor.execute.call_args.args
+        assert params == ["p1", "p2"]
+        assert sql.count("?") == 2
+
+    def test_no_ids_runs_no_query(self):
+        cursor = MagicMock()
+        assert m._fetch_pole_iana_timezones(cursor, []) == {}
+        cursor.execute.assert_not_called()
+
+    def test_chunks_so_one_statement_never_exceeds_the_parameter_limit(self):
+        cursor = MagicMock()
+        cursor.fetchall.return_value = []
+        m._fetch_pole_iana_timezones(cursor, [f"p{i}" for i in range(2500)])
+        sizes = [len(c.args) - 1 for c in cursor.execute.call_args_list]
+        assert sizes == [1000, 1000, 500]  # SQL Server's hard limit is 2,100 parameters
+
+    def test_joins_vendor_and_provisioned_poles_to_their_timezone_rows(self):
+        cursor = MagicMock()
+        cursor.fetchall.return_value = []
+        m._fetch_pole_iana_timezones(cursor, ["p1"])
+        sql = cursor.execute.call_args.args[0]
+        assert "p.VendorPoleId = ptz.VendorPoleId" in sql
+        assert "p.ProvisionedPoleId = ptz.ProvisionedPoleId" in sql

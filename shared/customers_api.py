@@ -1,4 +1,5 @@
 from shared.api_utils import clamp_limit, json_safe
+from shared.data_scope import UNRESTRICTED, DataScope, customer_filter
 from shared.sql_client import get_connection
 
 # Columns returned to API consumers, mapped to camelCase JSON keys
@@ -21,7 +22,12 @@ _COLUMN_TO_JSON_KEY = [
 ]
 
 
-def get_customers(customer_id: str = None, limit: int = None, active: bool = None) -> list:
+def get_customers(
+    customer_id: str = None,
+    limit: int = None,
+    active: bool = None,
+    scope: DataScope = UNRESTRICTED,
+) -> list:
     """
     Queries Customers and returns a list of JSON-serializable dicts
     (camelCase keys -- see _COLUMN_TO_JSON_KEY).
@@ -41,27 +47,44 @@ def get_customers(customer_id: str = None, limit: int = None, active: bool = Non
     own Id is a single specific resource, not a filtered list, so it
     shouldn't return "not found" just because that one customer happens
     to be inactive.
+
+    scope: row-level restriction derived from the caller (see
+    shared/data_scope.py). Applied in the SQL itself, ANDed with every
+    other filter -- so a customer outside the caller's scope is never
+    returned, including by a direct customer_id lookup (which then finds
+    nothing and the HTTP layer answers 404).
     """
     columns_sql = ", ".join(col for col, _ in _COLUMN_TO_JSON_KEY)
+
+    # Same query shapes as before this was scoped: customer_id is a
+    # single-Id lookup (limit/active ignored); otherwise optional active
+    # filter, TOP (limit), ordered by Name. Scope conditions are simply
+    # ANDed on, and add no parameters at all when the caller is unrestricted.
+    conditions, params = [], []
+    if customer_id:
+        conditions.append("Id = ?")
+        params.append(customer_id)
+    elif active is not None:
+        conditions.append("Active = ?")
+        params.append(1 if active else 0)
+    scope_conditions, scope_params = customer_filter(scope)
+    conditions += scope_conditions
+    params += scope_params
+    where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
 
     conn = get_connection()
     cursor = conn.cursor()
     try:
         if customer_id:
             cursor.execute(
-                f"SELECT {columns_sql} FROM Customers WHERE Id = ?",
-                customer_id,
-            )
-        elif active is not None:
-            cursor.execute(
-                f"SELECT TOP (?) {columns_sql} FROM Customers WHERE Active = ? ORDER BY Name",
-                clamp_limit(limit),
-                1 if active else 0,
+                f"SELECT {columns_sql} FROM Customers{where}",
+                *params,
             )
         else:
             cursor.execute(
-                f"SELECT TOP (?) {columns_sql} FROM Customers ORDER BY Name",
+                f"SELECT TOP (?) {columns_sql} FROM Customers{where} ORDER BY Name",
                 clamp_limit(limit),
+                *params,
             )
         rows = cursor.fetchall()
     finally:

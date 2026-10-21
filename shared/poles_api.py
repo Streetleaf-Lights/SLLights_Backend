@@ -32,6 +32,7 @@ from shared.pole_vitals_api import (
     _compute_pole_vitals_status_fields,
     _pole_row_to_dict,
 )
+from shared.data_scope import UNRESTRICTED, DataScope, project_filter
 from shared.sql_client import get_connection
 
 # How high `limit` can go specifically in summary mode -- deliberately
@@ -320,6 +321,202 @@ def _summary_row_to_dict(row) -> dict:
     }
 
 
+# --------------------------------------------------------------------------
+# Paginated listing -- get_poles_page()
+#
+# get_poles() above builds a full row (latest-telemetry lookup, timezone
+# join, per-pole sunset calculation in Python) for EVERY pole it returns --
+# which is the cost when a caller only wants a screenful. get_poles_page()
+# instead (1) counts the poles that match the filters with a cheap query
+# that touches none of that, and (2) picks just the requested page's pole
+# Ids in a subquery (OFFSET/FETCH) and only then runs the same expensive
+# per-pole query -- for at most page_size rows. The rows it returns come
+# out of the same SQL templates and row mappers as get_poles(), so an item
+# here is identical to the same pole's entry in the unpaginated list --
+# though in a different ORDER (see _PAGED_ORDER_BY).
+# --------------------------------------------------------------------------
+
+DEFAULT_PAGE_SIZE = 50
+MAX_PAGE_SIZE = 1000
+
+# EXACTLY the rollup's own "fault" definition (pole_vitals_api.py's
+# _FETCH_SQL_TEMPLATE, ProjectAgg.TotalFaults), applied to the same
+# Last48Hours PoleVitals row -- so faults=1's `total` reconciles with the
+# TotalFaults a dashboard already shows for the same customer/project.
+_FAULT_PREDICATE = "(sv.IsOnline = 1 OR sv.IsOpenIssueFault = 1) AND sv.IsPoleFault = 1"
+
+# Paginated results are ordered by PoleNumber across the whole list. The
+# page's pole Ids are chosen with this order (inside the OFFSET/FETCH
+# subquery) AND the final per-pole query is re-ordered to match, so the
+# rows within a page come back in the same order that decided what is ON
+# the page. The id is the tie-breaker that makes the order total.
+_PAGE_SUBQUERY_ORDER_BY = "ORDER BY sp.PoleNumber, sp.Id"
+_PAGED_ORDER_BY = "ORDER BY p.PoleNumber, p.Id"
+# What BOTH shared templates (_POLE_SUMMARY_SQL_TEMPLATE here and
+# pole_vitals_api._POLE_DETAILS_SQL_TEMPLATE) end with. get_poles() and
+# getPoleVitals keep that project-first order; only the paginated path
+# swaps it, and only on its own copy of the formatted SQL.
+_TEMPLATE_ORDER_BY = "ORDER BY proj.Id, p.PoleNumber"
+
+
+def _like_contains(text: str) -> str:
+    """
+    Turns user-typed search text into a LIKE pattern meaning "contains this
+    text, literally": %, _ and [ (LIKE's own wildcards) are escaped with a
+    backslash, as is the backslash itself, so searching "10_5" matches
+    "10_5" only -- not "1085". Pair with  LIKE ? ESCAPE '\\'.
+    """
+    escaped = (
+        text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_").replace("[", "\\[")
+    )
+    return f"%{escaped}%"
+
+
+def _page_pole_filter(project_id, customer_id, active, faults, scope, pole_number=None):
+    """
+    The FROM + WHERE text and parameters that decide WHICH poles are in a
+    paginated result (aliases: sp = Poles, spr = Projects, sc = Customers,
+    sv = PoleVitals). Used verbatim by BOTH the count query and the page
+    query, so `total` can never disagree with the items it pages through.
+
+    Joins Projects and Customers exactly like the main query does (inner),
+    so a pole the main query would drop (no project, or a project whose
+    customer doesn't exist) is not counted or paged either -- otherwise a
+    page could come back short of page_size while `total` still counted it.
+
+    Returns (from_sql, where_sql, params) with params in the order their
+    `?` placeholders appear in from_sql + where_sql.
+    """
+    from_sql = (
+        "FROM Poles sp "
+        "JOIN Projects spr ON sp.ProjectId = spr.Id "
+        "JOIN Customers sc ON spr.CustomerId = sc.Id"
+    )
+    params = []
+    if faults:
+        from_sql += (
+            " JOIN PoleVitals sv ON COALESCE(sp.VendorPoleId, sp.ProvisionedPoleId) = sv.PoleId"
+            " AND sv.PeriodType = ?"
+        )
+        params.append(_ROLLUP_PERIOD_TYPE)
+
+    conditions = []
+    if project_id:
+        conditions.append("spr.Id = ?")
+        params.append(project_id)
+    if customer_id:
+        conditions.append("sc.Id = ?")
+        params.append(customer_id)
+    if pole_number:
+        # Case sensitivity follows the database collation (Azure SQL's
+        # default is case-insensitive). No index can serve a leading-
+        # wildcard match, but this runs over ~14K narrow Poles rows in the
+        # Id-only subquery, never over the expensive per-pole joins.
+        conditions.append("sp.PoleNumber LIKE ? ESCAPE '\\'")
+        params.append(_like_contains(pole_number))
+    if active is not None:
+        conditions.append("sp.Active = ?")
+        params.append(1 if active else 0)
+    scope_conditions, scope_params = project_filter(scope, alias="spr")
+    conditions += scope_conditions
+    params += scope_params
+    if faults:
+        conditions.append(_FAULT_PREDICATE)
+
+    where_sql = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    return from_sql, where_sql, params
+
+
+def get_poles_page(
+    page: int = 1,
+    page_size: int = None,
+    project_id: str = None,
+    customer_id: str = None,
+    pole_number: str = None,
+    summary: bool = False,
+    active: bool = None,
+    faults: bool = False,
+    scope: DataScope = UNRESTRICTED,
+) -> dict:
+    """
+    One page of poles: {"total", "page", "pageSize", "items"}.
+
+    total is the number of poles matching the filters across ALL pages.
+    page is 1-based; page_size defaults to DEFAULT_PAGE_SIZE and is clamped
+    to [1, MAX_PAGE_SIZE] (the clamped value is what comes back as
+    "pageSize"). A page past the end returns an empty items list with the
+    real total. Poles are ordered by PoleNumber across the whole result
+    (NOT grouped by project, unlike get_poles()), with the pole Id as a
+    tie-breaker so paging never repeats or skips a pole. PoleNumber sorts
+    as text under the database collation (so "...-1000" precedes "...-999").
+
+    pole_number: a search -- only poles whose PoleNumber CONTAINS this text
+    (see _like_contains for how wildcards in the text are handled).
+    faults: only poles the rollup counts as faults (see _FAULT_PREDICATE).
+    summary: use the lighter per-pole query, as get_poles(summary=True).
+    scope: row-level restriction from the caller (shared/data_scope.py),
+    applied to the count and the page alike.
+    """
+    page = max(1, int(page))
+    page_size = DEFAULT_PAGE_SIZE if page_size is None else max(1, min(int(page_size), MAX_PAGE_SIZE))
+    offset = (page - 1) * page_size
+
+    from_sql, where_sql, filter_params = _page_pole_filter(
+        project_id, customer_id, active, faults, scope, pole_number
+    )
+    sql_template = _POLE_SUMMARY_SQL_TEMPLATE if summary else _POLE_DETAILS_SQL_TEMPLATE
+    row_to_dict = _summary_row_to_dict if summary else _pole_row_to_dict_with_parents
+
+    # ONE string for "which poles", used by both queries -- identical by
+    # construction, not by two f-strings happening to agree.
+    which_poles = f"{from_sql} {where_sql}".rstrip()
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(f"SELECT COUNT(*) {which_poles}", *filter_params)
+        total = cursor.fetchone()[0]
+
+        rows = []
+        # Nothing to fetch when the page starts past the last match -- skip
+        # the expensive per-pole query entirely.
+        if offset < total:
+            where_clause = (
+                f"WHERE p.Id IN (SELECT sp.Id {which_poles} "
+                f"{_PAGE_SUBQUERY_ORDER_BY} "
+                "OFFSET ? ROWS FETCH NEXT ? ROWS ONLY)"
+            )
+            page_sql = sql_template.format(where_clause=where_clause).rstrip()
+            # Swap the template's project-first order for PoleNumber order.
+            # Fail LOUDLY if a template ever stops ending this way -- a
+            # silent mismatch would put a page's rows in a different order
+            # than the one that chose them.
+            if not page_sql.endswith(_TEMPLATE_ORDER_BY):
+                raise RuntimeError(
+                    "get_poles_page expected the SQL template to end with "
+                    f"{_TEMPLATE_ORDER_BY!r}; update _TEMPLATE_ORDER_BY"
+                )
+            page_sql = page_sql[: -len(_TEMPLATE_ORDER_BY)] + _PAGED_ORDER_BY
+            cursor.execute(
+                page_sql,
+                _ROLLUP_PERIOD_TYPE,  # the template's own PoleVitals join comes first
+                *filter_params,
+                offset,
+                page_size,
+            )
+            rows = cursor.fetchall()
+    finally:
+        cursor.close()
+        conn.close()
+
+    return {
+        "total": total,
+        "page": page,
+        "pageSize": page_size,
+        "items": [row_to_dict(row) for row in rows],
+    }
+
+
 def get_poles(
     pole_id: str = None,
     project_id: str = None,
@@ -327,8 +524,16 @@ def get_poles(
     limit: int = None,
     summary: bool = False,
     active: bool = None,
+    scope: DataScope = UNRESTRICTED,
 ):
     """
+    scope: row-level restriction derived from the caller (see
+    shared/data_scope.py). Applied in the SQL, ANDed with every other
+    filter, and -- in the unfiltered list case -- inside the TOP (limit)
+    subquery, so the limit counts only poles the caller may see. A pole
+    outside the caller's scope is never returned, even by a direct
+    pole_id lookup (which then returns None, i.e. 404).
+
     Returns Poles, each with the exact same fields a pole carries inside
     getPoleVitals's "poles" list (id, poleNumber, locationId, installDate,
     lat, long, lastUpdate, batteryVoltage1, batteryVoltage2, isOnline,
@@ -426,6 +631,12 @@ def get_poles(
         if active is not None and not pole_id:
             conditions.append("p.Active = ?")
             params.append(1 if active else 0)
+        # Scope: the query already joins Projects (proj) and Customers (c).
+        if scope.customer_id is not None:
+            conditions.append("c.Id = ?")
+            params.append(scope.customer_id)
+        if scope.scheduled_projects_only:
+            conditions.append("proj.StickerNumbers IS NOT NULL")
         where_clause = "WHERE " + " AND ".join(conditions)
         params = tuple(params)
     else:
@@ -438,9 +649,21 @@ def get_poles(
         # unlike Customer->Project). Kept consistent anyway, rather than
         # simplified, so this doesn't silently become wrong if the query
         # shape ever changes to produce more than one row per pole again.
-        where_clause = "WHERE p.Id IN (SELECT TOP (?) Id FROM Poles ORDER BY PoleNumber)"
         row_limit = _clamp_summary_limit(limit) if summary else clamp_limit(limit)
-        params = [_ROLLUP_PERIOD_TYPE, row_limit]
+        # Scope goes INSIDE the TOP subquery (so the limit counts only
+        # in-scope poles). The subquery joins Projects as `spr`; a
+        # customer-scoped caller is checked on spr.CustomerId.
+        sub_conditions, sub_params = project_filter(scope, alias="spr")
+        if sub_conditions:
+            where_clause = (
+                "WHERE p.Id IN (SELECT TOP (?) sp.Id FROM Poles sp "
+                "JOIN Projects spr ON sp.ProjectId = spr.Id "
+                "WHERE " + " AND ".join(sub_conditions) + " ORDER BY sp.PoleNumber)"
+            )
+            params = [_ROLLUP_PERIOD_TYPE, row_limit, *sub_params]
+        else:
+            where_clause = "WHERE p.Id IN (SELECT TOP (?) Id FROM Poles ORDER BY PoleNumber)"
+            params = [_ROLLUP_PERIOD_TYPE, row_limit]
         if active is not None:
             where_clause += " AND p.Active = ?"
             params.append(1 if active else 0)

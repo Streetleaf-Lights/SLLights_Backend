@@ -9,15 +9,27 @@ from freezegun import freeze_time
 
 import function_app
 from shared.auth_utils import AuthContext as _AuthContext
+from shared.data_scope import UNRESTRICTED, DataScope
 
-def _make_auth_ctx(role="Streetleaf Admin", customer_id=None):
+
+def _make_auth_ctx(role="Streetleaf Admin", customer_id=None, user_id="test-user-id"):
     ctx = _AuthContext.__new__(_AuthContext)
-    ctx.user_id = "test-user-id"
+    ctx.user_id = user_id
     ctx.role = role
     ctx.customer_id = customer_id
     ctx.session_id = "test-session-id"
     return ctx
 
+
+@pytest.fixture
+def signed_in(mocker):
+    """
+    Every read endpoint (and setPoleLights/createPoleIssue) now requires a
+    valid token. Tests of what an endpoint DOES with a request use this
+    to act as a signed-in Streetleaf Admin (unrestricted scope); tests of
+    scoping/auth override it by patching function_app.require_auth again.
+    """
+    return mocker.patch("function_app.require_auth", return_value=_make_auth_ctx())
 
 
 def make_timer_request(past_due=False):
@@ -38,9 +50,10 @@ def make_http_request():
 
 def patch_all_loaders(mocker):
     """
-    Patches load_poles, load_linked_poles, load_projects, and load_customers,
-    tracking call order via a shared list so tests can assert
-    Poles -> LinkedPoles -> Projects -> Customers.
+    Patches load_poles, load_linked_poles, load_projects,
+    load_installation_schedule and load_customers, tracking call order via
+    a shared list so tests can assert
+    Poles -> LinkedPoles -> Projects -> InstallationSchedule -> Customers.
 
     Also patches load_pole_issues silently -- not returned since no test
     currently needs to inspect it directly.
@@ -54,6 +67,10 @@ def patch_all_loaders(mocker):
     )
     mock_projects = mocker.patch(
         "function_app.load_projects", side_effect=lambda: call_order.append("projects")
+    )
+    mocker.patch(
+        "function_app.load_installation_schedule",
+        side_effect=lambda: call_order.append("installation_schedule"),
     )
     mock_customers = mocker.patch(
         "function_app.load_customers", side_effect=lambda: call_order.append("customers")
@@ -142,13 +159,14 @@ class TestLoadAirTableDataTimer:
     def test_poles_runs_before_projects_before_customers(self, mocker):
         _, _, _, call_order = patch_all_loaders(mocker)
         function_app.loadAirTableData(make_timer_request())
-        assert call_order == ["poles", "linked_poles", "projects", "customers"]
+        assert call_order == ["poles", "linked_poles", "projects", "installation_schedule", "customers"]
 
     @freeze_time("2026-07-13 10:00:00")
     def test_propagates_exception_from_load_customers(self, mocker):
         mocker.patch("function_app.load_poles")
         mocker.patch("function_app.load_linked_poles")
         mocker.patch("function_app.load_projects")
+        mocker.patch("function_app.load_installation_schedule")
         mocker.patch("function_app.load_customers", side_effect=RuntimeError("db down"))
         with pytest.raises(RuntimeError, match="db down"):
             function_app.loadAirTableData(make_timer_request())
@@ -237,7 +255,7 @@ class TestLoadAirTableDataManual:
         response = function_app.loadAirTableDataManual(make_http_request())
 
         assert response.status_code == 200
-        assert response.get_body() == b"loadPoles + loadProjects + loadCustomers + loadPoleIssues run complete."
+        assert response.get_body() == b"loadPoles + loadProjects + loadInstallationSchedule + loadCustomers + loadPoleIssues run complete."
         mock_poles.assert_called_once()
         mock_projects.assert_called_once()
         mock_customers.assert_called_once()
@@ -248,7 +266,7 @@ class TestLoadAirTableDataManual:
 
         function_app.loadAirTableDataManual(make_http_request())
 
-        assert call_order == ["poles", "linked_poles", "projects", "customers"]
+        assert call_order == ["poles", "linked_poles", "projects", "installation_schedule", "customers"]
 
     def test_runs_when_environment_unset_defaults_to_dev_behavior(self, mocker, monkeypatch):
         # ENVIRONMENT defaults to "Dev" for any value other than "Prod"
@@ -274,6 +292,7 @@ class TestLoadAirTableDataManual:
         mocker.patch("function_app.load_poles")
         mocker.patch("function_app.load_linked_poles")
         mocker.patch("function_app.load_projects")
+        mocker.patch("function_app.load_installation_schedule")
         mocker.patch("function_app.load_customers", side_effect=RuntimeError("db down"))
 
         with pytest.raises(RuntimeError, match="db down"):
@@ -754,6 +773,7 @@ def make_get_customers_http_request(customer_id=None, limit=None, active=None):
     )
 
 
+@pytest.mark.usefixtures("signed_in")
 class TestGetCustomers:
     def test_no_customer_id_returns_array_with_200(self, mocker):
         mocker.patch("function_app.require_auth", return_value=_make_auth_ctx())
@@ -780,7 +800,7 @@ class TestGetCustomers:
         assert response.status_code == 200
         body = json.loads(response.get_body())
         assert body == {"id": "rec1", "name": "Acme"}
-        mock_get.assert_called_once_with(customer_id="rec1", limit=None, active=None, crew_assigned_only=False)
+        mock_get.assert_called_once_with(customer_id="rec1", limit=None, active=None, scope=UNRESTRICTED)
 
     def test_customer_id_not_found_returns_404(self, mocker):
         mocker.patch("function_app.require_auth", return_value=_make_auth_ctx())
@@ -798,7 +818,7 @@ class TestGetCustomers:
 
         function_app.getCustomers(make_get_customers_http_request(limit="5"))
 
-        mock_get.assert_called_once_with(customer_id=None, limit=5, active=None, crew_assigned_only=False)
+        mock_get.assert_called_once_with(customer_id=None, limit=5, active=None, scope=UNRESTRICTED)
 
     def test_active_true_is_parsed_and_passed_through(self, mocker):
         mocker.patch("function_app.require_auth", return_value=_make_auth_ctx())
@@ -806,7 +826,7 @@ class TestGetCustomers:
 
         function_app.getCustomers(make_get_customers_http_request(active="true"))
 
-        mock_get.assert_called_once_with(customer_id=None, limit=None, active=True, crew_assigned_only=False)
+        mock_get.assert_called_once_with(customer_id=None, limit=None, active=True, scope=UNRESTRICTED)
 
     def test_active_1_is_also_treated_as_true(self, mocker):
         mocker.patch("function_app.require_auth", return_value=_make_auth_ctx())
@@ -814,7 +834,7 @@ class TestGetCustomers:
 
         function_app.getCustomers(make_get_customers_http_request(active="1"))
 
-        mock_get.assert_called_once_with(customer_id=None, limit=None, active=True, crew_assigned_only=False)
+        mock_get.assert_called_once_with(customer_id=None, limit=None, active=True, scope=UNRESTRICTED)
 
     def test_active_false_is_parsed_and_passed_through(self, mocker):
         mocker.patch("function_app.require_auth", return_value=_make_auth_ctx())
@@ -822,7 +842,7 @@ class TestGetCustomers:
 
         function_app.getCustomers(make_get_customers_http_request(active="false"))
 
-        mock_get.assert_called_once_with(customer_id=None, limit=None, active=False, crew_assigned_only=False)
+        mock_get.assert_called_once_with(customer_id=None, limit=None, active=False, scope=UNRESTRICTED)
 
     def test_active_is_case_insensitive(self, mocker):
         mocker.patch("function_app.require_auth", return_value=_make_auth_ctx())
@@ -830,7 +850,7 @@ class TestGetCustomers:
 
         function_app.getCustomers(make_get_customers_http_request(active="TRUE"))
 
-        mock_get.assert_called_once_with(customer_id=None, limit=None, active=True, crew_assigned_only=False)
+        mock_get.assert_called_once_with(customer_id=None, limit=None, active=True, scope=UNRESTRICTED)
 
     def test_active_absent_defaults_to_none(self, mocker):
         mocker.patch("function_app.require_auth", return_value=_make_auth_ctx())
@@ -838,7 +858,7 @@ class TestGetCustomers:
 
         function_app.getCustomers(make_get_customers_http_request())
 
-        mock_get.assert_called_once_with(customer_id=None, limit=None, active=None, crew_assigned_only=False)
+        mock_get.assert_called_once_with(customer_id=None, limit=None, active=None, scope=UNRESTRICTED)
 
     def test_invalid_active_returns_400_without_querying(self, mocker):
         mocker.patch("function_app.require_auth", return_value=_make_auth_ctx())
@@ -878,22 +898,6 @@ class TestGetCustomers:
 
         assert response.status_code == 200
         assert json.loads(response.get_body()) == []
-
-    def test_streetleaf_crew_forces_crew_assigned_only(self, mocker):
-        mocker.patch("function_app.require_auth", return_value=_make_auth_ctx(role="Streetleaf Crew"))
-        mock_get = mocker.patch("function_app.get_customers", return_value=[])
-
-        function_app.getCustomers(make_get_customers_http_request())
-
-        mock_get.assert_called_once_with(customer_id=None, limit=None, active=None, crew_assigned_only=True)
-
-    def test_non_crew_does_not_force_crew_assigned_only(self, mocker):
-        mocker.patch("function_app.require_auth", return_value=_make_auth_ctx(role="Customer Admin"))
-        mock_get = mocker.patch("function_app.get_customers", return_value=[])
-
-        function_app.getCustomers(make_get_customers_http_request())
-
-        mock_get.assert_called_once_with(customer_id=None, limit=None, active=None, crew_assigned_only=False)
 
 
 # --------------------------------------------------------------------------
@@ -962,6 +966,7 @@ def make_get_poles_http_request(
     )
 
 
+@pytest.mark.usefixtures("signed_in")
 class TestGetProjects:
     def test_no_project_id_returns_array_with_200(self, mocker):
         mocker.patch(
@@ -987,7 +992,7 @@ class TestGetProjects:
         assert response.status_code == 200
         body = json.loads(response.get_body())
         assert body == {"id": "rec1", "name": "Chaparral Ph3"}
-        mock_get.assert_called_once_with(project_id="rec1", customer_id=None, limit=None, active=None)
+        mock_get.assert_called_once_with(project_id="rec1", customer_id=None, limit=None, active=None, scope=UNRESTRICTED)
 
     def test_project_id_not_found_returns_404(self, mocker):
         mocker.patch("function_app.get_projects", return_value=[])
@@ -1013,7 +1018,7 @@ class TestGetProjects:
         body = json.loads(response.get_body())
         assert body == [{"id": "rec1", "name": "Chaparral Ph3"}, {"id": "rec2", "name": "Elm St"}]
         mock_get.assert_called_once_with(
-            project_id=None, customer_id="recwx649JfiRmWqxF", limit=None, active=None
+            project_id=None, customer_id="recwx649JfiRmWqxF", limit=None, active=None, scope=UNRESTRICTED
         )
 
     def test_customer_id_alone_with_no_matches_returns_empty_array_not_404(self, mocker):
@@ -1043,7 +1048,7 @@ class TestGetProjects:
 
         assert response.status_code == 200
         mock_get.assert_called_once_with(
-            project_id="rec1", customer_id="recwx649JfiRmWqxF", limit=None, active=None
+            project_id="rec1", customer_id="recwx649JfiRmWqxF", limit=None, active=None, scope=UNRESTRICTED
         )
     def test_project_id_and_customer_id_combined_not_found_returns_404(self, mocker):
         """projectId presence still drives 404-vs-empty-array semantics,
@@ -1062,7 +1067,7 @@ class TestGetProjects:
 
         function_app.getProjects(make_get_projects_http_request(limit="5"))
 
-        mock_get.assert_called_once_with(project_id=None, customer_id=None, limit=5, active=None)
+        mock_get.assert_called_once_with(project_id=None, customer_id=None, limit=5, active=None, scope=UNRESTRICTED)
 
     def test_non_numeric_limit_returns_400_without_querying(self, mocker):
         mock_get = mocker.patch("function_app.get_projects")
@@ -1086,7 +1091,7 @@ class TestGetProjects:
 
         function_app.getProjects(make_get_projects_http_request(active="true"))
 
-        mock_get.assert_called_once_with(project_id=None, customer_id=None, limit=None, active=True)
+        mock_get.assert_called_once_with(project_id=None, customer_id=None, limit=None, active=True, scope=UNRESTRICTED)
 
     def test_active_combined_with_customer_id_is_passed_through(self, mocker):
         mock_get = mocker.patch("function_app.get_projects", return_value=[])
@@ -1096,14 +1101,14 @@ class TestGetProjects:
         )
 
         mock_get.assert_called_once_with(
-            project_id=None, customer_id="recwx649JfiRmWqxF", limit=None, active=False
+            project_id=None, customer_id="recwx649JfiRmWqxF", limit=None, active=False, scope=UNRESTRICTED
         )
     def test_active_absent_defaults_to_none(self, mocker):
         mock_get = mocker.patch("function_app.get_projects", return_value=[])
 
         function_app.getProjects(make_get_projects_http_request())
 
-        mock_get.assert_called_once_with(project_id=None, customer_id=None, limit=None, active=None)
+        mock_get.assert_called_once_with(project_id=None, customer_id=None, limit=None, active=None, scope=UNRESTRICTED)
 
     def test_invalid_active_returns_400_without_querying(self, mocker):
         mock_get = mocker.patch("function_app.get_projects")
@@ -1124,6 +1129,7 @@ class TestGetProjects:
         assert json.loads(response.get_body()) == []
 
 
+@pytest.mark.usefixtures("signed_in")
 class TestGetPoleVitals:
     """
     Unlike getProjects, BOTH projectId and customerId are single-entity
@@ -1173,7 +1179,7 @@ class TestGetPoleVitals:
         body = json.loads(response.get_body())
         assert body["id"] == "proj1"
         assert body["customerId"] == "cust1"
-        mock_get.assert_called_once_with(project_id="proj1", customer_id=None, limit=None)
+        mock_get.assert_called_once_with(project_id="proj1", customer_id=None, limit=None, scope=UNRESTRICTED)
 
     def test_project_id_not_found_returns_404(self, mocker):
         mocker.patch("function_app.require_auth", return_value=_make_auth_ctx())
@@ -1201,7 +1207,7 @@ class TestGetPoleVitals:
         assert response.status_code == 200
         body = json.loads(response.get_body())
         assert body == {"id": "cust1", "name": "Acme", "projects": []}
-        mock_get.assert_called_once_with(project_id=None, customer_id="cust1", limit=None)
+        mock_get.assert_called_once_with(project_id=None, customer_id="cust1", limit=None, scope=UNRESTRICTED)
 
     def test_customer_id_not_found_returns_404_not_empty_array(self, mocker):
         """
@@ -1237,7 +1243,7 @@ class TestGetPoleVitals:
         )
 
         assert response.status_code == 200
-        mock_get.assert_called_once_with(project_id="proj1", customer_id="cust1", limit=None)
+        mock_get.assert_called_once_with(project_id="proj1", customer_id="cust1", limit=None, scope=UNRESTRICTED)
 
     def test_project_id_and_customer_id_combined_not_found_returns_404(self, mocker):
         """e.g. a real project Id that belongs to a DIFFERENT customer
@@ -1257,7 +1263,7 @@ class TestGetPoleVitals:
 
         function_app.getPoleVitals(make_get_pole_vitals_http_request(limit="5"))
 
-        mock_get.assert_called_once_with(project_id=None, customer_id=None, limit=5)
+        mock_get.assert_called_once_with(project_id=None, customer_id=None, limit=5, scope=UNRESTRICTED)
 
     def test_non_numeric_limit_returns_400_without_querying(self, mocker):
         mocker.patch("function_app.require_auth", return_value=_make_auth_ctx())
@@ -1289,6 +1295,7 @@ class TestGetPoleVitals:
         assert json.loads(response.get_body()) == []
 
 
+@pytest.mark.usefixtures("signed_in")
 class TestGetPoles:
     """
     poleId is a single-entity lookup (404-on-not-found), matching
@@ -1325,7 +1332,7 @@ class TestGetPoles:
         body = json.loads(response.get_body())
         assert body["id"] == "pole1"
         mock_get.assert_called_once_with(
-            pole_id="pole1", project_id=None, customer_id=None, limit=None, summary=False, active=None, crew_assigned_only=False
+            pole_id="pole1", project_id=None, customer_id=None, limit=None, summary=False, active=None, scope=UNRESTRICTED
         )
     def test_pole_id_not_found_returns_404(self, mocker):
         mocker.patch("function_app.require_auth", return_value=_make_auth_ctx())
@@ -1346,7 +1353,7 @@ class TestGetPoles:
         assert response.status_code == 200
         assert json.loads(response.get_body()) == []
         mock_get.assert_called_once_with(
-            pole_id=None, project_id="proj-empty", customer_id=None, limit=None, summary=False, active=None, crew_assigned_only=False
+            pole_id=None, project_id="proj-empty", customer_id=None, limit=None, summary=False, active=None, scope=UNRESTRICTED
         )
     def test_customer_id_alone_returns_array_with_200(self, mocker):
         mocker.patch("function_app.require_auth", return_value=_make_auth_ctx())
@@ -1359,7 +1366,7 @@ class TestGetPoles:
 
         assert response.status_code == 200
         mock_get.assert_called_once_with(
-            pole_id=None, project_id=None, customer_id="cust1", limit=None, summary=False, active=None, crew_assigned_only=False
+            pole_id=None, project_id=None, customer_id="cust1", limit=None, summary=False, active=None, scope=UNRESTRICTED
         )
     def test_pole_id_and_project_id_both_passed_through(self, mocker):
         mocker.patch("function_app.require_auth", return_value=_make_auth_ctx())
@@ -1374,7 +1381,7 @@ class TestGetPoles:
 
         assert response.status_code == 200
         mock_get.assert_called_once_with(
-            pole_id="pole1", project_id="proj1", customer_id=None, limit=None, summary=False, active=None, crew_assigned_only=False
+            pole_id="pole1", project_id="proj1", customer_id=None, limit=None, summary=False, active=None, scope=UNRESTRICTED
         )
     def test_pole_id_belonging_to_different_project_returns_404(self, mocker):
         mocker.patch("function_app.require_auth", return_value=_make_auth_ctx())
@@ -1393,7 +1400,7 @@ class TestGetPoles:
         function_app.getPoles(make_get_poles_http_request(limit="5"))
 
         mock_get.assert_called_once_with(
-            pole_id=None, project_id=None, customer_id=None, limit=5, summary=False, active=None, crew_assigned_only=False
+            pole_id=None, project_id=None, customer_id=None, limit=5, summary=False, active=None, scope=UNRESTRICTED
         )
     def test_non_numeric_limit_returns_400_without_querying(self, mocker):
         mocker.patch("function_app.require_auth", return_value=_make_auth_ctx())
@@ -1430,7 +1437,7 @@ class TestGetPoles:
         function_app.getPoles(make_get_poles_http_request(summary="true"))
 
         mock_get.assert_called_once_with(
-            pole_id=None, project_id=None, customer_id=None, limit=None, summary=True, active=None, crew_assigned_only=False
+            pole_id=None, project_id=None, customer_id=None, limit=None, summary=True, active=None, scope=UNRESTRICTED
         )
     def test_summary_is_case_insensitive(self, mocker):
         mocker.patch("function_app.require_auth", return_value=_make_auth_ctx())
@@ -1439,7 +1446,7 @@ class TestGetPoles:
         function_app.getPoles(make_get_poles_http_request(summary="TRUE"))
 
         mock_get.assert_called_once_with(
-            pole_id=None, project_id=None, customer_id=None, limit=None, summary=True, active=None, crew_assigned_only=False
+            pole_id=None, project_id=None, customer_id=None, limit=None, summary=True, active=None, scope=UNRESTRICTED
         )
     def test_summary_1_is_also_treated_as_true(self, mocker):
         mocker.patch("function_app.require_auth", return_value=_make_auth_ctx())
@@ -1448,7 +1455,7 @@ class TestGetPoles:
         function_app.getPoles(make_get_poles_http_request(summary="1"))
 
         mock_get.assert_called_once_with(
-            pole_id=None, project_id=None, customer_id=None, limit=None, summary=True, active=None, crew_assigned_only=False
+            pole_id=None, project_id=None, customer_id=None, limit=None, summary=True, active=None, scope=UNRESTRICTED
         )
     def test_summary_absent_defaults_to_false(self, mocker):
         mocker.patch("function_app.require_auth", return_value=_make_auth_ctx())
@@ -1457,7 +1464,7 @@ class TestGetPoles:
         function_app.getPoles(make_get_poles_http_request())
 
         mock_get.assert_called_once_with(
-            pole_id=None, project_id=None, customer_id=None, limit=None, summary=False, active=None, crew_assigned_only=False
+            pole_id=None, project_id=None, customer_id=None, limit=None, summary=False, active=None, scope=UNRESTRICTED
         )
     def test_summary_false_string_is_treated_as_false(self, mocker):
         mocker.patch("function_app.require_auth", return_value=_make_auth_ctx())
@@ -1466,7 +1473,7 @@ class TestGetPoles:
         function_app.getPoles(make_get_poles_http_request(summary="false"))
 
         mock_get.assert_called_once_with(
-            pole_id=None, project_id=None, customer_id=None, limit=None, summary=False, active=None, crew_assigned_only=False
+            pole_id=None, project_id=None, customer_id=None, limit=None, summary=False, active=None, scope=UNRESTRICTED
         )
     def test_active_true_is_parsed_and_passed_through(self, mocker):
         mocker.patch("function_app.require_auth", return_value=_make_auth_ctx())
@@ -1475,7 +1482,7 @@ class TestGetPoles:
         function_app.getPoles(make_get_poles_http_request(active="true"))
 
         mock_get.assert_called_once_with(
-            pole_id=None, project_id=None, customer_id=None, limit=None, summary=False, active=True, crew_assigned_only=False
+            pole_id=None, project_id=None, customer_id=None, limit=None, summary=False, active=True, scope=UNRESTRICTED
         )
     def test_active_combined_with_project_id_is_passed_through(self, mocker):
         mocker.patch("function_app.require_auth", return_value=_make_auth_ctx())
@@ -1484,7 +1491,7 @@ class TestGetPoles:
         function_app.getPoles(make_get_poles_http_request(project_id="proj1", active="false"))
 
         mock_get.assert_called_once_with(
-            pole_id=None, project_id="proj1", customer_id=None, limit=None, summary=False, active=False, crew_assigned_only=False
+            pole_id=None, project_id="proj1", customer_id=None, limit=None, summary=False, active=False, scope=UNRESTRICTED
         )
     def test_active_absent_defaults_to_none(self, mocker):
         mocker.patch("function_app.require_auth", return_value=_make_auth_ctx())
@@ -1493,7 +1500,7 @@ class TestGetPoles:
         function_app.getPoles(make_get_poles_http_request())
 
         mock_get.assert_called_once_with(
-            pole_id=None, project_id=None, customer_id=None, limit=None, summary=False, active=None, crew_assigned_only=False
+            pole_id=None, project_id=None, customer_id=None, limit=None, summary=False, active=None, scope=UNRESTRICTED
         )
     def test_invalid_active_returns_400_without_querying(self, mocker):
         mocker.patch("function_app.require_auth", return_value=_make_auth_ctx())
@@ -1525,6 +1532,7 @@ def make_get_users_http_request(user_id=None, customer_id=None, limit=None):
     )
 
 
+@pytest.mark.usefixtures("signed_in")
 class TestGetUsers:
     """
     userId is the single-entity lookup (404-on-not-found), matching
@@ -1559,7 +1567,7 @@ class TestGetUsers:
         assert response.status_code == 200
         body = json.loads(response.get_body())
         assert body == {"id": "user1", "name": "Jane Doe"}
-        mock_get.assert_called_once_with(user_id="user1", customer_id=None, limit=None)
+        mock_get.assert_called_once_with(user_id="user1", customer_id=None, limit=None, scope=UNRESTRICTED)
 
     def test_user_id_not_found_returns_404(self, mocker):
         mocker.patch("function_app.get_users", return_value=[])
@@ -1577,7 +1585,7 @@ class TestGetUsers:
 
         assert response.status_code == 200
         assert json.loads(response.get_body()) == []
-        mock_get.assert_called_once_with(user_id=None, customer_id="cust-empty", limit=None)
+        mock_get.assert_called_once_with(user_id=None, customer_id="cust-empty", limit=None, scope=UNRESTRICTED)
 
     def test_user_id_and_customer_id_both_passed_through(self, mocker):
         mocker.patch("function_app.require_auth", return_value=_make_auth_ctx())
@@ -1591,7 +1599,7 @@ class TestGetUsers:
         )
 
         assert response.status_code == 200
-        mock_get.assert_called_once_with(user_id="user1", customer_id="cust1", limit=None)
+        mock_get.assert_called_once_with(user_id="user1", customer_id="cust1", limit=None, scope=UNRESTRICTED)
 
     def test_user_belonging_to_different_customer_returns_404(self, mocker):
         mocker.patch("function_app.get_users", return_value=[])
@@ -1607,7 +1615,7 @@ class TestGetUsers:
 
         function_app.getUsers(make_get_users_http_request(limit="5"))
 
-        mock_get.assert_called_once_with(user_id=None, customer_id=None, limit=5)
+        mock_get.assert_called_once_with(user_id=None, customer_id=None, limit=5, scope=UNRESTRICTED)
 
     def test_non_numeric_limit_returns_400_without_querying(self, mocker):
         mock_get = mocker.patch("function_app.get_users")
@@ -1649,6 +1657,7 @@ def make_set_pole_lights_http_request(body=None, invalid_json=False):
     )
 
 
+@pytest.mark.usefixtures("signed_in")
 class TestSetPoleLights:
     # -- Pole scope --
 

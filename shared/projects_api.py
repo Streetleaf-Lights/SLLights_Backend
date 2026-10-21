@@ -1,4 +1,5 @@
 from shared.api_utils import clamp_limit, json_safe
+from shared.data_scope import UNRESTRICTED, DataScope, project_filter
 from shared.sql_client import get_connection
 
 # Columns returned to API consumers, mapped to camelCase JSON keys --
@@ -23,7 +24,11 @@ _COLUMN_TO_JSON_KEY = [
 
 
 def get_projects(
-    project_id: str = None, customer_id: str = None, limit: int = None, active: bool = None
+    project_id: str = None,
+    customer_id: str = None,
+    limit: int = None,
+    active: bool = None,
+    scope: DataScope = UNRESTRICTED,
 ) -> list:
     """
     Queries Projects and returns a list of JSON-serializable dicts
@@ -57,47 +62,50 @@ def get_projects(
     and the fully unfiltered list; ignored when project_id is given, same
     reasoning as limit -- a lookup by its own Id is a single specific
     resource, not a filtered list.
+
+    scope: row-level restriction derived from the caller (see
+    shared/data_scope.py), ANDed into the SQL with every other filter --
+    so a project outside the caller's scope is never returned, including
+    by a direct project_id lookup (which then finds nothing, and the HTTP
+    layer answers 404).
     """
     columns_sql = ", ".join(col for col, _ in _COLUMN_TO_JSON_KEY)
+
+    # Same query shapes as before this was scoped: project_id is a
+    # single-resource lookup (no TOP, limit/active ignored), optionally
+    # also checked against customer_id; otherwise customer_id/active
+    # filters with TOP (limit), newest EffectiveDate first when filtered by
+    # customer, by Name otherwise. Scope conditions are ANDed on and add no
+    # parameters when the caller is unrestricted.
+    conditions, params = [], []
+    if project_id:
+        conditions.append("Id = ?")
+        params.append(project_id)
+    if customer_id:
+        conditions.append("CustomerId = ?")
+        params.append(customer_id)
+    if active is not None and not project_id:
+        conditions.append("Active = ?")
+        params.append(1 if active else 0)
+    scope_conditions, scope_params = project_filter(scope)
+    conditions += scope_conditions
+    params += scope_params
+    where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
 
     conn = get_connection()
     cursor = conn.cursor()
     try:
-        if project_id and customer_id:
+        if project_id:
             cursor.execute(
-                f"SELECT {columns_sql} FROM Projects WHERE Id = ? AND CustomerId = ?",
-                project_id,
-                customer_id,
-            )
-        elif project_id:
-            cursor.execute(
-                f"SELECT {columns_sql} FROM Projects WHERE Id = ?",
-                project_id,
-            )
-        elif customer_id and active is not None:
-            cursor.execute(
-                f"SELECT TOP (?) {columns_sql} FROM Projects "
-                "WHERE CustomerId = ? AND Active = ? ORDER BY EffectiveDate DESC",
-                clamp_limit(limit),
-                customer_id,
-                1 if active else 0,
-            )
-        elif customer_id:
-            cursor.execute(
-                f"SELECT TOP (?) {columns_sql} FROM Projects WHERE CustomerId = ? ORDER BY EffectiveDate DESC",
-                clamp_limit(limit),
-                customer_id,
-            )
-        elif active is not None:
-            cursor.execute(
-                f"SELECT TOP (?) {columns_sql} FROM Projects WHERE Active = ? ORDER BY Name",
-                clamp_limit(limit),
-                1 if active else 0,
+                f"SELECT {columns_sql} FROM Projects{where}",
+                *params,
             )
         else:
+            order_by = "EffectiveDate DESC" if customer_id else "Name"
             cursor.execute(
-                f"SELECT TOP (?) {columns_sql} FROM Projects ORDER BY Name",
+                f"SELECT TOP (?) {columns_sql} FROM Projects{where} ORDER BY {order_by}",
                 clamp_limit(limit),
+                *params,
             )
         rows = cursor.fetchall()
     finally:

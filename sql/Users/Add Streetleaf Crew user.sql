@@ -8,9 +8,11 @@
 --                   and paste the hash, or set a ResetToken and use the
 --                   forgot-password flow to let the user set their own)
 --
--- Streetleaf Crew: same read access as User but scoped to ALL customers
--- with CrewAssigned = 1, regardless of CustomerId. No CustomerId is set
--- on this role (it's Streetleaf-wide, not customer-scoped).
+-- Streetleaf Crew: same permissions as User, but Streetleaf-wide (no
+-- CustomerId). Its data is limited by installation schedule rather than by
+-- customer: only projects that have an installation schedule
+-- (Projects.StickerNumbers IS NOT NULL), the customers that own at least
+-- one such project, and those projects' poles. It still sees all users.
 
 DECLARE @Name     NVARCHAR(100) = 'Streetleaf Crew';
 DECLARE @Email    NVARCHAR(200) = 'crew@streetleaf.com';

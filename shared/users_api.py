@@ -1,4 +1,5 @@
 from shared.api_utils import clamp_limit, json_safe
+from shared.data_scope import UNRESTRICTED, DataScope, user_filter
 from shared.sql_client import get_connection
 
 # Columns returned to API consumers, mapped to camelCase JSON keys --
@@ -31,7 +32,12 @@ _COLUMN_TO_JSON_KEY = [
 _FROM_CLAUSE = "FROM Users u LEFT JOIN Customers c ON u.CustomerId = c.Id"
 
 
-def get_users(user_id: str = None, customer_id: str = None, limit: int = None) -> list:
+def get_users(
+    user_id: str = None,
+    customer_id: str = None,
+    limit: int = None,
+    scope: DataScope = UNRESTRICTED,
+) -> list:
     """
     Queries Users (joined with Customers for customerName) and returns a
     list of JSON-serializable dicts (camelCase keys -- see
@@ -49,30 +55,48 @@ def get_users(user_id: str = None, customer_id: str = None, limit: int = None) -
     limit: max rows returned when neither id is given. Defaults to
     DEFAULT_LIMIT, capped at MAX_LIMIT regardless of what's requested
     (see shared/api_utils.py). Ignored when either id is given.
+
+    scope: row-level restriction derived from the caller (see
+    shared/data_scope.py), ANDed into the SQL with every other filter:
+    customer-scoped roles only ever see their own customer's users;
+    Streetleaf Admin and Streetleaf Crew see all users. A user outside a
+    customer-scoped caller's customer is never returned, including by a
+    direct user_id lookup.
     """
     columns_sql = ", ".join(col for col, _ in _COLUMN_TO_JSON_KEY)
 
     conn = get_connection()
     cursor = conn.cursor()
     try:
+        conditions = []
+        params = []
+        if user_id:
+            conditions.append("u.Id = ?")
+            params.append(user_id)
+        if customer_id:
+            conditions.append("u.CustomerId = ?")
+            params.append(customer_id)
+        scope_conditions, scope_params = user_filter(scope)
+        conditions += scope_conditions
+        params += scope_params
         if user_id or customer_id:
-            conditions = []
-            params = []
-            if user_id:
-                conditions.append("u.Id = ?")
-                params.append(user_id)
-            if customer_id:
-                conditions.append("u.CustomerId = ?")
-                params.append(customer_id)
+            # Specific lookups: no TOP -- bounded by the Id/customer filter
+            # (plus scope), same as before this was scoped.
             where_clause = "WHERE " + " AND ".join(conditions)
             cursor.execute(
                 f"SELECT {columns_sql} {_FROM_CLAUSE} {where_clause}",
                 *params,
             )
         else:
+            # Fully unfiltered list. Unrestricted callers get exactly the
+            # original query; a restricted caller's scope conditions join
+            # in as a WHERE, applied BEFORE the TOP so the limit counts
+            # only rows they're allowed to see.
+            where_clause = ("WHERE " + " AND ".join(conditions) + " ") if conditions else ""
             cursor.execute(
-                f"SELECT TOP (?) {columns_sql} {_FROM_CLAUSE} ORDER BY u.Name",
+                f"SELECT TOP (?) {columns_sql} {_FROM_CLAUSE} {where_clause}ORDER BY u.Name",
                 clamp_limit(limit),
+                *params,
             )
         rows = cursor.fetchall()
     finally:

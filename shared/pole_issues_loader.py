@@ -3,7 +3,11 @@ import logging
 
 from shared.airtable_client import fetch_all_records
 from shared.sql_client import get_connection
-from shared.datetime_utils import now_eastern as _now_eastern, to_dto_string as _to_dto_string, airtable_date_to_eastern as _airtable_date_to_eastern
+from shared.datetime_utils import (
+    now_eastern as _now_eastern,
+    to_dto_string as _to_dto_string,
+    airtable_date_to_local as _airtable_date_to_local,
+)
 
 # The base id and table id come directly from the Airtable API URL given
 # for this table (https://api.airtable.com/v0/<base>/<table>?view=<view>).
@@ -97,10 +101,44 @@ def _map_record_to_issue(record: dict) -> dict:
         # Lookup/multi-select field -- list of plain category strings
         # (not record ids), first taken.
         "PoleStatus": _first_linked_value(fields.get("Pole Status")),
-        "DateReported": _airtable_date_to_eastern(fields.get("DateReportedF")),
+        # Converted to the POLE's own local time in load_pole_issues(), once
+        # the pole's timezone has been looked up -- the raw Airtable value
+        # is carried here until then.
+        "DateReported": None,
+        "DateReportedRaw": fields.get("DateReportedF"),
         "ProblemDetails": fields.get("ProblemDetails"),
         "IssueSource": fields.get("Source"),
     }
+
+
+def _fetch_pole_iana_timezones(cursor, pole_ids: list) -> dict:
+    """
+    {Poles.Id: IanaTimeZone} for the given pole Ids, via PoleTimeZones
+    (keyed by VendorPoleId for Leadsun poles, ProvisionedPoleId for
+    provisioned ones). A pole with no PoleTimeZones row maps to None.
+    Chunked: SQL Server allows at most 2,100 parameters per statement and
+    there can be more distinct poles than that across all issues.
+    """
+    unique_ids = list(dict.fromkeys(pid for pid in pole_ids if pid))
+    result = {}
+    for i in range(0, len(unique_ids), 1000):
+        chunk = unique_ids[i : i + 1000]
+        placeholders = ", ".join("?" for _ in chunk)
+        cursor.execute(
+            f"""
+            SELECT p.Id, ptz.IanaTimeZone
+            FROM Poles p
+            LEFT JOIN PoleTimeZones ptz ON
+                (p.VendorPoleId IS NOT NULL AND p.VendorPoleId = ptz.VendorPoleId)
+                OR (p.VendorPoleId IS NULL AND p.ProvisionedPoleId IS NOT NULL
+                    AND p.ProvisionedPoleId = ptz.ProvisionedPoleId)
+            WHERE p.Id IN ({placeholders})
+            """,
+            *chunk,
+        )
+        for row in cursor.fetchall():
+            result[row[0]] = row[1]
+    return result
 
 
 def _has_valid_pole_status(issue: dict) -> bool:
@@ -178,6 +216,15 @@ def load_pole_issues() -> None:
             len(matching),
             len(mapped),
         )
+
+        # 3b. DateReported in each POLE's own local time (not one fixed zone):
+        # one query for every matched pole's IANA timezone, then convert
+        # per issue. A pole with no resolved timezone falls back to Eastern.
+        pole_timezones = _fetch_pole_iana_timezones(cursor, [i["PoleId"] for i in matching])
+        for issue in matching:
+            issue["DateReported"] = _airtable_date_to_local(
+                issue["DateReportedRaw"], pole_timezones.get(issue["PoleId"])
+            )
 
         # 4. Upsert each matching issue -- insert if new, update only if
         # something changed

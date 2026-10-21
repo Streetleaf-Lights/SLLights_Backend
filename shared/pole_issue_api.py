@@ -20,6 +20,7 @@ import time
 
 import requests
 
+from shared.pole_issues_loader import load_pole_issues
 from shared.sql_client import get_connection
 
 AIRTABLE_API_KEY = os.environ["AIRTABLE_API_KEY"]
@@ -134,7 +135,6 @@ def create_pole_issue(
 
     # Wait for Airtable to propagate, then sync back to DB
     time.sleep(2)
-    from shared.pole_issues_loader import load_pole_issues
     load_pole_issues()
 
     # If the new record still isn't in DB, wait longer and retry once

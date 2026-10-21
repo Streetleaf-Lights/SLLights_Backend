@@ -11,7 +11,7 @@ preserving the correct Eastern offset.
 
 import re
 from datetime import datetime
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 EASTERN = ZoneInfo("America/New_York")
 
@@ -74,18 +74,29 @@ def airtable_created_time_to_eastern(created_time: str | None) -> str | None:
     return to_dto_string(eastern_dt)
 
 
-def airtable_date_to_eastern(value: str | None) -> str | None:
+def airtable_date_to_local(value: str | None, iana_timezone: str | None) -> str | None:
     """
-    Converts an Airtable date or datetime field to an Eastern-time
-    DATETIMEOFFSET string.
+    Converts an Airtable date or datetime field to a DATETIMEOFFSET string
+    in the given IANA timezone (e.g. a pole's own 'America/Chicago'), so a
+    value is shown in the local time of the place it's about rather than
+    one fixed zone.
 
     Airtable date fields return a plain date string ('2026-09-01');
     datetime fields return an ISO 8601 UTC string ('2026-09-01T14:30:00.000Z').
     Plain dates are treated as midnight UTC before conversion.
+
+    Falls back to Eastern when iana_timezone is empty or not a valid zone
+    (e.g. a pole whose timezone hasn't been resolved yet), so a missing
+    timezone degrades to the old behavior rather than failing the load.
     Returns None for null/empty values.
     """
     if not value:
         return None
+
+    try:
+        tz = ZoneInfo(iana_timezone) if iana_timezone else EASTERN
+    except (ZoneInfoNotFoundError, ValueError):
+        tz = EASTERN
 
     # Datetime string (has 'T') -- parse as UTC
     if "T" in value:
@@ -95,5 +106,9 @@ def airtable_date_to_eastern(value: str | None) -> str | None:
         from datetime import timezone
         utc_dt = datetime.fromisoformat(value).replace(tzinfo=timezone.utc)
 
-    eastern_dt = utc_dt.astimezone(EASTERN)
-    return to_dto_string(eastern_dt)
+    return to_dto_string(utc_dt.astimezone(tz))
+
+
+def airtable_date_to_eastern(value: str | None) -> str | None:
+    """Same as airtable_date_to_local(), always in Eastern time."""
+    return airtable_date_to_local(value, None)

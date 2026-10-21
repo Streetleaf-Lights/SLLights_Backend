@@ -6,6 +6,7 @@ from shared.api_utils import (
     compute_reporting_staleness_label,
     json_safe,
 )
+from shared.data_scope import UNRESTRICTED, DataScope, customer_filter, project_filter
 from shared.sql_client import get_connection
 
 # Which PoleVitals period type drives BOTH the rollup classification
@@ -661,8 +662,20 @@ def _customer_rollup_fields(rows) -> dict:
     }
 
 
-def get_pole_vitals(customer_id: str = None, project_id: str = None, limit: int = None):
+def get_pole_vitals(
+    customer_id: str = None,
+    project_id: str = None,
+    limit: int = None,
+    scope: DataScope = UNRESTRICTED,
+):
     """
+    scope: row-level restriction derived from the caller (see
+    shared/data_scope.py), applied in the SQL for BOTH queries below
+    (they share one where_clause): customer-scoped roles see only their
+    own customer; Streetleaf Crew sees only projects with an installation
+    schedule and the customers that own at least one. A customer or
+    project outside the scope is returned as None (404), never confirmed.
+
     Returns each Customer's Projects, each annotated with pole-health
     rollup stats (totalLights, connectedLights, totalFaults,
     percentWorking -- computed from each pole's own Last48Hours
@@ -768,24 +781,44 @@ def get_pole_vitals(customer_id: str = None, project_id: str = None, limit: int 
     projects within a customer). Defaults to DEFAULT_LIMIT, capped at
     MAX_LIMIT (see shared/api_utils.py). Ignored when either id is given.
     """
+    # Scope conditions for the OUTER query (both templates alias Customers
+    # as `c` and Projects as `proj`). ANDed onto whichever filter applies;
+    # an unrestricted caller adds nothing, leaving the original SQL/params.
+    scope_sql = ""
+    scope_params = ()
+    if scope.customer_id is not None:
+        scope_sql += " AND c.Id = ?"
+        scope_params += (scope.customer_id,)
+    if scope.scheduled_projects_only:
+        # On the LEFT JOIN'd project, so a customer with no scheduled
+        # project also loses its "phantom" no-project row and drops out.
+        scope_sql += " AND proj.StickerNumbers IS NOT NULL"
+
     if project_id and customer_id:
-        where_clause = "WHERE proj.Id = ? AND c.Id = ?"
-        params = (_ROLLUP_PERIOD_TYPE, project_id, customer_id)
+        where_clause = f"WHERE proj.Id = ? AND c.Id = ?{scope_sql}"
+        params = (_ROLLUP_PERIOD_TYPE, project_id, customer_id, *scope_params)
     elif project_id:
-        where_clause = "WHERE proj.Id = ?"
-        params = (_ROLLUP_PERIOD_TYPE, project_id)
+        where_clause = f"WHERE proj.Id = ?{scope_sql}"
+        params = (_ROLLUP_PERIOD_TYPE, project_id, *scope_params)
     elif customer_id:
-        where_clause = "WHERE c.Id = ?"
-        params = (_ROLLUP_PERIOD_TYPE, customer_id)
+        where_clause = f"WHERE c.Id = ?{scope_sql}"
+        params = (_ROLLUP_PERIOD_TYPE, customer_id, *scope_params)
     else:
         # limit applies to CUSTOMERS, the top-level entity here -- can't
         # TOP() the raw query directly (that would truncate PROJECT rows,
         # silently dropping some of one customer's projects rather than
         # dropping whole customers), so this filters to the first N
         # distinct customer Ids first via a subquery, then fetches every
-        # project row for those.
-        where_clause = "WHERE c.Id IN (SELECT TOP (?) Id FROM Customers ORDER BY Name)"
-        params = (_ROLLUP_PERIOD_TYPE, clamp_limit(limit))
+        # project row for those. Scope goes INSIDE that subquery, so the
+        # limit counts only customers the caller may see.
+        sub_conditions, sub_params = customer_filter(scope)
+        sub_where = (" WHERE " + " AND ".join(sub_conditions)) if sub_conditions else ""
+        crew_outer = " AND proj.StickerNumbers IS NOT NULL" if scope.scheduled_projects_only else ""
+        where_clause = (
+            f"WHERE c.Id IN (SELECT TOP (?) Id FROM Customers{sub_where} ORDER BY Name)"
+            f"{crew_outer}"
+        )
+        params = (_ROLLUP_PERIOD_TYPE, clamp_limit(limit), *sub_params)
 
     conn = get_connection()
     cursor = conn.cursor()
@@ -1103,7 +1136,12 @@ def _pole_vitals_history_row_to_dict(row) -> dict:
     }
 
 
-def get_pole_vitals_by_period(pole_id: str, period_type: str, limit: int = None):
+def get_pole_vitals_by_period(
+    pole_id: str,
+    period_type: str,
+    limit: int = None,
+    scope: DataScope = UNRESTRICTED,
+):
     """
     Returns a single pole's static info (id, poleNumber, locationId,
     installDate, lat, long, lastUpdate, lampPower1, lampPower2,
@@ -1164,7 +1202,23 @@ def get_pole_vitals_by_period(pole_id: str, period_type: str, limit: int = None)
     conn = get_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute(_POLE_INFO_FOR_HISTORY_SQL_TEMPLATE, pole_id)
+        # Scope: the pole must belong to a project the caller may see --
+        # otherwise it is treated exactly like a pole that doesn't exist
+        # (None -> 404), so history for another customer's pole is never
+        # returned or even confirmed to exist. Unrestricted callers run
+        # the original query unchanged.
+        info_sql = _POLE_INFO_FOR_HISTORY_SQL_TEMPLATE
+        info_params = (pole_id,)
+        project_conditions, project_params = project_filter(scope, alias="spr")
+        if project_conditions:
+            info_sql = (
+                info_sql.rstrip()
+                + " AND EXISTS (SELECT 1 FROM Projects spr WHERE spr.Id = p.ProjectId AND "
+                + " AND ".join(project_conditions)
+                + ")"
+            )
+            info_params = (pole_id, *project_params)
+        cursor.execute(info_sql, *info_params)
         pole_row = cursor.fetchone()
         if pole_row is None:
             return None

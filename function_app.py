@@ -23,7 +23,7 @@ from shared.provisioned_telemetry_loader import process_provisioned_telemetry_ev
 from shared.customers_api import get_customers
 from shared.projects_api import get_projects
 from shared.pole_vitals_api import get_pole_vitals, get_pole_vitals_by_period
-from shared.poles_api import get_poles
+from shared.poles_api import get_poles, get_poles_page
 from shared.pole_issue_api import create_pole_issue
 from shared.api_utils import parse_bool_param
 from shared.pole_remote_control import (
@@ -40,6 +40,7 @@ from shared.pole_remote_control import (
 from shared.leadsun_edge_client import LeadsunEdgeApiError
 from shared.users_api import get_users
 from shared.auth_utils import AuthError, require_auth
+from shared.data_scope import scope_for
 from shared.users_management_api import (
     change_role,
     delete_user,
@@ -440,6 +441,7 @@ def getCustomers(req: func.HttpRequest) -> func.HttpResponse:
     """
     try:
         ctx = require_auth(req)
+        scope = scope_for(ctx)
     except AuthError as ex:
         return _auth_error_response(ex)
     customer_id = req.params.get("customerId")
@@ -469,6 +471,7 @@ def getCustomers(req: func.HttpRequest) -> func.HttpResponse:
             customer_id=customer_id,
             limit=int(limit_param) if limit_param else None,
             active=active,
+            scope=scope,
         )
     except Exception as ex:
         logging.error("getCustomers: query failed: %s", ex)
@@ -530,6 +533,7 @@ def getProjects(req: func.HttpRequest) -> func.HttpResponse:
     project_id = req.params.get("projectId")
     try:
         ctx = require_auth(req)
+        scope = scope_for(ctx)
     except AuthError as ex:
         return _auth_error_response(ex)
     customer_id = req.params.get("customerId")
@@ -560,6 +564,7 @@ def getProjects(req: func.HttpRequest) -> func.HttpResponse:
             customer_id=customer_id,
             limit=int(limit_param) if limit_param else None,
             active=active,
+            scope=scope,
         )
     except Exception as ex:
         logging.error("getProjects: query failed: %s", ex)
@@ -615,7 +620,8 @@ def getPoleVitals(req: func.HttpRequest) -> func.HttpResponse:
         projects. Ignored if either id is given.
     """
     try:
-        require_auth(req)
+        ctx = require_auth(req)
+        scope = scope_for(ctx)
     except AuthError as ex:
         return _auth_error_response(ex)
     project_id = req.params.get("projectId")
@@ -634,6 +640,7 @@ def getPoleVitals(req: func.HttpRequest) -> func.HttpResponse:
             project_id=project_id,
             customer_id=customer_id,
             limit=int(limit_param) if limit_param else None,
+            scope=scope,
         )
     except Exception as ex:
         logging.error("getPoleVitals: query failed: %s", ex)
@@ -707,6 +714,28 @@ def getPoles(req: func.HttpRequest) -> func.HttpResponse:
         built for a "give me every pole" consumer (e.g. a map rendering
         all ~14K poles at once) that only needs location/status, not
         per-pole telemetry detail.
+      page / pageSize -- optional. Either one switches the response to a
+        PAGE: {"total": N, "page": P, "pageSize": S, "items": [...]},
+        where total counts every matching pole across all pages, page is
+        1-based, and pageSize defaults to 50 and is capped at 1000 (the
+        capped value is what comes back as "pageSize"). Items are the same
+        objects the plain array contains, but ordered by poleNumber
+        across the whole result (the plain array is grouped by project). Works with projectId/customerId/active/summary. Much
+        faster than the plain list, since the per-pole work (latest
+        telemetry, sunset time) is done only for the rows on the page.
+        `limit` is ignored when paginating. Without page/pageSize the
+        response is the plain array exactly as before. Ignored if poleId
+        is given (that is always a single-pole lookup).
+      poleNumber -- optional search: only poles whose poleNumber CONTAINS
+        this text (case-insensitive under the database's default
+        collation; % _ [ are matched literally, not as wildcards).
+        Surrounding whitespace is trimmed and a blank value means no
+        search. Combines with customerId/projectId/faults/active. Only
+        valid together with page/pageSize (400 otherwise).
+      faults -- optional, "true"/"1" to return only poles counted as
+        faults (the same definition as the TotalFaults rollup in
+        getPoleVitals, so the total matches). Only valid together with
+        page/pageSize (400 otherwise); "false"/"0" means no filter.
       active -- optional, "true"/"1" or "false"/"0" (case-insensitive).
         Filters to only poles whose Active column matches. Applies to
         the projectId-filtered list, the customerId-filtered list, and
@@ -714,7 +743,8 @@ def getPoles(req: func.HttpRequest) -> func.HttpResponse:
         entirely -> no filter, same as before this param existed.
     """
     try:
-        require_auth(req)
+        ctx = require_auth(req)
+        scope = scope_for(ctx)
     except AuthError as ex:
         return _auth_error_response(ex)
     pole_id = req.params.get("poleId")
@@ -742,6 +772,61 @@ def getPoles(req: func.HttpRequest) -> func.HttpResponse:
                 mimetype="application/json",
             )
 
+    def _bad_request(message):
+        return func.HttpResponse(
+            json.dumps({"error": message}),
+            status_code=400,
+            mimetype="application/json",
+        )
+
+    page_param = req.params.get("page")
+    page_size_param = req.params.get("pageSize")
+    if page_param is not None and not (page_param.isdigit() and int(page_param) >= 1):
+        return _bad_request("page must be a positive integer (1-based)")
+    if page_size_param is not None and not (page_size_param.isdigit() and int(page_size_param) >= 1):
+        return _bad_request("pageSize must be a positive integer")
+
+    faults = False
+    faults_param = req.params.get("faults")
+    if faults_param is not None:
+        try:
+            faults = parse_bool_param(faults_param, "faults")
+        except ValueError as ve:
+            return _bad_request(str(ve))
+
+    # A blank search box means "no search", not "no match".
+    pole_number = (req.params.get("poleNumber") or "").strip() or None
+
+    paginate = (page_param is not None or page_size_param is not None) and not pole_id
+    if faults and not paginate and not pole_id:
+        return _bad_request("faults can only be used together with page/pageSize")
+    if pole_number and not paginate and not pole_id:
+        return _bad_request("poleNumber can only be used together with page/pageSize")
+
+    if paginate:
+        try:
+            page_result = get_poles_page(
+                page=int(page_param) if page_param is not None else 1,
+                page_size=int(page_size_param) if page_size_param is not None else None,
+                project_id=project_id,
+                customer_id=customer_id,
+                pole_number=pole_number,
+                summary=summary,
+                active=active,
+                faults=faults,
+                scope=scope,
+            )
+        except Exception as ex:
+            logging.error("getPoles: paginated query failed: %s", ex)
+            return func.HttpResponse(
+                json.dumps({"error": "internal error"}),
+                status_code=500,
+                mimetype="application/json",
+            )
+        return func.HttpResponse(
+            json.dumps(page_result), status_code=200, mimetype="application/json"
+        )
+
     try:
         result = get_poles(
             pole_id=pole_id,
@@ -750,6 +835,7 @@ def getPoles(req: func.HttpRequest) -> func.HttpResponse:
             limit=int(limit_param) if limit_param else None,
             summary=summary,
             active=active,
+            scope=scope,
         )
     except Exception as ex:
         logging.error("getPoles: query failed: %s", ex)
@@ -807,6 +893,11 @@ def getUsers(req: func.HttpRequest) -> func.HttpResponse:
         Applies to how many users are returned in the fully unfiltered
         case. Ignored if userId or customerId is given.
     """
+    try:
+        ctx = require_auth(req)
+        scope = scope_for(ctx)
+    except AuthError as ex:
+        return _auth_error_response(ex)
     user_id = req.params.get("userId")
     customer_id = req.params.get("customerId")
     limit_param = req.params.get("limit")
@@ -823,6 +914,7 @@ def getUsers(req: func.HttpRequest) -> func.HttpResponse:
             user_id=user_id,
             customer_id=customer_id,
             limit=int(limit_param) if limit_param else None,
+            scope=scope,
         )
     except Exception as ex:
         logging.error("getUsers: query failed: %s", ex)
@@ -858,16 +950,18 @@ def getUsers(req: func.HttpRequest) -> func.HttpResponse:
 # only proves "this caller is the website's own backend", not "this caller
 # is a specific, signed-in human with a specific role".
 #
-# FOLLOW-UP, not done as part of this change: getCustomers/getProjects/
-# getPoles/getPoleVitals/getUsers above don't call require_auth() at all
-# yet, so a Customer Admin's requests aren't actually scoped to their own
-# CustomerId yet -- they can currently see every customer's data, same as a
-# Streetleaf Admin would. Retrofitting that is a separate, contained change:
-# call require_auth() at the top of each of those, then (when
-# ctx.role != "Streetleaf Admin") filter/verify against ctx.customer_id the
-# same way invite_user()/delete_user() already enforce their own
-# Streetleaf-Admin-only restriction. Worth doing before this goes live for
-# real Customer Admin users.
+# DATA SCOPING (done): every read endpoint (getCustomers/getProjects/
+# getPoles/getPoleVitals/getPoleVitalsByPeriod/getUsers) calls require_auth()
+# and then scope_for(ctx) (shared/data_scope.py) and passes the resulting
+# DataScope to its query function, which enforces it in the SQL itself:
+# customer-scoped roles see only their own customer, Streetleaf Crew only
+# projects with an installation schedule (and their customers/poles), and
+# only Streetleaf Admin sees everything. Out-of-scope lookups return 404 /
+# empty, never 403, so another customer's Ids aren't confirmed to exist.
+#
+# NOT scoped yet: the WRITE endpoints that act on poles by poleNumber/
+# poleNumbers/gatewayCode (setPoleLights, createPoleIssue) only require a
+# valid token -- they don't check the pole belongs to the caller's scope.
 
 
 def _auth_error_response(ex: AuthError) -> func.HttpResponse:
@@ -1185,6 +1279,11 @@ def getPoleVitalsByPeriod(req: func.HttpRequest) -> func.HttpResponse:
     back as an empty list, not a 404 -- the pole itself was found, it
     just has no history yet for that period type.
     """
+    try:
+        ctx = require_auth(req)
+        scope = scope_for(ctx)
+    except AuthError as ex:
+        return _auth_error_response(ex)
     pole_id = req.params.get("poleId")
     period_type = req.params.get("periodType")
     limit_param = req.params.get("limit")
@@ -1213,6 +1312,7 @@ def getPoleVitalsByPeriod(req: func.HttpRequest) -> func.HttpResponse:
             pole_id=pole_id,
             period_type=period_type,
             limit=int(limit_param) if limit_param else None,
+            scope=scope,
         )
     except ValueError as ex:
         return func.HttpResponse(
@@ -1268,6 +1368,10 @@ def setPoleLights(req: func.HttpRequest) -> func.HttpResponse:
     login/token refresh -> the actual remote-command call, sent as ONE
     request per Leadsun account covering every matched pole under it).
     """
+    try:
+        require_auth(req)
+    except AuthError as ex:
+        return _auth_error_response(ex)
     try:
         body = req.get_json()
     except ValueError:

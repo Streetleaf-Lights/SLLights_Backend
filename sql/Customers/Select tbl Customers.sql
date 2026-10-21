@@ -2,7 +2,6 @@ SELECT TOP (1000) [Id]
       ,[Name]
       ,[ProjectNames]
       ,[ProjectIds]
-      ,CrewAssigned
       ,Active
       ,[SP_ExecId]
       ,[Address]

@@ -1259,3 +1259,103 @@ class TestSelfDelete:
             users_management_api.delete_user(
                 caller, "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
             )
+
+
+class TestStreetleafCrewRole:
+    """
+    Streetleaf Crew is a Streetleaf-level role (no customer) with the same
+    permissions as User. Regression: it was missing from _VALID_ROLES after
+    a stale snapshot overwrote this module, so inviting one failed with
+    "role must be one of: ...".
+    """
+
+    OTHER_USER = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+
+    def _insert_args(self, mock_cursor):
+        calls = [c.args for c in mock_cursor.execute.call_args_list if "INSERT INTO Users" in c.args[0]]
+        assert len(calls) == 1
+        return calls[0]
+
+    def test_crew_is_a_valid_role_ranked_with_user(self):
+        assert "Streetleaf Crew" in users_management_api._VALID_ROLES
+        assert users_management_api._ROLE_RANK["Streetleaf Crew"] == users_management_api._ROLE_RANK["User"]
+
+    def test_streetleaf_admin_can_invite_a_crew_member_with_no_customer(
+        self, patch_get_connection_users_management, mock_conn, mock_cursor, mocker
+    ):
+        mocker.patch("shared.users_management_api._send_invite_email", return_value=True)
+        mock_cursor.fetchone.return_value = None  # email not taken
+        caller = _Ctx("Streetleaf Admin")
+
+        result = users_management_api.invite_user(caller, "Crew One", "crew@streetleaf.com", "Streetleaf Crew")
+
+        assert result["email"] == "crew@streetleaf.com"
+        _, _id, name, email, role, customer_id, *_ = self._insert_args(mock_cursor)
+        assert (role, customer_id) == ("Streetleaf Crew", None)
+
+    def test_crew_invite_rejects_a_customer_id(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        with pytest.raises(auth_utils.AuthError, match="customerId must not be given when role is 'Streetleaf Crew'") as exc:
+            users_management_api.invite_user(
+                _Ctx("Streetleaf Admin"), "Crew One", "crew@streetleaf.com", "Streetleaf Crew", customer_id="cust1"
+            )
+        assert exc.value.status_code == 400
+        mock_cursor.execute.assert_not_called()
+
+    @pytest.mark.parametrize("inviter_role", ["Customer Owner", "Customer Admin"])
+    def test_customer_roles_cannot_invite_crew(
+        self, patch_get_connection_users_management, mock_cursor, inviter_role
+    ):
+        caller = _Ctx(inviter_role, customer_id="cust1")
+        with pytest.raises(auth_utils.AuthError) as exc:
+            users_management_api.invite_user(caller, "Crew One", "crew@streetleaf.com", "Streetleaf Crew")
+        assert exc.value.status_code == 403
+        mock_cursor.execute.assert_not_called()
+
+    def test_crew_cannot_invite_anyone(self, patch_get_connection_users_management, mock_cursor):
+        with pytest.raises(auth_utils.AuthError) as exc:
+            users_management_api.invite_user(_Ctx("Streetleaf Crew"), "X", "x@co.com", "User", customer_id="cust1")
+        assert exc.value.status_code == 403
+
+    def test_role_cannot_be_toggled(self, patch_get_connection_users_management, mock_cursor):
+        mock_cursor.fetchone.return_value = ("Streetleaf Crew", None)
+        with pytest.raises(auth_utils.AuthError, match="cannot be toggled") as exc:
+            users_management_api.change_role(_Ctx("Streetleaf Admin"), self.OTHER_USER)
+        assert exc.value.status_code == 400
+
+    def test_customer_admin_cannot_change_a_crew_members_role(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = ("Streetleaf Crew", None)
+        with pytest.raises(auth_utils.AuthError) as exc:
+            users_management_api.change_role(_Ctx("Customer Admin", customer_id="cust1"), self.OTHER_USER)
+        assert exc.value.status_code == 403
+
+    def test_customer_admin_cannot_delete_a_crew_member(
+        self, patch_get_connection_users_management, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = ("Streetleaf Crew", None)
+        with pytest.raises(auth_utils.AuthError) as exc:
+            users_management_api.delete_user(_Ctx("Customer Admin", customer_id="cust1"), self.OTHER_USER)
+        assert exc.value.status_code == 403
+
+    def test_streetleaf_admin_can_delete_a_crew_member(
+        self, patch_get_connection_users_management, mock_conn, mock_cursor
+    ):
+        mock_cursor.fetchone.return_value = ("Streetleaf Crew", None)
+        users_management_api.delete_user(_Ctx("Streetleaf Admin"), self.OTHER_USER)
+        assert any("DELETE FROM Users" in c.args[0] for c in mock_cursor.execute.call_args_list)
+
+    def test_crew_can_delete_their_own_account_but_not_others(
+        self, patch_get_connection_users_management, mock_conn, mock_cursor
+    ):
+        me = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        crew = _Ctx("Streetleaf Crew", user_id=me)
+        mock_cursor.fetchone.return_value = ("Streetleaf Crew", None)
+        users_management_api.delete_user(crew, me)  # self-delete is allowed for every role
+        assert any("DELETE FROM Users" in c.args[0] for c in mock_cursor.execute.call_args_list)
+
+        with pytest.raises(auth_utils.AuthError) as exc:
+            users_management_api.delete_user(crew, self.OTHER_USER)
+        assert exc.value.status_code == 403

@@ -1,6 +1,8 @@
 """Tests for shared/datetime_utils.py"""
 
 import re
+
+import pytest
 from datetime import datetime, timedelta, timezone
 
 from shared import datetime_utils
@@ -98,3 +100,34 @@ class TestParseDtoString:
         as_string = datetime_utils.to_dto_string(original)
         parsed = datetime_utils.parse_dto_string(as_string)
         assert parsed == original
+
+
+class TestAirtableDateToLocal:
+    def test_utc_datetime_converted_to_the_given_zone(self):
+        assert datetime_utils.airtable_date_to_local("2026-09-01T14:30:00.000Z", "America/Chicago") == \
+            "2026-09-01 09:30:00.000 -05:00"
+
+    def test_offset_follows_daylight_saving(self):
+        assert datetime_utils.airtable_date_to_local("2026-12-01T14:30:00.000Z", "America/Chicago") == \
+            "2026-12-01 08:30:00.000 -06:00"
+
+    def test_zone_without_dst(self):
+        assert datetime_utils.airtable_date_to_local("2026-09-01T14:30:00.000Z", "America/Phoenix") == \
+            "2026-09-01 07:30:00.000 -07:00"
+
+    def test_plain_date_is_treated_as_midnight_utc(self):
+        assert datetime_utils.airtable_date_to_local("2026-09-01", "America/Chicago") == \
+            "2026-08-31 19:00:00.000 -05:00"
+
+    @pytest.mark.parametrize("value", [None, ""])
+    def test_empty_values_become_none(self, value):
+        assert datetime_utils.airtable_date_to_local(value, "America/Chicago") is None
+
+    @pytest.mark.parametrize("tz", [None, "", "Not/AZone", "bad zone!"])
+    def test_missing_or_invalid_timezone_falls_back_to_eastern(self, tz):
+        assert datetime_utils.airtable_date_to_local("2026-09-01T14:30:00.000Z", tz) == \
+            "2026-09-01 10:30:00.000 -04:00"
+
+    def test_eastern_helper_is_the_local_helper_with_no_zone(self):
+        v = "2026-12-01T14:30:00.000Z"
+        assert datetime_utils.airtable_date_to_eastern(v) == datetime_utils.airtable_date_to_local(v, None)

@@ -3,7 +3,7 @@ The ten user-management operations: invite, resend invite, register,
 sign in, sign out, forgot password, reset password, delete, change role,
 and transfer ownership (Customer Owner → another user).
 
-Role model, four roles in descending order of privilege:
+Role model, five roles (Streetleaf Crew ranks alongside User):
   'Streetleaf Admin'  -- broad access, not scoped to one customer
   'Customer Owner'    -- highest customer-scoped role; exactly one per
                          customer at any time; can act on Customer Admin
@@ -12,9 +12,14 @@ Role model, four roles in descending order of privilege:
                          act on User within their customer only
   'User'              -- restricted to their own CustomerId's data, with
                          narrower permissions than Customer Admin
+  'Streetleaf Crew'   -- Streetleaf-level (no CustomerId), same permissions
+                         as User; reads only projects that have an
+                         installation schedule and the customers/poles
+                         under them (shared/data_scope.py). Only a
+                         Streetleaf Admin can invite one.
 
 Invite permissions:
-  Streetleaf Admin    can invite any role
+  Streetleaf Admin    can invite any role (Streetleaf Admin/Crew: no customerId)
   Customer Owner      can invite Customer Admin / User for their own customer
   Customer Admin      can invite Customer Admin / User for their own customer
   User                cannot invite at all
@@ -57,7 +62,7 @@ from shared.datetime_utils import to_dto_string as _to_dto_string
 from shared.email_client import EmailSendError, send_email
 from shared.sql_client import get_connection
 
-_VALID_ROLES = ("Streetleaf Admin", "Customer Owner", "Customer Admin", "User")
+_VALID_ROLES = ("Streetleaf Admin", "Customer Owner", "Customer Admin", "User", "Streetleaf Crew")
 
 # Roles that are scoped to a specific customer (vs. Streetleaf-wide)
 _CUSTOMER_SCOPED_ROLES = ("Customer Owner", "Customer Admin", "User")
@@ -65,6 +70,7 @@ _CUSTOMER_SCOPED_ROLES = ("Customer Owner", "Customer Admin", "User")
 # Role precedence for permission checks -- higher index = higher privilege
 _ROLE_RANK = {
     "User": 0,
+    "Streetleaf Crew": 0,  # same privilege as User; a different DATA scope (see shared/data_scope.py)
     "Customer Admin": 1,
     "Customer Owner": 2,
     "Streetleaf Admin": 3,
@@ -194,6 +200,11 @@ def invite_user(
         raise AuthError("customerId is required when role is 'Customer Admin'", status_code=400)
     if role == "Streetleaf Admin" and customer_id:
         raise AuthError("customerId must not be given when role is 'Streetleaf Admin'", status_code=400)
+    if role == "Streetleaf Crew" and customer_id:
+        # Streetleaf-level, like Streetleaf Admin: not tied to any one
+        # customer (what a Crew user can see is decided by installation
+        # schedule, not by CustomerId -- see shared/data_scope.py).
+        raise AuthError("customerId must not be given when role is 'Streetleaf Crew'", status_code=400)
 
     conn = get_connection()
     cursor = conn.cursor()
@@ -609,6 +620,14 @@ def _new_role_after_toggle(current_role: str, customer_id) -> str:
     if current_role == "Customer Owner":
         raise AuthError(
             "Customer Owner role cannot be toggled; use transfer_ownership() instead",
+            status_code=400,
+        )
+    if current_role == "Streetleaf Crew":
+        # Toggling would turn a customer-less Crew account into a customer-
+        # less 'User' -- not a valid state. Crew is assigned at invite time
+        # (Streetleaf Admin only); to change it, delete and re-invite.
+        raise AuthError(
+            "Streetleaf Crew role cannot be toggled; delete and re-invite the user instead",
             status_code=400,
         )
     if current_role == "User":
