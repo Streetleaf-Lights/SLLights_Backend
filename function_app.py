@@ -615,7 +615,7 @@ def getPoleVitals(req: func.HttpRequest) -> func.HttpResponse:
         projects. Ignored if either id is given.
     """
     try:
-        ctx = require_auth(req)
+        require_auth(req)
     except AuthError as ex:
         return _auth_error_response(ex)
     project_id = req.params.get("projectId")
@@ -629,13 +629,11 @@ def getPoleVitals(req: func.HttpRequest) -> func.HttpResponse:
             mimetype="application/json",
         )
 
-    crew_assigned_only = ctx.role == "Streetleaf Crew"
     try:
         result = get_pole_vitals(
             project_id=project_id,
             customer_id=customer_id,
             limit=int(limit_param) if limit_param else None,
-            crew_assigned_only=crew_assigned_only,
         )
     except Exception as ex:
         logging.error("getPoleVitals: query failed: %s", ex)
@@ -716,7 +714,7 @@ def getPoles(req: func.HttpRequest) -> func.HttpResponse:
         entirely -> no filter, same as before this param existed.
     """
     try:
-        ctx = require_auth(req)
+        require_auth(req)
     except AuthError as ex:
         return _auth_error_response(ex)
     pole_id = req.params.get("poleId")
@@ -744,7 +742,6 @@ def getPoles(req: func.HttpRequest) -> func.HttpResponse:
                 mimetype="application/json",
             )
 
-    crew_assigned_only = ctx.role == "Streetleaf Crew"
     try:
         result = get_poles(
             pole_id=pole_id,
@@ -753,7 +750,6 @@ def getPoles(req: func.HttpRequest) -> func.HttpResponse:
             limit=int(limit_param) if limit_param else None,
             summary=summary,
             active=active,
-            crew_assigned_only=crew_assigned_only,
         )
     except Exception as ex:
         logging.error("getPoles: query failed: %s", ex)

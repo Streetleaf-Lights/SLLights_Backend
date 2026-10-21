@@ -74,6 +74,7 @@ def _summary_row(
     pole_id="pole1",
     pole_number="PN-1",
     location_id="LOC-1",
+    controller_id="CTRL-1",
     install_date="2025-01-01",
     lat=28.0,
     long_=-82.0,
@@ -102,7 +103,7 @@ def _summary_row(
 ):
     """Matches _POLE_SUMMARY_SQL_TEMPLATE's own column order exactly."""
     return (
-        project_id, pole_id, pole_number, location_id, install_date, lat, long_,
+        project_id, pole_id, pole_number, location_id, controller_id, install_date, lat, long_,
         active,
         last_update,
         lamp_power_1, lamp_power_2, battery_elec_current_1, battery_elec_current_2,
@@ -121,6 +122,7 @@ class TestSummaryRowToDict:
         assert result["id"] == "pole1"
         assert result["poleNumber"] == "PN-1"
         assert result["locationId"] == "LOC-1"
+        assert result["controllerId"] == "CTRL-1"
         assert result["installDate"] == "2025-01-01"
         assert result["lat"] == 28.0
         assert result["long"] == -82.0
@@ -423,3 +425,39 @@ class TestGetPolesActiveFilter:
         executed_sql, *params = mock_cursor.execute.call_args.args
         assert "AND p.Active = ?" in executed_sql
         assert params[-1] == 1
+
+
+class TestPoleRowToDictWithParents:
+    """
+    Regression guard: IssuesRaw was appended AFTER CustomerId in
+    _POLE_DETAILS_SQL_TEMPLATE, so CustomerId is row[-2], not row[-1].
+    Reading row[-1] returned the issues string (or None) as customerId.
+    A row WITH issue data is what exposes it -- a None IssuesRaw would
+    pass either way.
+    """
+
+    def _detail_row(self, issues_raw):
+        return (
+            "proj1", "pole1", "PN-1", "LOC-1", "CTRL-1", "2025-01-01", 28.0, -82.0, True,
+            None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None,
+            28.2, -80.7, "America/New_York",
+            True, None, None, None, False, None,
+            None, None, None, "cust1", issues_raw,
+        )
+
+    def test_customer_id_comes_from_customer_column_not_issues_raw(self):
+        row = self._detail_row("ISS-1|Open|Electrical Issue|2026-10-01|Bad lamp")
+        result = m._pole_row_to_dict_with_parents(row)
+        assert result["customerId"] == "cust1"
+        assert result["projectId"] == "proj1"
+        assert result["poleIssues"][0]["issueId"] == "ISS-1"
+
+    def test_customer_id_correct_when_no_issues(self):
+        result = m._pole_row_to_dict_with_parents(self._detail_row(None))
+        assert result["customerId"] == "cust1"
+        assert result["poleIssues"] == []
+
+    def test_controller_id_is_returned(self):
+        result = m._pole_row_to_dict_with_parents(self._detail_row(None))
+        assert result["controllerId"] == "CTRL-1"

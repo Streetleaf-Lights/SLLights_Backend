@@ -195,6 +195,7 @@ SELECT
     p.Id AS PoleId,
     p.PoleNumber AS PoleNumber,
     p.VendorPoleId AS VendorPoleId,
+    p.ControllerId AS ControllerId,
     p.InstallDate AS InstallDate,
     p.Lat AS Lat,
     p.Long AS Long,
@@ -396,6 +397,7 @@ def _pole_row_to_dict(row) -> dict:
         pole_id,
         pole_number,
         vendor_pole_id,
+        controller_id,
         install_date,
         lat,
         long_,
@@ -489,6 +491,7 @@ def _pole_row_to_dict(row) -> dict:
         "id": json_safe(pole_id),
         "poleNumber": json_safe(pole_number),
         "locationId": json_safe(vendor_pole_id),
+        "controllerId": json_safe(controller_id),
         "installDate": json_safe(install_date),
         "lat": json_safe(lat),
         "long": json_safe(long_),
@@ -658,7 +661,7 @@ def _customer_rollup_fields(rows) -> dict:
     }
 
 
-def get_pole_vitals(customer_id: str = None, project_id: str = None, limit: int = None, crew_assigned_only: bool = False):
+def get_pole_vitals(customer_id: str = None, project_id: str = None, limit: int = None):
     """
     Returns each Customer's Projects, each annotated with pole-health
     rollup stats (totalLights, connectedLights, totalFaults,
@@ -765,15 +768,14 @@ def get_pole_vitals(customer_id: str = None, project_id: str = None, limit: int 
     projects within a customer). Defaults to DEFAULT_LIMIT, capped at
     MAX_LIMIT (see shared/api_utils.py). Ignored when either id is given.
     """
-    crew_filter = " AND c.CrewAssigned = 1" if crew_assigned_only else ""
     if project_id and customer_id:
-        where_clause = f"WHERE proj.Id = ? AND c.Id = ?{crew_filter}"
+        where_clause = "WHERE proj.Id = ? AND c.Id = ?"
         params = (_ROLLUP_PERIOD_TYPE, project_id, customer_id)
     elif project_id:
-        where_clause = f"WHERE proj.Id = ?{crew_filter}"
+        where_clause = "WHERE proj.Id = ?"
         params = (_ROLLUP_PERIOD_TYPE, project_id)
     elif customer_id:
-        where_clause = f"WHERE c.Id = ?{crew_filter}"
+        where_clause = "WHERE c.Id = ?"
         params = (_ROLLUP_PERIOD_TYPE, customer_id)
     else:
         # limit applies to CUSTOMERS, the top-level entity here -- can't
@@ -782,8 +784,7 @@ def get_pole_vitals(customer_id: str = None, project_id: str = None, limit: int 
         # dropping whole customers), so this filters to the first N
         # distinct customer Ids first via a subquery, then fetches every
         # project row for those.
-        crew_subfilter = " AND CrewAssigned = 1" if crew_assigned_only else ""
-        where_clause = f"WHERE c.Id IN (SELECT TOP (?) Id FROM Customers{crew_subfilter} ORDER BY Name)"
+        where_clause = "WHERE c.Id IN (SELECT TOP (?) Id FROM Customers ORDER BY Name)"
         params = (_ROLLUP_PERIOD_TYPE, clamp_limit(limit))
 
     conn = get_connection()

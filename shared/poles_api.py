@@ -97,6 +97,7 @@ SELECT
     p.Id AS PoleId,
     p.PoleNumber AS PoleNumber,
     p.VendorPoleId AS VendorPoleId,
+    p.ControllerId AS ControllerId,
     p.InstallDate AS InstallDate,
     p.Lat AS Lat,
     p.Long AS Long,
@@ -157,7 +158,8 @@ ORDER BY proj.Id, p.PoleNumber
 def _pole_row_to_dict_with_parents(row) -> dict:
     """
     pole_vitals_api._pole_row_to_dict() deliberately discards ProjectId
-    (row[0], the first column) and CustomerId (row[-1], the last column)
+    (row[0], the first column) and CustomerId (row[-2], second-to-last --
+    IssuesRaw is the last column)
     -- in that module both are used only for GROUPING poles under their
     already-known parent project/customer dicts, not included in the
     per-pole dict itself, since nesting under a project (itself under a
@@ -168,7 +170,7 @@ def _pole_row_to_dict_with_parents(row) -> dict:
     """
     pole_dict = _pole_row_to_dict(row)
     pole_dict["projectId"] = json_safe(row[0])
-    pole_dict["customerId"] = json_safe(row[-1])
+    pole_dict["customerId"] = json_safe(row[-2])  # CustomerId; row[-1] is IssuesRaw
     return pole_dict
 
 
@@ -220,6 +222,7 @@ def _summary_row_to_dict(row) -> dict:
         pole_id,
         pole_number,
         vendor_pole_id,
+        controller_id,
         install_date,
         lat,
         long_,
@@ -295,6 +298,7 @@ def _summary_row_to_dict(row) -> dict:
         "id": json_safe(pole_id),
         "poleNumber": json_safe(pole_number),
         "locationId": json_safe(vendor_pole_id),
+        "controllerId": json_safe(controller_id),
         "installDate": json_safe(install_date),
         "lat": json_safe(lat),
         "long": json_safe(long_),
@@ -323,7 +327,6 @@ def get_poles(
     limit: int = None,
     summary: bool = False,
     active: bool = None,
-    crew_assigned_only: bool = False,
 ):
     """
     Returns Poles, each with the exact same fields a pole carries inside
@@ -423,8 +426,6 @@ def get_poles(
         if active is not None and not pole_id:
             conditions.append("p.Active = ?")
             params.append(1 if active else 0)
-        if crew_assigned_only:
-            conditions.append("c.CrewAssigned = 1")
         where_clause = "WHERE " + " AND ".join(conditions)
         params = tuple(params)
     else:
@@ -443,14 +444,6 @@ def get_poles(
         if active is not None:
             where_clause += " AND p.Active = ?"
             params.append(1 if active else 0)
-        if crew_assigned_only:
-            where_clause += (
-                " AND EXISTS ("
-                "SELECT 1 FROM Projects proj"
-                " JOIN Customers c ON proj.CustomerId = c.Id"
-                " WHERE proj.Id = p.ProjectId AND c.CrewAssigned = 1"
-                ")"
-            )
         params = tuple(params)
 
     sql_template = _POLE_SUMMARY_SQL_TEMPLATE if summary else _POLE_DETAILS_SQL_TEMPLATE

@@ -313,7 +313,7 @@ class TestPoleDetailsIsOpenIssueFaultIndependence:
 
     def _detail_row(self, is_open_issue_fault, is_online, is_pole_fault):
         return (
-            "proj1", "pole1", "PN-1", "LOC-1", "2025-01-01", 28.0, -82.0, True,
+            "proj1", "pole1", "PN-1", "LOC-1", "CTRL-1", "2025-01-01", 28.0, -82.0, True,
             None, None, None, None, None,
             None, None, None, None, None, None, None, None, None,
             28.2, -80.7, "America/New_York",
@@ -356,6 +356,7 @@ class TestPoleRowToDict:
         pole_id="pole1",
         pole_number="PN-001",
         vendor_pole_id="LOC-001",
+        controller_id="CTRL-001",
         install_date="2025-01-01",
         lat=28.0,
         long_=-82.0,
@@ -390,7 +391,7 @@ class TestPoleRowToDict:
         issues_raw=None,
     ):
         return (
-            project_id, pole_id, pole_number, vendor_pole_id, install_date, lat, long_,
+            project_id, pole_id, pole_number, vendor_pole_id, controller_id, install_date, lat, long_,
             active,
             last_update, controller_code, group_id, product_id, user_name,
             battery_voltage_1, battery_voltage_2,
@@ -408,6 +409,7 @@ class TestPoleRowToDict:
             "id": "pole1",
             "poleNumber": "PN-001",
             "locationId": "LOC-001",
+            "controllerId": "CTRL-001",
             "installDate": "2025-01-01",
             "lat": 28.0,
             "long": -82.0,
@@ -754,7 +756,7 @@ class TestGetPoleVitalsUnfiltered:
         agg_rows = [("cust1", "Acme", "proj1", "Downtown", 8, 6, 3, '{"ProjectId": "482"}')]
         pole_rows = [
             (
-                "proj1", "pole1", "PN-1", "LOC-1", "2025-01-01", 28.0, -82.0, True,
+                "proj1", "pole1", "PN-1", "LOC-1", "CTRL-1", "2025-01-01", 28.0, -82.0, True,
                 "2026-08-28 10:00:00 -04:00", "CC-100", 7, "PROD-42", "jdoe",
                 12.6, 12.4,
                 8.7, 8.6, 15.0, 15.2, 18.0, 2.0, 1,
