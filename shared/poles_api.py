@@ -20,6 +20,8 @@ underscore-prefixed names" for code this tightly coupled and this
 unlikely to be used by anything outside this codebase.
 """
 
+import re
+
 from shared.api_utils import (
     clamp_limit,
     compute_pole_local_sunset,
@@ -327,13 +329,19 @@ def _summary_row_to_dict(row) -> dict:
 # get_poles() above builds a full row (latest-telemetry lookup, timezone
 # join, per-pole sunset calculation in Python) for EVERY pole it returns --
 # which is the cost when a caller only wants a screenful. get_poles_page()
-# instead (1) counts the poles that match the filters with a cheap query
-# that touches none of that, and (2) picks just the requested page's pole
-# Ids in a subquery (OFFSET/FETCH) and only then runs the same expensive
-# per-pole query -- for at most page_size rows. The rows it returns come
-# out of the same SQL templates and row mappers as get_poles(), so an item
-# here is identical to the same pole's entry in the unpaginated list --
-# though in a different ORDER (see _PAGED_ORDER_BY).
+# instead (1) runs a cheap query returning just (Id, PoleNumber) for every
+# pole that matches the filters -- none of the per-pole machinery -- (2)
+# sorts those NATURALLY in Python and takes the requested page, and only
+# then (3) runs the same expensive per-pole query, for at most page_size
+# poles, selected by Id. The rows it returns come out of the same SQL
+# templates and row mappers as get_poles(), so an item here is identical
+# to the same pole's entry in the unpaginated list -- though in a
+# different ORDER (see _natural_key).
+#
+# Why sort in Python rather than SQL: SQL Server has no natural sort
+# ("-999" before "-1000"), and a generic one in T-SQL means a looping UDF
+# run over every pole on every request. ~14K short strings sort in
+# milliseconds here, and it keeps the order out of the SQL entirely.
 # --------------------------------------------------------------------------
 
 DEFAULT_PAGE_SIZE = 50
@@ -345,18 +353,27 @@ MAX_PAGE_SIZE = 1000
 # TotalFaults a dashboard already shows for the same customer/project.
 _FAULT_PREDICATE = "(sv.IsOnline = 1 OR sv.IsOpenIssueFault = 1) AND sv.IsPoleFault = 1"
 
-# Paginated results are ordered by PoleNumber across the whole list. The
-# page's pole Ids are chosen with this order (inside the OFFSET/FETCH
-# subquery) AND the final per-pole query is re-ordered to match, so the
-# rows within a page come back in the same order that decided what is ON
-# the page. The id is the tie-breaker that makes the order total.
-_PAGE_SUBQUERY_ORDER_BY = "ORDER BY sp.PoleNumber, sp.Id"
-_PAGED_ORDER_BY = "ORDER BY p.PoleNumber, p.Id"
-# What BOTH shared templates (_POLE_SUMMARY_SQL_TEMPLATE here and
-# pole_vitals_api._POLE_DETAILS_SQL_TEMPLATE) end with. get_poles() and
-# getPoleVitals keep that project-first order; only the paginated path
-# swaps it, and only on its own copy of the formatted SQL.
-_TEMPLATE_ORDER_BY = "ORDER BY proj.Id, p.PoleNumber"
+# Splitting on digit runs gives [text, digits, text, digits, ..., text]:
+# even indexes are always text and odd indexes always digits, so comparing
+# two such lists never compares a str with an int.
+_DIGIT_RUNS = re.compile(r"([0-9]+)")
+
+
+def _natural_key(pole_number, pole_id):
+    """
+    Sort key for natural PoleNumber order: digit runs compare as NUMBERS and
+    the text between them case-insensitively, so "12009-999" sorts before
+    "12009-1000" (a plain string sort puts "-1000" first) and "OSC-1099"
+    after "OSC-99". A pole with no PoleNumber sorts first, as in SQL. Ties
+    (e.g. "A-07" vs "A-7", or "a-1" vs "A-1") fall back to the exact text and
+    then the pole Id, so the order is total and paging never repeats or skips
+    a pole.
+    """
+    if not pole_number:
+        return (0, [], "", pole_id)
+    parts = _DIGIT_RUNS.split(pole_number)
+    natural = [int(part) if i % 2 else part.casefold() for i, part in enumerate(parts)]
+    return (1, natural, pole_number, pole_id)
 
 
 def _like_contains(text: str) -> str:
@@ -445,10 +462,9 @@ def get_poles_page(
     page is 1-based; page_size defaults to DEFAULT_PAGE_SIZE and is clamped
     to [1, MAX_PAGE_SIZE] (the clamped value is what comes back as
     "pageSize"). A page past the end returns an empty items list with the
-    real total. Poles are ordered by PoleNumber across the whole result
-    (NOT grouped by project, unlike get_poles()), with the pole Id as a
-    tie-breaker so paging never repeats or skips a pole. PoleNumber sorts
-    as text under the database collation (so "...-1000" precedes "...-999").
+    real total. Poles are in NATURAL PoleNumber order across the whole
+    result (digit runs compare as numbers: "...-999" before "...-1000"; see
+    _natural_key) -- NOT grouped by project, unlike get_poles().
 
     pole_number: a search -- only poles whose PoleNumber CONTAINS this text
     (see _like_contains for how wildcards in the text are handled).
@@ -467,53 +483,54 @@ def get_poles_page(
     sql_template = _POLE_SUMMARY_SQL_TEMPLATE if summary else _POLE_DETAILS_SQL_TEMPLATE
     row_to_dict = _summary_row_to_dict if summary else _pole_row_to_dict_with_parents
 
-    # ONE string for "which poles", used by both queries -- identical by
-    # construction, not by two f-strings happening to agree.
     which_poles = f"{from_sql} {where_sql}".rstrip()
 
     conn = get_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute(f"SELECT COUNT(*) {which_poles}", *filter_params)
-        total = cursor.fetchone()[0]
+        # (1) Every matching pole's Id and PoleNumber -- narrow, and none of
+        # the expensive per-pole joins. Its length IS the total, so there is
+        # no separate COUNT query to keep in step with the page.
+        cursor.execute(f"SELECT sp.Id, sp.PoleNumber {which_poles}", *filter_params)
+        candidates = {}
+        for pole_id, pole_number_text in cursor.fetchall():
+            # Id is a primary key, but guard against a join fanning out (e.g.
+            # two matching PoleVitals rows) so total and paging stay exact.
+            candidates.setdefault(pole_id, pole_number_text)
 
+        # (2) Natural order, then this page's slice.
+        ordered_ids = [
+            pole_id
+            for pole_id, _ in sorted(candidates.items(), key=lambda kv: _natural_key(kv[1], kv[0]))
+        ]
+        total = len(ordered_ids)
+        page_ids = ordered_ids[offset : offset + page_size]
+
+        # (3) The expensive per-pole query, for at most page_size poles --
+        # skipped entirely when the page is past the last match.
         rows = []
-        # Nothing to fetch when the page starts past the last match -- skip
-        # the expensive per-pole query entirely.
-        if offset < total:
-            where_clause = (
-                f"WHERE p.Id IN (SELECT sp.Id {which_poles} "
-                f"{_PAGE_SUBQUERY_ORDER_BY} "
-                "OFFSET ? ROWS FETCH NEXT ? ROWS ONLY)"
-            )
-            page_sql = sql_template.format(where_clause=where_clause).rstrip()
-            # Swap the template's project-first order for PoleNumber order.
-            # Fail LOUDLY if a template ever stops ending this way -- a
-            # silent mismatch would put a page's rows in a different order
-            # than the one that chose them.
-            if not page_sql.endswith(_TEMPLATE_ORDER_BY):
-                raise RuntimeError(
-                    "get_poles_page expected the SQL template to end with "
-                    f"{_TEMPLATE_ORDER_BY!r}; update _TEMPLATE_ORDER_BY"
-                )
-            page_sql = page_sql[: -len(_TEMPLATE_ORDER_BY)] + _PAGED_ORDER_BY
+        if page_ids:
+            placeholders = ", ".join("?" for _ in page_ids)
             cursor.execute(
-                page_sql,
+                sql_template.format(where_clause=f"WHERE p.Id IN ({placeholders})"),
                 _ROLLUP_PERIOD_TYPE,  # the template's own PoleVitals join comes first
-                *filter_params,
-                offset,
-                page_size,
+                *page_ids,
             )
             rows = cursor.fetchall()
     finally:
         cursor.close()
         conn.close()
 
+    # The template orders rows project-first; put them back in page order.
+    position = {pole_id: i for i, pole_id in enumerate(page_ids)}
+    items = [row_to_dict(row) for row in rows]
+    items.sort(key=lambda item: position[item["id"]])
+
     return {
         "total": total,
         "page": page,
         "pageSize": page_size,
-        "items": [row_to_dict(row) for row in rows],
+        "items": items,
     }
 
 

@@ -719,8 +719,10 @@ def getPoles(req: func.HttpRequest) -> func.HttpResponse:
         where total counts every matching pole across all pages, page is
         1-based, and pageSize defaults to 50 and is capped at 1000 (the
         capped value is what comes back as "pageSize"). Items are the same
-        objects the plain array contains, but ordered by poleNumber
-        across the whole result (the plain array is grouped by project). Works with projectId/customerId/active/summary. Much
+        objects the plain array contains, but in NATURAL poleNumber order
+        across the whole result (digit runs compare as numbers, so
+        "…-999" comes before "…-1000"; the plain array is instead grouped
+        by project). Works with projectId/customerId/active/summary. Much
         faster than the plain list, since the per-pole work (latest
         telemetry, sunset time) is done only for the rows on the page.
         `limit` is ignored when paginating. Without page/pageSize the
@@ -1182,12 +1184,11 @@ def deleteUser(req: func.HttpRequest) -> func.HttpResponse:
     PERMANENTLY removes a user (a hard delete, not a deactivation -- see
     delete_user()'s own docstring for the earlier soft-delete design
     this replaced, and why it's not reversible) and revokes their active
-    sessions. Streetleaf Admin or Customer Admin only -- see
-    delete_user()'s own docstring for the full permission model
-    (Streetleaf Admin can delete any Streetleaf Admin/Customer Admin/
-    User except itself; Customer Admin can delete a Customer Admin/User
-    within their own customer only, never a Streetleaf Admin; no caller
-    can ever delete their own account). Query param: ?userId=X.
+    sessions. Requires a valid token. Any caller may delete their OWN
+    account; deleting someone else needs Streetleaf Admin, Customer Owner
+    or Customer Admin, and delete_user() decides who may delete whom (by
+    role and customer) -- the userId in the URL is only WHICH user, never
+    proof of permission. Query param: ?userId=X.
     """
     try:
         ctx = require_auth(req)

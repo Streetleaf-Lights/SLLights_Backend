@@ -1380,31 +1380,42 @@ reference for a from-scratch project, not as the LightsApp deploy runbook.
   and either or both can *also* combine with `poleId` (verifies the pole
   belongs to that project/customer).
 
-  **Pagination: `page` / `pageSize` / `faults`** (opt-in). Either of the
-  first two switches the response from a bare array to
+  **Pagination: `page` / `pageSize` / `faults` / `poleNumber`** (opt-in).
+  Either `page` or `pageSize` switches the response from a bare array to
   `{"total", "page", "pageSize", "items"}`; without them nothing changes,
   so existing consumers (e.g. the all-poles map via `summary=true`) are
-  unaffected. `get_poles_page()` makes it cheap: it (1) counts matching
-  poles with a query that touches none of the per-pole machinery (no
-  telemetry, timezone or issue joins), and (2) selects just the page's
-  pole Ids in a subquery (`ORDER BY PoleNumber, Id OFFSET ? ROWS FETCH
-  NEXT ? ROWS ONLY`) before running the same per-pole SQL
-  templates for at most `pageSize` rows -- so the latest-telemetry lookup
-  and the Python sunset calculation happen for a screenful, not ~14K
-  poles. **Order**: a page is sorted by `PoleNumber` across the whole
-  result (then pole `Id`, so paging never repeats or skips a pole) --
-  not grouped by project like the unpaginated list. `PoleNumber` sorts
-  as text under the database collation, so `…-1000` precedes `…-999`.
-  The two shared per-pole templates keep their project-first
-  `ORDER BY` (they also serve `getPoleVitals` and the plain list);
-  `get_poles_page()` swaps it on its own copy of the SQL and raises
-  if a template ever stops ending the expected way. The count and the
-  page are filtered by one shared string, so
-  `total` cannot disagree with the items; scope (`shared/data_scope.py`)
-  applies to both. `pageSize` defaults to 50 and is capped at 1000 (the
-  effective value is echoed back); `page` is 1-based; a page past the end
-  returns empty `items` with the real `total`. `faults=1` keeps only poles
-  the `getPoleVitals` rollup counts as faults --
+  unaffected. `get_poles_page()` makes it cheap in three steps: (1) a
+  narrow query returns just `(Id, PoleNumber)` for every pole matching
+  the filters -- no telemetry, timezone or issue joins; (2) Python sorts
+  those **naturally** and slices out the requested page, `total` being
+  simply how many came back (so there is no separate COUNT to keep in step
+  with the page, and scope applies to both by construction); (3) only
+  then does the same per-pole SQL template as the plain list run, for at
+  most `pageSize` poles chosen by `WHERE p.Id IN (...)`. So the
+  latest-telemetry lookup and the Python sunset calculation happen for a
+  screenful, not ~14K poles. The trade is that step (1) moves one narrow
+  row per matching pole (~14K unfiltered) on every request; if the pole
+  count grows by an order of magnitude, a persisted sort-key column
+  populated by `loadPoles` would replace it.
+
+  **Order**: natural `PoleNumber` order across the whole result -- digit
+  runs compare as numbers and the text between them case-insensitively, so
+  `12009-999` sorts before `12009-1000` (a plain text sort, which is what
+  SQL Server would do, gets that backwards). Ties fall back to the exact
+  text, then the pole `Id`, so paging never repeats or skips a pole; a
+  pole with no `PoleNumber` sorts first. This is done in Python
+  (`_natural_key`) because SQL Server has no natural sort and a generic
+  one in T-SQL would be a looping UDF run over every pole on every
+  request. It is *not* grouped by project like the plain list, whose
+  project-first `ORDER BY` (shared with `getPoleVitals`) is untouched;
+  the page's rows are put back into page order in Python after the
+  per-pole query, which orders them its own way.
+
+  `pageSize` defaults to 50 and is capped at 1000 (one bound parameter
+  per id, well under SQL Server's 2,100; the effective value is echoed
+  back); `page` is 1-based; a page past the end returns empty `items`
+  with the real `total`. `faults=1` keeps only poles the `getPoleVitals`
+  rollup counts as faults --
   `(IsOnline = 1 OR IsOpenIssueFault = 1) AND IsPoleFault = 1` on the
   Last48Hours vitals row -- so its `total` reconciles with that rollup's
   `TotalFaults`; it is only accepted together with `page`/`pageSize`
@@ -1413,12 +1424,12 @@ reference for a from-scratch project, not as the LightsApp deploy runbook.
   ESCAPE '\'`, with `%`, `_`, `[` and `\` in the typed text escaped so
   they match literally; always a bound parameter). Case sensitivity
   follows the database collation (Azure SQL's default is
-  case-insensitive); there is no index for a leading-wildcard match,
-  so it scans the narrow `Poles` rows inside the Id-only subquery, never
-  the expensive per-pole joins. It is trimmed, a blank value means no
-  search, it combines with `customerId`/`projectId`/`faults`/`active`,
-  and like `faults` it is rejected (`400`) without `page`/`pageSize`.
-  `poleId` is always a single-pole lookup and ignores all of these.
+  case-insensitive); there is no index for a leading-wildcard match, so it
+  scans the narrow `Poles` rows in step (1), never the expensive per-pole
+  joins. It is trimmed, a blank value means no search, it combines with
+  `customerId`/`projectId`/`faults`/`active`, and like `faults` it is
+  rejected (`400`) without `page`/`pageSize`. `poleId` is always a
+  single-pole lookup and ignores all of these.
 
   **A real bug, found by writing the tests for this, not a hypothetical
   edge case**: the first version built the `WHERE` clause with an

@@ -61,7 +61,7 @@ SELECT TOP 1000  -- ← change row limit here
     BatteryVoltage2,
     BatteryElecCurrent1,
     BatteryElecCurrent2,
-    -- ControllerCode,
+    ControllerCode,
     -- ProductId,
     -- UserName,
     -- LeadsunId,
