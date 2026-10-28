@@ -19,4 +19,5 @@ SELECT TOP (1000) [Id]
     AND Name LIKE '%streetleaf%'
     -- AND LeadsunProject IS NOT NULL
     -- AND Active = 1
+    -- AND StickerNumbers IS NOT NULL
   ORDER BY [AirTableCreatedDateTime] DESC;

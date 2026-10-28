@@ -21,7 +21,7 @@ WITH PoleContext AS (
         VendorPoleId      AS LeadsunVendorPoleId,
         ProvisionedPoleId AS ProvisionedPoleId
     FROM Poles
-    WHERE PoleNumber = 'TESTSL1-1004'  -- ← change filter here
+    WHERE PoleNumber = 'JAX-DEMO'  -- ← change filter here
     -- WHERE VendorPoleId = 'DRH-Orl'
     -- WHERE ProvisionedPoleId = '0a10aced202194944a071358'
 ),
@@ -63,7 +63,7 @@ SELECT TOP 1000  -- ← change row limit here
     BatteryElecCurrent2,
     ControllerCode,
     -- ProductId,
-    -- UserName,
+    UserName,
     -- LeadsunId,
     -- GroupId,
     -- GroupName,

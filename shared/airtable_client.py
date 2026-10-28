@@ -86,3 +86,67 @@ def fetch_all_records(
             break
 
     return records, offsets_seen
+
+
+class AirtableApiError(RuntimeError):
+    """
+    A single-record Airtable call failed. Airtable's own response body is
+    included in the message -- it names the real cause (e.g.
+    INVALID_PERMISSIONS_OR_MODEL_NOT_FOUND, UNKNOWN_FIELD_NAME,
+    INVALID_VALUE_FOR_COLUMN), which the bare HTTP status never does.
+    """
+
+
+def _record_url(table_name: str, record_id: str, base_id: str = None) -> str:
+    return f"{AIRTABLE_API_URL}/{base_id or AIRTABLE_BASE_ID}/{table_name}/{record_id}"
+
+
+def _check_record_response(action: str, table_name: str, record_id: str, response) -> dict:
+    if not response.ok:
+        raise AirtableApiError(
+            f"Airtable {action} {table_name}/{record_id} failed "
+            f"({response.status_code}): {response.text or '(empty response body)'}"
+        )
+    return response.json()
+
+
+def fetch_record(table_name: str, record_id: str, base_id: str = None) -> dict:
+    """
+    One record, by its Airtable record id -- {"id": ..., "fields": {...}}.
+    Raises AirtableApiError on any non-2xx (a 404 means no such record).
+    """
+    response = requests.get(
+        _record_url(table_name, record_id, base_id),
+        headers={"Authorization": f"Bearer {AIRTABLE_API_KEY}"},
+        timeout=30,
+    )
+    return _check_record_response("GET", table_name, record_id, response)
+
+
+def update_record(
+    table_name: str,
+    record_id: str,
+    fields: dict,
+    base_id: str = None,
+    typecast: bool = False,
+) -> dict:
+    """
+    PATCHes just `fields` on one record (every other field is left alone).
+    typecast=True lets Airtable convert a value to the column's own type --
+    e.g. the string "389" into a Number column, or into text -- which is
+    useful when the column's type isn't something this code controls.
+    Raises AirtableApiError on any non-2xx.
+    """
+    payload = {"fields": fields}
+    if typecast:
+        payload["typecast"] = True
+    response = requests.patch(
+        _record_url(table_name, record_id, base_id),
+        headers={
+            "Authorization": f"Bearer {AIRTABLE_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=30,
+    )
+    return _check_record_response("PATCH", table_name, record_id, response)

@@ -39,7 +39,8 @@ from shared.pole_remote_control import (
 )
 from shared.leadsun_edge_client import LeadsunEdgeApiError
 from shared.users_api import get_users
-from shared.auth_utils import AuthError, require_auth
+from shared.auth_utils import AuthError, require_auth, require_role
+from shared.leadsun_project_populator import PopulateError, populate_leadsun_project
 from shared.data_scope import scope_for
 from shared.users_management_api import (
     change_role,
@@ -214,6 +215,85 @@ def createPoleIssue(req: func.HttpRequest) -> func.HttpResponse:
     return func.HttpResponse(
         json.dumps(result), status_code=201, mimetype="application/json"
     )
+
+
+@app.route(route="populateLeadsunProject", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
+def populateLeadsunProject(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Creates a project in Leadsun EDGE and links it to one of our Projects:
+    fills Projects.LeadsunProject ({"ProjectId": "<id>"}, the same shape
+    loadProjects writes) and sets Airtable's "Leadsun ProjectID". Not
+    related to telemetry.
+
+    Body: {"ProjectId": <our Projects.Id / Airtable record id>  (required),
+           "ProjectName": <name for the new Leadsun project>   (required),
+           "remark": <text>                                   (optional)}
+
+    The Project's current LeadsunProject must be blank (409 otherwise), as
+    must Airtable's Leadsun ProjectID, and no Leadsun project of that name
+    may already exist (409) -- all checked BEFORE anything is created. See
+    shared/leadsun_project_populator.py for the full sequence, and why
+    Airtable is written before the database.
+
+    Requires Streetleaf Admin or Streetleaf Crew: it creates a real project
+    in an external system and rewrites Airtable. A Crew caller is also held
+    to their data scope -- only a Project with an installation schedule --
+    and anything outside it is a 404, as on the read endpoints. Uses the
+    Leadsun admin account configured
+    in LEADSUN_EDGE_ADMIN_USERNAME / LEADSUN_EDGE_ADMIN_PASSWORD.
+
+    201 {projectId, projectName, leadsunProject: {ProjectId}}. Errors:
+    400 bad body, 404 no such Project, 409 not blank / name taken,
+    502 Leadsun or Airtable failure, 500 misconfiguration or database
+    failure. Any failure AFTER the Leadsun project exists also returns its
+    "leadsunProjectId", so the rest can be finished by hand.
+    """
+    try:
+        ctx = require_auth(req)
+        require_role(ctx, ["Streetleaf Admin", "Streetleaf Crew"])
+        scope = scope_for(ctx)
+    except AuthError as ex:
+        return _auth_error_response(ex)
+
+    def _json_response(status_code, payload):
+        return func.HttpResponse(
+            json.dumps(payload), status_code=status_code, mimetype="application/json"
+        )
+
+    try:
+        body = req.get_json()
+    except ValueError:
+        return _json_response(400, {"error": "request body must be valid JSON"})
+    if not isinstance(body, dict):
+        return _json_response(400, {"error": "request body must be a JSON object"})
+
+    try:
+        result = populate_leadsun_project(
+            project_id=body.get("ProjectId"),
+            project_name=body.get("ProjectName"),
+            remark=body.get("remark"),
+            scope=scope,
+        )
+    except ValueError as ex:
+        return _json_response(400, {"error": str(ex)})
+    except PopulateError as ex:
+        logging.error("populateLeadsunProject: %s", ex)
+        payload = {"error": str(ex)}
+        if ex.leadsun_project_id:
+            payload["leadsunProjectId"] = ex.leadsun_project_id
+        return _json_response(ex.http_status, payload)
+    except LeadsunEdgeApiError as ex:
+        logging.error("populateLeadsunProject: Leadsun EDGE API error: %s", ex)
+        return _json_response(502, {"error": str(ex)})
+    except Exception as ex:
+        logging.error("populateLeadsunProject: failed: %s", ex)
+        return _json_response(500, {"error": "internal error"})
+
+    logging.info(
+        "populateLeadsunProject: user %s linked Project %s to Leadsun project %s.",
+        ctx.user_id, result["projectId"], result["leadsunProject"]["ProjectId"],
+    )
+    return _json_response(201, result)
 
 
 # Separate from loadAirTableData on purpose -- different source (Leadsun,

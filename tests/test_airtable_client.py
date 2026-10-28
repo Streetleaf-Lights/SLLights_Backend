@@ -188,3 +188,64 @@ def test_fetch_all_records_no_sleep_for_single_page(mock_requests_get, mocker):
     airtable_client.fetch_all_records("Companies_New")
 
     mock_sleep.assert_not_called()
+
+
+class TestFetchRecord:
+    def test_gets_one_record_by_id_with_the_bearer_token(self, mocker):
+        record = {"id": "recABC", "fields": {"Leadsun ProjectID": 389}}
+        mock_get = mocker.patch(
+            "shared.airtable_client.requests.get", return_value=make_http_response(record)
+        )
+
+        result = airtable_client.fetch_record("Project Tracking", "recABC")
+
+        assert result == record
+        call = mock_get.call_args
+        assert call.args[0] == f"{airtable_client.AIRTABLE_API_URL}/{airtable_client.AIRTABLE_BASE_ID}/Project Tracking/recABC"
+        assert call.kwargs["headers"]["Authorization"] == f"Bearer {airtable_client.AIRTABLE_API_KEY}"
+
+    def test_an_explicit_base_id_overrides_the_default(self, mocker):
+        mock_get = mocker.patch(
+            "shared.airtable_client.requests.get", return_value=make_http_response({"id": "r", "fields": {}})
+        )
+        airtable_client.fetch_record("T", "recABC", base_id="appOTHER")
+        assert "/appOTHER/T/recABC" in mock_get.call_args.args[0]
+
+    def test_a_failure_raises_with_status_and_airtables_own_message(self, mocker):
+        response = make_http_response({}, status_code=404)
+        response.ok = False
+        response.text = '{"error":"NOT_FOUND"}'
+        mocker.patch("shared.airtable_client.requests.get", return_value=response)
+        with pytest.raises(airtable_client.AirtableApiError, match=r"GET T/recX failed \(404\).*NOT_FOUND"):
+            airtable_client.fetch_record("T", "recX")
+
+
+class TestUpdateRecord:
+    def test_patches_only_the_given_fields(self, mocker):
+        mock_patch = mocker.patch(
+            "shared.airtable_client.requests.patch",
+            return_value=make_http_response({"id": "recABC", "fields": {"Leadsun ProjectID": "389"}}),
+        )
+
+        airtable_client.update_record("Project Tracking", "recABC", {"Leadsun ProjectID": "389"})
+
+        call = mock_patch.call_args
+        assert call.args[0].endswith("/Project Tracking/recABC")
+        assert call.kwargs["json"] == {"fields": {"Leadsun ProjectID": "389"}}  # no typecast unless asked
+        assert call.kwargs["headers"]["Authorization"] == f"Bearer {airtable_client.AIRTABLE_API_KEY}"
+        assert call.kwargs["headers"]["Content-Type"] == "application/json"
+
+    def test_typecast_is_sent_only_when_requested(self, mocker):
+        mock_patch = mocker.patch(
+            "shared.airtable_client.requests.patch", return_value=make_http_response({"id": "r", "fields": {}})
+        )
+        airtable_client.update_record("T", "recABC", {"F": "1"}, typecast=True)
+        assert mock_patch.call_args.kwargs["json"] == {"fields": {"F": "1"}, "typecast": True}
+
+    def test_a_failure_raises_with_status_and_airtables_own_message(self, mocker):
+        response = make_http_response({}, status_code=422)
+        response.ok = False
+        response.text = '{"error":{"type":"UNKNOWN_FIELD_NAME"}}'
+        mocker.patch("shared.airtable_client.requests.patch", return_value=response)
+        with pytest.raises(airtable_client.AirtableApiError, match=r"PATCH T/recX failed \(422\).*UNKNOWN_FIELD_NAME"):
+            airtable_client.update_record("T", "recX", {"Nope": 1})

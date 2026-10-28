@@ -247,3 +247,92 @@ class TestSendRemoteCommand:
             "statusCode": "200",
             "data": None,
         }
+
+
+class TestUpsertProject:
+    SUCCESS = {"success": True, "message": "Request successful", "statusCode": "200", "data": None}
+
+    def test_sends_the_exact_request_from_the_curl_example(self, mocker):
+        mock_post = mocker.patch(
+            "shared.leadsun_edge_client.requests.post", return_value=_make_response(mocker, self.SUCCESS)
+        )
+
+        result = m.upsert_project("TOKEN-123", "Pioneer Ranch", "phase 2")
+
+        call = mock_post.call_args
+        assert call.args[0] == f"{m.LEADSUN_EDGE_BASE_URL}/project/upsert"
+        assert call.kwargs["data"] == {"name": "Pioneer Ranch", "remark": "phase 2"}  # form fields, not JSON
+        assert "json" not in call.kwargs
+        assert call.kwargs["headers"]["Authorization"] == "TOKEN-123"  # bare token, no "Bearer "
+        assert call.kwargs["headers"]["Content-Type"] == "application/x-www-form-urlencoded"
+        assert result == self.SUCCESS
+
+    @pytest.mark.parametrize("remark", [None, ""])
+    def test_remark_is_always_sent_empty_when_there_is_none(self, mocker, remark):
+        mock_post = mocker.patch(
+            "shared.leadsun_edge_client.requests.post", return_value=_make_response(mocker, self.SUCCESS)
+        )
+        m.upsert_project("T", "Name", remark)
+        assert mock_post.call_args.kwargs["data"] == {"name": "Name", "remark": ""}
+
+    def test_special_characters_are_left_for_requests_to_form_encode(self, mocker):
+        mock_post = mocker.patch(
+            "shared.leadsun_edge_client.requests.post", return_value=_make_response(mocker, self.SUCCESS)
+        )
+        m.upsert_project("T", "Smith & Sons: 50% off = #1", "a+b")
+        assert mock_post.call_args.kwargs["data"]["name"] == "Smith & Sons: 50% off = #1"
+
+    def test_raises_on_success_false_with_leadsuns_message(self, mocker):
+        response = _make_response(mocker, {"success": False, "message": "Project name already exists"})
+        mocker.patch("shared.leadsun_edge_client.requests.post", return_value=response)
+        with pytest.raises(m.LeadsunEdgeApiError, match="project/upsert.*Project name already exists"):
+            m.upsert_project("T", "Name")
+
+    def test_raises_with_the_response_body_on_an_http_error(self, mocker):
+        response = _make_response(mocker, {}, status_code=401, raise_for_status_error=requests.HTTPError("401"))
+        response.text = "token expired"
+        mocker.patch("shared.leadsun_edge_client.requests.post", return_value=response)
+        with pytest.raises(m.LeadsunEdgeApiError, match="401.*token expired"):
+            m.upsert_project("T", "Name")
+
+
+class TestListProjects:
+    def test_sends_an_empty_body_post_with_the_bare_token(self, mocker):
+        mock_post = mocker.patch(
+            "shared.leadsun_edge_client.requests.post",
+            return_value=_make_response(mocker, {"success": True, "data": []}),
+        )
+
+        m.list_projects("TOKEN-123")
+
+        call = mock_post.call_args
+        assert call.args[0] == f"{m.LEADSUN_EDGE_BASE_URL}/project/projects"
+        assert call.kwargs["data"] == ""  # curl --data ''
+        assert call.kwargs["headers"]["Authorization"] == "TOKEN-123"
+        assert call.kwargs["headers"]["Content-Type"] == "application/x-www-form-urlencoded"
+
+    def test_returns_the_data_list_as_is(self, mocker):
+        projects = [
+            {"id": 389, "name": "DEMOs", "isDefault": None, "remark": "", "userName": "SLDEMOS",
+             "createTime": "2023-01-07 06:33:58", "totalGateway": 4, "totalLamp": 4},
+            {"id": 390, "name": "Other"},
+        ]
+        mocker.patch(
+            "shared.leadsun_edge_client.requests.post",
+            return_value=_make_response(mocker, {"success": True, "data": projects}),
+        )
+        assert m.list_projects("T") == projects
+
+    @pytest.mark.parametrize("data", [None, []])
+    def test_no_data_is_an_empty_list(self, mocker, data):
+        mocker.patch(
+            "shared.leadsun_edge_client.requests.post",
+            return_value=_make_response(mocker, {"success": True, "data": data}),
+        )
+        assert m.list_projects("T") == []
+
+    def test_raises_on_success_false(self, mocker):
+        response = _make_response(mocker, {"success": False, "message": "Token expired"})
+        mocker.patch("shared.leadsun_edge_client.requests.post", return_value=response)
+        with pytest.raises(m.LeadsunEdgeApiError, match="project/projects.*Token expired"):
+            m.list_projects("T")

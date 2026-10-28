@@ -15,6 +15,10 @@ Three endpoints, called in this order by shared/pole_remote_control.py:
   3. send_remote_command(...)           -- the actual light on/off/dim
      command, using the access token from step 1 or 2
 
+Two more endpoints, used by shared/leadsun_project_populator.py to create a
+Leadsun project: upsert_project() and list_projects() (both authenticated
+with the access token from get_token()).
+
 No SP_Execution logging here -- this is a single, immediate, real-time
 control action (a person or another system asking one specific light to
 change right now), not a batch load with counts to track. Ordinary
@@ -52,16 +56,13 @@ class LeadsunEdgeApiError(Exception):
     """
 
 
-def _post_form(path: str, data: dict) -> dict:
+def _checked_json(path: str, response) -> dict:
     """
-    Shared POST logic for get_token/refresh_token -- both send
-    application/x-www-form-urlencoded bodies (requests' data= kwarg
-    handles that encoding automatically) and both return the same
-    {"success", "message", "statusCode", "access_token",
-    "refresh_token"} shape.
+    Shared by every call here: raises LeadsunEdgeApiError on a non-2xx
+    response (including the response BODY text, which is often the only
+    place the real reason is) or on a 2xx whose own JSON says
+    {"success": false}; otherwise returns the parsed body.
     """
-    url = f"{LEADSUN_EDGE_BASE_URL}/{path}"
-    response = requests.post(url, data=data, timeout=_REQUEST_TIMEOUT_SECONDS)
     try:
         response.raise_for_status()
     except requests.HTTPError as ex:
@@ -75,6 +76,43 @@ def _post_form(path: str, data: dict) -> dict:
             f"Leadsun EDGE API ({path}) reported failure: {body.get('message', body)}"
         )
     return body
+
+
+def _post_form(path: str, data: dict) -> dict:
+    """
+    Shared POST logic for get_token/refresh_token -- both send
+    application/x-www-form-urlencoded bodies (requests' data= kwarg
+    handles that encoding automatically) and both return the same
+    {"success", "message", "statusCode", "access_token",
+    "refresh_token"} shape.
+    """
+    url = f"{LEADSUN_EDGE_BASE_URL}/{path}"
+    response = requests.post(url, data=data, timeout=_REQUEST_TIMEOUT_SECONDS)
+    return _checked_json(path, response)
+
+
+def _post_authed_form(path: str, access_token: str, data: dict = None) -> dict:
+    """
+    POST to an authenticated endpoint with a form-encoded body (curl's
+    --data-urlencode, or --data '' for none). The access token goes in the
+    Authorization header BARE, with no "Bearer " prefix -- the same format
+    send_remote_command() settled on after "Bearer <token>" got a 401 (see
+    its ASSUMPTION note), and what the curl examples for these two endpoints
+    show.
+    """
+    url = f"{LEADSUN_EDGE_BASE_URL}/{path}"
+    headers = {
+        "Authorization": access_token,
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    # data="" (not None) so an empty body is sent explicitly, like curl --data ''
+    response = requests.post(
+        url,
+        data=data if data is not None else "",
+        headers=headers,
+        timeout=_REQUEST_TIMEOUT_SECONDS,
+    )
+    return _checked_json(path, response)
 
 
 def get_token(username: str, password: str) -> dict:
@@ -203,3 +241,34 @@ def send_remote_command(access_token: str, brightness: int, time_minutes: int, g
         time_minutes,
     )
     return body
+
+
+def upsert_project(access_token: str, name: str, remark: str = "") -> dict:
+    """
+    Creates a Leadsun project (project/upsert). Sent as form fields `name`
+    and `remark` -- remark is always sent, as an empty string when there is
+    none, matching how Leadsun itself reports a project with no remark
+    ("remark": "").
+
+    "upsert" suggests this may UPDATE a project that already has this name
+    instead of creating a second one; callers that need a genuinely NEW
+    project must check the name is free first (see
+    shared/leadsun_project_populator.py). The response carries no project
+    id -- {"success": true, ..., "data": null} -- so the id has to be looked
+    up afterwards with list_projects().
+    """
+    body = _post_authed_form("project/upsert", access_token, {"name": name, "remark": remark or ""})
+    logging.info("leadsun_edge_client: project upsert accepted for name=%r.", name)
+    return body
+
+
+def list_projects(access_token: str) -> list:
+    """
+    All projects visible to this account (project/projects, an empty-body
+    POST). Each item is shaped like
+      {"id": 389, "name": "DEMOs", "isDefault": null, "remark": "",
+       "userName": "SLDEMOS", "createTime": "...", "totalGateway": 4, "totalLamp": 4}
+    Returns [] if Leadsun reports success with no data.
+    """
+    body = _post_authed_form("project/projects", access_token)
+    return body.get("data") or []

@@ -1775,3 +1775,67 @@ reference for a from-scratch project, not as the LightsApp deploy runbook.
   period type's `commit()` has already happened before a later one's
   failure — the actual property this change exists for.
 
+
+- **`populateLeadsunProject`** (`POST /api/populateLeadsunProject`) --
+  creates a project in Leadsun EDGE and links it to one of our Projects.
+  Not related to telemetry. Streetleaf Admin and Streetleaf Crew only
+  (JWT), because it creates a real project in an external system and
+  rewrites Airtable. A Crew caller is held to their data scope: only a
+  Project that has an installation schedule (`Projects.StickerNumbers IS
+  NOT NULL`) can be populated; any other is a `404`, as on the read
+  endpoints, and nothing is created in Leadsun. Streetleaf Admin is
+  unrestricted.
+
+  Body: `{"ProjectId": "<Projects.Id = Airtable record id>", "ProjectName":
+  "<name for the new Leadsun project>", "remark": "<optional>"}` -- exactly
+  those key names. Success is `201 {"projectId", "projectName",
+  "leadsunProject": {"ProjectId": "<id>"}}` -- the new Leadsun id is
+  `leadsunProject.ProjectId`, exactly what was stored.
+
+  **Needs two app settings** (Azure Configuration, and `local.settings.json`
+  locally): `LEADSUN_EDGE_ADMIN_USERNAME` and `LEADSUN_EDGE_ADMIN_PASSWORD`,
+  the Leadsun EDGE account that is allowed to create projects (separate
+  from the per-pole accounts in `LeadsunEdgeAccounts`). Missing -> `500`
+  before anything is touched. The Airtable token must also be allowed to
+  **write** to the `Project Tracking` table.
+
+  Sequence (`shared/leadsun_project_populator.py` has the reasoning):
+  1. validate the body and settings;
+  2. pre-flight, changing nothing: the Project exists (and is in the
+     caller's scope) and `Projects.LeadsunProject` is **blank** (`NULL`, `''`, `{}`; anything
+     else is `409`), and its Airtable `Leadsun ProjectID` is empty too
+     (`409` otherwise -- SQL can lag Airtable by hours and the PATCH would
+     overwrite it);
+  3. log in to Leadsun (`get-token`), list projects, and `409` if one with
+     that name already exists (case/space-insensitive) -- `project/upsert`
+     may *update* a same-named project rather than create one, and
+     linking to a project this call didn't create would tie our telemetry
+     to somebody else's;
+  4. `project/upsert` (form-encoded `name`, `remark`);
+  5. `project/projects`, retried after 1s, 2s, 3s, 5s (Leadsun can lag),
+     to find the **new** project by name and read its `id` -- the upsert
+     response itself carries none;
+  6. `PATCH` Airtable's `Leadsun ProjectID` (as text with `typecast`, so it
+     works whether that column is a Number or text);
+  7. fill `Projects.LeadsunProject` with `{"ProjectId": "<id>"}`, built by
+     the same `JSON_MODIFY('{}', '$.ProjectId', CAST(? AS NVARCHAR(MAX)))`
+     `projects_loader` uses, and conditional on the value still being the
+     blank that was read. The rest of the JSON (`ProjectName`,
+     `totalGateways`, `totalPoles`, `groups`) is still built later by
+     `update_leadsun_project_details()` once the poles report in.
+
+  **Airtable is written before the database**, deliberately: Airtable is
+  the source of truth and `loadProjects` rewrites `$.ProjectId` to match it
+  on every run -- removing the key when Airtable's value is empty. Filling
+  the database first and then failing the PATCH would be silently undone
+  at the next run; this order leaves every partial failure either with
+  nothing changed locally or with Airtable correct and `loadProjects`
+  filling the database in by itself.
+
+  Leadsun has no delete call among the endpoints used, so a project it has
+  already created cannot be undone from here -- hence every check before
+  step 4. Any failure *after* the Leadsun project exists (`502` Airtable /
+  lookup, `500` database, `409` the row changed underneath) also returns
+  `"leadsunProjectId"` in the body so the remainder can be finished by
+  hand: set Airtable's `Leadsun ProjectID` to that id and let `loadProjects`
+  do the rest.
